@@ -1,6 +1,4 @@
-下面这个可以直接复制成 `README.md`。
 
-````markdown
 # Xray Edge Manager
 
 `xray-edge-manager` 是一个单文件 Xray-core 节点部署与订阅管理脚本，目标是把 Xray-core、Cloudflare DNS、证书、Nginx 伪装站、XHTTP、REALITY、Hysteria2、BestCF 优选域名和 base64 订阅整合到一个交互式脚本里。
