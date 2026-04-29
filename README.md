@@ -1,9 +1,9 @@
 
 # Xray Edge Manager
 
-`xray-edge-manager` 是一个单文件 Xray-core 节点部署与订阅管理脚本，目标是把 Xray-core、Cloudflare DNS、证书、Nginx 伪装站、XHTTP、REALITY、Hysteria2、BestCF 优选域名和 base64 订阅整合到一个交互式脚本里。
+`xray-edge-manager` 是一个单文件 Xray-core 节点部署脚本，用于在个人 VPS 上快速部署多协议节点、Cloudflare DNS、证书、Nginx 伪装站和 base64 订阅。
 
-> 当前版本仍处于 Alpha 阶段，建议先在全新测试 VPS 上验证，不建议直接用于生产环境。
+当前版本：`v0.0.1`
 
 ---
 
@@ -13,7 +13,7 @@
 bash <(curl -fsSL https://raw.githubusercontent.com/0x1233333/xray-edge-manager/main/xem.sh)
 ````
 
-如果 `curl` 连接失败，可以用 `wget`：
+如果 `curl` 不可用：
 
 ```bash
 bash <(wget -qO- https://raw.githubusercontent.com/0x1233333/xray-edge-manager/main/xem.sh)
@@ -23,11 +23,15 @@ bash <(wget -qO- https://raw.githubusercontent.com/0x1233333/xray-edge-manager/m
 
 ## 安装成本地命令
 
-安装后可以直接输入 `xem` 打开菜单。
-
 ```bash
 curl -fsSL https://raw.githubusercontent.com/0x1233333/xray-edge-manager/main/xem.sh -o /usr/local/bin/xem
 chmod +x /usr/local/bin/xem
+xem
+```
+
+以后直接运行：
+
+```bash
 xem
 ```
 
@@ -40,155 +44,109 @@ chmod +x /usr/local/bin/xem
 
 ---
 
-## 项目定位
-
-`xray-edge-manager` 不是面板，也不是机场系统。它是一个面向个人 VPS 的 Xray-core 自动部署和订阅管理脚本。
-
-它主要用于：
+## 支持功能
 
 * 安装 / 升级 Xray-core
+* 更新 `geoip.dat` / `geosite.dat`
 * 配置 Cloudflare DNS
-* 自动管理橙云 / 灰云
-* DNS-01 方式申请证书
+* 自动申请 DNS-01 泛域名证书
 * 配置 Nginx 伪装站
-* 部署 VLESS + XHTTP + REALITY
-* 部署 VLESS + XHTTP + TLS + CDN
-* 部署 Xray Hysteria2
-* 配置 Hysteria2 UDP 端口跳跃
 * 生成 base64 订阅
-* 整合多台机器的 base64 订阅
+* IPv4 / IPv6 分栈部署
+* Hysteria2 UDP 端口跳跃
+* BestCF 优选域名入口
+* 卸载 / 清理部署环境
 
 ---
 
-## 核心设计
+## 域名规则
 
-每台机器最多使用 3 个域名：
+脚本要求使用三段式或以上的母域名，例如：
 
 ```text
-1.example.com       CDN / 伪装站 / 订阅域名
-v4.1.example.com    IPv4 灰云直连
-v6.1.example.com    IPv6 灰云直连
+node.example.com
+jp1.proxy.example.com
+us1.edge.example.com
 ```
 
-其中：
-
-| 域名                   | 用途              | Cloudflare 状态    |
-| -------------------- | --------------- | ---------------- |
-| `1.example.com`    | CDN 入口、伪装站、订阅链接 | 启用 CDN 时橙云，否则可灰云 |
-| `v4.1.example.com` | IPv4 直连入口       | 灰云               |
-| `v6.1.example.com` | IPv6 直连入口       | 灰云               |
-
-这样做的目的是避免 A / AAAA 混用，方便 IPv4 和 IPv6 分开配置策略。
-
----
-
-## 默认协议组合
-
-默认安装组合是：
+假设输入：
 
 ```text
-123
+node.example.com
 ```
 
-也就是：
+脚本会按需创建：
 
 ```text
-1. VLESS + XHTTP + REALITY
-2. VLESS + XHTTP + TLS + CDN
-3. Xray Hysteria2
+node.example.com       CDN / 伪装站 / 订阅
+v4.node.example.com    IPv4 直连
+v6.node.example.com    IPv6 直连
 ```
 
-可选协议：
+不建议直接使用二段根域名：
 
 ```text
-4. VLESS + REALITY + Vision
-5. XHTTP CDN + REALITY 分离实验模式
+example.com
 ```
 
 ---
 
 ## 协议说明
 
-### 1. VLESS + XHTTP + REALITY
-
-默认直连协议。
+脚本支持按 IPv4 / IPv6 分别选择协议组合。
 
 ```text
-CDN: no
-默认端口: TCP 2443，可自定义
-用途: 默认直连、速度和伪装平衡
+1 = VLESS + XHTTP + REALITY
+2 = VLESS + XHTTP + TLS + CDN
+3 = Xray Hysteria2
+4 = VLESS + REALITY + Vision
+5 = VLESS + XHTTP + TLS + CDN 入口扩展
 ```
 
-适合优质 IPv4 / IPv6 线路。
+常用选择：
+
+```text
+123      推荐组合
+1234     全部主力和备用协议
+12345    包含 CDN 入口扩展
+```
+
+说明：
+
+* `1` 是直连主力协议，使用 `v4.` / `v6.` 子域名。
+* `2` 是 CDN 协议，使用母域名。
+* `3` 是 UDP 协议，可选端口跳跃。
+* `4` 是 REALITY + Vision 备用直连协议。
+* `5` 是 CDN 入口扩展，可配合 BestCF / 优选域名使用。
 
 ---
 
-### 2. VLESS + XHTTP + TLS + CDN
+## Cloudflare API Token
 
-最高隐藏协议。
+需要创建 Cloudflare Restricted API Token。
 
-```text
-CDN: yes
-默认端口: TCP 443
-用途: CDN、伪装站、主力抗封锁
-```
-
-结构：
+建议权限：
 
 ```text
-TCP 443 -> Nginx
-          ├── 伪装网站
-          ├── base64 订阅
-          └── 随机 path -> Xray XHTTP 本地端口
+Zone:Read
+DNS:Edit
 ```
+
+作用范围建议限制到你的目标 Zone。
+
+中文教程：
+
+```text
+https://github.com/0x1233333/xray-edge-manager/blob/main/examples/cloudflare-api-token.md
+```
+
+不要使用 Global API Key。
 
 ---
 
-### 3. Xray Hysteria2
+## Cloudflare CDN 端口
 
-UDP 高速备用协议。
-
-```text
-CDN: no
-默认端口: UDP 443，可自定义
-用途: UDP / QUIC 高速备用
-```
-
-可选端口跳跃：
-
-```text
-UDP 20000-20100 -> UDP 443
-```
-
----
-
-### 4. VLESS + REALITY + Vision
-
-可选备用协议，不默认生成。
-
-```text
-CDN: no
-默认端口: TCP 3443，可自定义
-用途: 测速、排障、低延迟兜底
-```
-
----
-
-### 5. XHTTP CDN + REALITY 分离实验模式
-
-高级实验功能，不默认生成。
-
-```text
-用途: 高级上下行分离 / CDN 与 REALITY 混合测试
-```
-
----
-
-## Cloudflare CDN 端口限制
-
-只有 CDN 协议端口会被限制。
-
-`VLESS + XHTTP + TLS + CDN` 只能选择 Cloudflare 支持的 HTTPS 代理端口：
+CDN 协议只能使用 Cloudflare 支持的 HTTPS 代理端口：
 
 ```text
 443
@@ -199,244 +157,45 @@ CDN: no
 8443
 ```
 
-其他非 CDN 协议端口只是默认推荐，可以自定义：
+非 CDN 协议端口可以自定义。
+
+常见默认端口：
 
 ```text
-XHTTP + REALITY 默认 TCP 2443，可自定义
-Hysteria2 默认 UDP 443，可自定义
-REALITY + Vision 默认 TCP 3443，可自定义
+TCP 443    Nginx / CDN / 伪装站 / 订阅
+TCP 2443   VLESS + XHTTP + REALITY
+UDP 443    Xray Hysteria2
+TCP 3443   VLESS + REALITY + Vision
+UDP 20000-20100   Hysteria2 端口跳跃
 ```
 
 ---
 
-## 域名要求
+## 云安全组放行
 
-脚本要求输入三段式或以上母域名，例如：
+请在 VPS 控制台手动放行需要的端口。
 
-```text
-1.example.com
-us1.node.example.com
-kr1.proxy.example.com
-```
-
-不建议直接使用二段根域名：
-
-```text
-example.com
-0x0000.top
-```
-
-假设输入：
-
-```text
-1.example.com
-```
-
-脚本会按需管理：
-
-```text
-1.example.com
-v4.1.example.com
-v6.1.example.com
-```
-
----
-
-## Cloudflare API Token 要求
-
-建议使用 Restricted API Token，不要使用 Global API Key。
-
-推荐权限：
-
-```text
-Zone:Read
-DNS:Edit
-```
-
-作用范围建议限制到目标 Zone。
-
-脚本会把 Cloudflare 配置保存在：
-
-```text
-/root/.xray-anti-block/cloudflare.env
-```
-
-权限会设置为：
-
-```text
-600
-```
-
----
-
-## 证书策略
-
-脚本默认使用 DNS-01 方式申请证书。
-
-默认申请：
-
-```text
-1.example.com
-*.1.example.com
-```
-
-这样可以覆盖：
-
-```text
-1.example.com
-v4.1.example.com
-v6.1.example.com
-```
-
----
-
-## 默认端口规划
-
-```text
-TCP 443:
-  Nginx + XHTTP/TLS/CDN + 伪装站 + 订阅
-
-TCP 2443:
-  VLESS + XHTTP + REALITY
-
-UDP 443:
-  Xray Hysteria2
-
-UDP 20000-20100:
-  Hysteria2 端口跳跃，可选
-
-TCP 3443:
-  VLESS + REALITY + Vision，可选
-```
-
-注意：非 CDN 协议的端口不是强制固定，只是默认推荐。
-
----
-
-## BestCF
-
-BestCF 默认关闭。
-
-启用后：
-
-```text
-只使用优选域名
-不使用优选 IP
-```
-
-用法：
-
-```text
-server/address = BestCF 优选域名
-serverName/SNI = 你的母域名
-Host = 你的母域名
-```
-
-示例：
-
-```text
-server = bestcf.example
-servername = 1.example.com
-host = 1.example.com
-```
-
-普通 CDN 节点：
-
-```text
-server = 1.example.com
-servername = 1.example.com
-host = 1.example.com
-```
-
-BestCF 节点：
-
-```text
-server = 优选域名
-servername = 1.example.com
-host = 1.example.com
-```
-
----
-
-## 订阅
-
-脚本对外只生成 base64 订阅。
-
-本机订阅示例：
-
-```text
-https://1.example.com/sub/xxxxxxxxxxxxxxxx
-```
-
-本地文件：
-
-```text
-/root/.xray-anti-block/subscription/local.raw
-/root/.xray-anti-block/subscription/local.b64
-/root/.xray-anti-block/subscription/merged.raw
-/root/.xray-anti-block/subscription/merged.b64
-/root/.xray-anti-block/subscription/mihomo-reference.yaml
-```
-
-其中：
-
-```text
-local.raw              本机原始分享链接
-local.b64              本机 base64 订阅
-merged.raw             整合后的原始链接
-merged.b64             整合后的 base64 订阅
-mihomo-reference.yaml  本地参考片段，不作为默认订阅发布
-```
-
----
-
-## 多机订阅整合
-
-脚本支持添加远程 base64 订阅，然后整合成本机总订阅。
-
-流程：
-
-```text
-1. 添加远程 base64 订阅地址
-2. 拉取远程订阅
-3. 解码远程订阅
-4. 合并本机节点
-5. 去重
-6. 重新生成 merged.b64
-```
-
-最终仍然只输出 base64 订阅。
-
----
-
-## 本机防火墙策略
-
-如果系统原本没有启用本机防火墙，脚本不会主动安装或启用防火墙。
-
-如果检测到已有防火墙：
-
-```text
-ufw active       -> 自动 ufw allow 所需端口
-firewalld active -> 自动 firewall-cmd 放行所需端口
-```
-
-云厂商安全组无法自动处理，需要手动确认放行。
-
-常见需要放行：
+常见组合：
 
 ```text
 TCP 443
-TCP 2443
+TCP 2443 或自定义 XHTTP REALITY 端口
+TCP 3443 或自定义 Vision 端口
 UDP 443
 UDP 20000-20100
-TCP 3443，可选
+```
+
+如果你把 XHTTP REALITY 改成 `2053`，就需要放行：
+
+```text
+TCP 2053
 ```
 
 ---
 
 ## 使用流程
 
-首次部署建议选择：
+首次部署直接选择：
 
 ```text
 1. 首次部署向导
@@ -447,48 +206,131 @@ TCP 3443，可选
 ```text
 1. 安装依赖
 2. 安装 / 升级 Xray-core
-3. 更新 geoip.dat / geosite.dat
-4. 配置 Cloudflare API
-5. 输入母域名
-6. 查询 IPv4 / IPv6 / ASN
-7. 选择协议组合
-8. 创建 DNS 记录
-9. 申请证书
-10. 生成 Xray 配置
-11. 配置 Nginx 伪装站
-12. 配置 Hysteria2
-13. 配置端口跳跃
-14. 处理本机防火墙
-15. 生成 base64 订阅
-16. 输出部署摘要
+3. 更新 geodata
+4. 输入母域名
+5. 配置 Cloudflare API Token
+6. 选择 IPv4 / IPv6 协议组合
+7. 创建 DNS 记录
+8. 申请证书
+9. 生成 Xray 配置
+10. 配置 Nginx 伪装站
+11. 配置 Hysteria2 端口跳跃
+12. 生成 base64 订阅
 ```
 
 ---
 
-## 菜单预览
+## 订阅
+
+部署完成后会输出订阅链接：
 
 ```text
-===== Xray Anti-Block Manager Alpha R3 =====
+https://node.example.com/sub/xxxxxxxxxxxxxxxx
+```
 
-1. 首次部署向导，推荐
-2. 安装/升级基础依赖
-3. 安装/升级 Xray-core
-4. 更新 geoip.dat / geosite.dat
-5. 网络优化 / BBR 状态与稳定优化
-6. Cloudflare 域名 / DNS / 小云朵管理
-7. 证书申请 / 续签 / 自动部署
-8. 查询 IPv4 / IPv6 / ASN 辅助报告
-9. 选择协议组合并生成 Xray 配置
-10. 配置 CDN / Nginx / 伪装站
-11. BestCF 优选域名管理，默认关闭
-12. 配置 Hysteria2 端口跳跃
-13. 本机防火墙端口处理
-14. 订阅管理 / 多机汇总
-15. 查看服务状态
-16. 查看分享链接 / 订阅链接
-17. 重启服务
-18. 部署摘要
-0. 退出
+脚本对外发布的是 base64 订阅。
+
+本地文件位置：
+
+```text
+/root/.xray-edge-manager/subscription/local.raw
+/root/.xray-edge-manager/subscription/local.b64
+/root/.xray-edge-manager/subscription/mihomo-reference.yaml
+```
+
+其中：
+
+```text
+local.raw              原始分享链接
+local.b64              base64 订阅
+mihomo-reference.yaml  Mihomo 参考配置
+```
+
+---
+
+## BestCF
+
+BestCF 默认关闭。
+
+启用后会生成额外的 CDN 入口节点。
+
+说明：
+
+```text
+server/address = BestCF 优选域名
+SNI/servername = 你的母域名
+Host           = 你的母域名
+```
+
+脚本只使用优选域名，不使用优选 IP。
+
+---
+
+## 卸载
+
+运行脚本后选择：
+
+```text
+20. 卸载 / 清理
+```
+
+支持：
+
+```text
+1. 完整卸载本脚本环境
+2. 停止并禁用 Xray
+3. 删除 Hysteria2 端口跳跃规则
+4. 清理脚本状态目录
+5. 删除 Cloudflare DNS 记录
+```
+
+Cloudflare DNS 默认不会自动删除，需要用户确认。
+
+---
+
+## 检查脚本
+
+如果脚本无法运行，先检查：
+
+```bash
+curl -fsSL -o /root/xem.sh https://raw.githubusercontent.com/0x1233333/xray-edge-manager/main/xem.sh
+wc -l /root/xem.sh
+head -n 5 /root/xem.sh
+bash -n /root/xem.sh
+```
+
+运行本地文件：
+
+```bash
+bash /root/xem.sh
+```
+
+---
+
+## 目录
+
+脚本状态目录：
+
+```text
+/root/.xray-edge-manager
+```
+
+Nginx 站点配置：
+
+```text
+/etc/nginx/conf.d/xray-edge-manager.conf
+```
+
+Web 根目录：
+
+```text
+/var/www/xray-edge-manager
+```
+
+Xray 配置：
+
+```text
+/usr/local/etc/xray/config.json
 ```
 
 ---
@@ -496,89 +338,17 @@ TCP 3443，可选
 ## 安全提示
 
 * 不要公开 Cloudflare API Token
-* 不建议使用 Cloudflare Global API Key
-* 建议使用 Restricted API Token
-* 不要提交 `/root/.xray-anti-block/` 目录内容
-* 不要提交证书私钥
-* 不要公开订阅 token
-* 建议先在测试 VPS 上运行
-* Hysteria2 属于较新功能，客户端兼容性需要实测
-* XHTTP 分享链接在不同客户端上的兼容性可能不同
-
----
-
-## 检查脚本格式
-
-如果从 GitHub 拉下来的脚本不能运行，先检查：
-
-```bash
-wc -l xem.sh
-head -n 5 xem.sh
-bash -n xem.sh
-```
-
-如果脚本只有十几行，或者第一行塞了大量内容，说明上传时换行损坏，需要重新上传。
-
----
-
-## 仓库建议结构
-
-```text
-xray-edge-manager/
-├── xem.sh
-├── README.md
-├── LICENSE
-├── SECURITY.md
-├── .gitignore
-└── examples/
-    └── cloudflare-token-permissions.md
-```
-
----
-
-## 建议添加 `.gitignore`
-
-```gitignore
-*.env
-*.ini
-*.log
-*.bak
-.DS_Store
-
-cloudflare.env
-cloudflare.ini
-state.env
-
-/root/
-.xray-anti-block/
-```
+* 不要提交 `/root/.xray-edge-manager/`
+* 不要公开订阅链接
+* 不要公开证书私钥
+* 建议先在测试 VPS 上验证
+* 不同客户端对 XHTTP / Hysteria2 的支持可能不同
 
 ---
 
 ## License
 
-建议使用 MIT License。
-
-```text
 MIT License
-```
-
----
-
-## 状态
-
-当前项目处于 Alpha 阶段。
-
-优先需要实机验证：
-
-```text
-1. Xray Hysteria2 配置字段兼容性
-2. XHTTP 分享链接客户端兼容性
-3. v4/v6 出口绑定行为
-4. Cloudflare DNS 自动管理
-5. Nginx XHTTP 反代行为
-6. Hysteria2 端口跳跃持久化
-```
 
 ```
 ```
