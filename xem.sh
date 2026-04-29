@@ -443,7 +443,7 @@ create_dns_records() {
 
   if [[ -n "$ip4" ]]; then
     cf_upsert_record "$BASE_DOMAIN" A "$ip4" "$proxied_base"
-    if mode_has_direct "${IPV4_STRATEGY:-3}"; then
+    if stack_has_direct_protocol "${IPV4_PROTOCOLS:-1}"; then
       cf_upsert_record "v4.$BASE_DOMAIN" A "$ip4" false
     else
       info "IPv4 策略未启用直连，跳过 v4.$BASE_DOMAIN DNS 记录创建。"
@@ -451,7 +451,7 @@ create_dns_records() {
   fi
   if [[ -n "$ip6" ]]; then
     cf_upsert_record "$BASE_DOMAIN" AAAA "$ip6" "$proxied_base"
-    if mode_has_direct "${IPV6_STRATEGY:-3}"; then
+    if stack_has_direct_protocol "${IPV6_PROTOCOLS:-1}"; then
       cf_upsert_record "v6.$BASE_DOMAIN" AAAA "$ip6" false
     else
       info "IPv6 策略未启用直连，跳过 v6.$BASE_DOMAIN DNS 记录创建。"
@@ -576,16 +576,30 @@ select_protocols() {
   p=$(ask "默认安装" "$default_protocols")
   [[ "$p" =~ ^[1-5]+$ ]] || die "协议组合只能由 1-5 数字组成。"
   if [[ "$p" == *1* && "${NEED_DIRECT_PROTOCOL:-1}" == "0" ]]; then
-    warn "当前 IPv4/IPv6 策略均未启用直连，但协议组合包含 1。"
+    warn "当前 IPv4/IPv6 都没有选择 XHTTP+REALITY 直连，但协议组合包含 1。"
     if confirm "是否移除协议 1，避免生成无效直连入站？" "Y"; then
       p="${p//1/}"
       [[ -z "$p" ]] && p="3"
     fi
   fi
   if [[ "$p" == *2* && "${NEED_CDN_PROTOCOL:-1}" == "0" ]]; then
-    warn "当前 IPv4/IPv6 策略均未启用 CDN，但协议组合包含 2。"
+    warn "你前面选择不生成 CDN 节点，但协议组合包含 2。"
     if confirm "是否移除协议 2？" "Y"; then
       p="${p//2/}"
+      [[ -z "$p" ]] && p="3"
+    fi
+  fi
+  if [[ "$p" == *3* && "${NEED_HY2_PROTOCOL:-1}" == "0" ]]; then
+    warn "你前面选择不生成 Hysteria2，但协议组合包含 3。"
+    if confirm "是否移除协议 3？" "Y"; then
+      p="${p//3/}"
+      [[ -z "$p" ]] && p="1"
+    fi
+  fi
+  if [[ "$p" == *4* && "${IPV4_PROTOCOLS:-0}" != *4* && "${IPV6_PROTOCOLS:-0}" != *4* ]]; then
+    warn "当前 IPv4/IPv6 都没有选择 REALITY+Vision，但协议组合包含 4。"
+    if confirm "是否移除协议 4？" "Y"; then
+      p="${p//4/}"
       [[ -z "$p" ]] && p="3"
     fi
   fi
@@ -979,86 +993,109 @@ asn_report() {
   echo
   [[ -n "$ip6" ]] && asn_query_one "$ip6" || warn "未检测到公网 IPv6。"
   echo
-  info "建议：优质 v4/v6 可选 XHTTP+REALITY；普通/绕路线路可选 XHTTP+TLS+CDN。"
+  info "建议：优质 v4/v6 可选 XHTTP+REALITY；普通/绕路线路可选 CDN 节点兜底。"
 }
 
-mode_has_direct() {
-  [[ "$1" == "1" || "$1" == "3" ]]
+stack_protocols_has() {
+  local protos="$1" proto="$2"
+  [[ "$protos" == *"$proto"* ]]
 }
 
-mode_has_cdn() {
-  [[ "$1" == "2" || "$1" == "3" ]]
+stack_has_direct_protocol() {
+  local protos="$1"
+  [[ "$protos" == *"1"* || "$protos" == *"4"* ]]
 }
 
-select_one_stack_strategy() {
-  local label="$1" current="$2" default_mode="$3" mode
+normalize_stack_protocols() {
+  local p="$1" out=""
+  p="${p//,/}"
+  p="${p// /}"
+  [[ "$p" == "0" || -z "$p" ]] && { echo "0"; return 0; }
+  [[ "$p" == *1* ]] && out="${out}1"
+  [[ "$p" == *4* ]] && out="${out}4"
+  [[ -z "$out" ]] && out="0"
+  echo "$out"
+}
+
+select_one_stack_protocols() {
+  local label="$1" current="$2" default_mode="$3" mode normalized
   echo >&2
-  echo "===== ${label} 部署策略 =====" >&2
-  echo "1. 直连优先：生成 ${label} XHTTP + REALITY" >&2
-  echo "2. CDN 优先：不生成 ${label} 直连，只使用母域名 CDN 节点" >&2
-  echo "3. 双保险：同时生成 ${label} 直连 + CDN 节点" >&2
-  echo "4. 跳过：不生成 ${label} 相关直连节点" >&2
-  mode=$(ask "请选择 ${label} 策略" "${current:-$default_mode}")
-  case "$mode" in
-    1|2|3|4) echo "$mode" ;;
-    *) warn "无效选择，使用默认策略 $default_mode" >&2; echo "$default_mode" ;;
-  esac
+  echo "===== ${label} 直连协议选择 =====" >&2
+  echo "0. 不生成 ${label} 直连节点" >&2
+  echo "1. 生成 ${label} VLESS + XHTTP + REALITY" >&2
+  echo "4. 生成 ${label} VLESS + REALITY + Vision，可选备用" >&2
+  echo "14. 同时生成 ${label} 的 XHTTP+REALITY 和 REALITY+Vision" >&2
+  echo "说明：CDN 节点使用母域名 node.example.com，是全局节点，不在这里按 v4/v6 拆分。" >&2
+  mode=$(ask "请选择 ${label} 直连协议" "${current:-$default_mode}")
+  normalized=$(normalize_stack_protocols "$mode")
+  echo "$normalized"
 }
 
 select_ip_stack_strategy() {
   load_state
-  local ip4 ip6 v4_mode v6_mode
+  local ip4 ip6 v4_protos v6_protos enable_cdn enable_hy2 default_p
   ip4="${PUBLIC_IPV4:-$(public_ipv4)}"
   ip6="${PUBLIC_IPV6:-$(public_ipv6)}"
   [[ -n "$ip4" ]] && save_kv "$STATE_FILE" PUBLIC_IPV4 "$ip4"
   [[ -n "$ip6" ]] && save_kv "$STATE_FILE" PUBLIC_IPV6 "$ip6"
 
   echo
-  echo "===== IPv4 / IPv6 分栈部署策略 ====="
+  echo "===== IPv4 / IPv6 分协议部署 ====="
   echo "说明："
   echo "  v4.node.example.com / v6.node.example.com 用于直连协议。"
   echo "  node.example.com 用于 CDN、伪装站和订阅。"
-  echo "  CDN 节点是母域名节点，不严格区分 v4/v6；分栈主要控制是否生成 v4/v6 直连节点。"
+  echo "  CDN 节点是母域名全局节点，不严格区分 v4/v6。"
 
   if [[ -n "$ip4" ]]; then
-    v4_mode=$(select_one_stack_strategy "IPv4" "${IPV4_STRATEGY:-}" "3")
-    save_kv "$STATE_FILE" IPV4_STRATEGY "$v4_mode"
+    v4_protos=$(select_one_stack_protocols "IPv4" "${IPV4_PROTOCOLS:-}" "1")
+    save_kv "$STATE_FILE" IPV4_PROTOCOLS "$v4_protos"
   else
-    save_kv "$STATE_FILE" IPV4_STRATEGY "4"
-    warn "未检测到 IPv4，IPv4 策略设为跳过。"
+    save_kv "$STATE_FILE" IPV4_PROTOCOLS "0"
+    warn "未检测到 IPv4，IPv4 直连协议设为 0。"
   fi
 
   if [[ -n "$ip6" ]]; then
-    v6_mode=$(select_one_stack_strategy "IPv6" "${IPV6_STRATEGY:-}" "3")
-    save_kv "$STATE_FILE" IPV6_STRATEGY "$v6_mode"
+    v6_protos=$(select_one_stack_protocols "IPv6" "${IPV6_PROTOCOLS:-}" "1")
+    save_kv "$STATE_FILE" IPV6_PROTOCOLS "$v6_protos"
   else
-    save_kv "$STATE_FILE" IPV6_STRATEGY "4"
-    warn "未检测到 IPv6，IPv6 策略设为跳过。"
+    save_kv "$STATE_FILE" IPV6_PROTOCOLS "0"
+    warn "未检测到 IPv6，IPv6 直连协议设为 0。"
   fi
 
   load_state
-  if mode_has_direct "${IPV4_STRATEGY:-4}" || mode_has_direct "${IPV6_STRATEGY:-4}"; then
+  if stack_has_direct_protocol "${IPV4_PROTOCOLS:-0}" || stack_has_direct_protocol "${IPV6_PROTOCOLS:-0}"; then
     save_kv "$STATE_FILE" NEED_DIRECT_PROTOCOL "1"
   else
     save_kv "$STATE_FILE" NEED_DIRECT_PROTOCOL "0"
   fi
-  if mode_has_cdn "${IPV4_STRATEGY:-4}" || mode_has_cdn "${IPV6_STRATEGY:-4}"; then
+
+  if confirm "是否生成全局 CDN 节点：VLESS + XHTTP + TLS + CDN？" "Y"; then
     save_kv "$STATE_FILE" NEED_CDN_PROTOCOL "1"
     save_kv "$STATE_FILE" ENABLE_CDN "1"
   else
     save_kv "$STATE_FILE" NEED_CDN_PROTOCOL "0"
+    save_kv "$STATE_FILE" ENABLE_CDN "0"
   fi
 
-  log "分栈策略已保存：IPv4=${IPV4_STRATEGY:-4} IPv6=${IPV6_STRATEGY:-4}"
+  if confirm "是否生成全局 Hysteria2 UDP 节点？" "Y"; then
+    save_kv "$STATE_FILE" NEED_HY2_PROTOCOL "1"
+  else
+    save_kv "$STATE_FILE" NEED_HY2_PROTOCOL "0"
+  fi
+
+  default_p=$(build_default_protocols_from_stack_strategy)
+  save_kv "$STATE_FILE" PROTOCOLS "$default_p"
+  log "分协议策略已保存：IPv4=${IPV4_PROTOCOLS:-0} IPv6=${IPV6_PROTOCOLS:-0} 全局协议=${default_p}"
 }
 
 build_default_protocols_from_stack_strategy() {
   load_state
   local p=""
-  [[ "${NEED_DIRECT_PROTOCOL:-1}" == "1" ]] && p="${p}1"
-  [[ "${NEED_CDN_PROTOCOL:-1}" == "1" ]] && p="${p}2"
-  p="${p}3"
-  [[ -z "$p" ]] && p="123"
+  if [[ "${IPV4_PROTOCOLS:-0}" == *1* || "${IPV6_PROTOCOLS:-0}" == *1* ]]; then p="${p}1"; fi
+  if [[ "${NEED_CDN_PROTOCOL:-1}" == "1" ]]; then p="${p}2"; fi
+  if [[ "${NEED_HY2_PROTOCOL:-1}" == "1" ]]; then p="${p}3"; fi
+  if [[ "${IPV4_PROTOCOLS:-0}" == *4* || "${IPV6_PROTOCOLS:-0}" == *4* ]]; then p="${p}4"; fi
+  [[ -z "$p" ]] && p="3"
   echo "$p"
 }
 
