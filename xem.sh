@@ -127,6 +127,44 @@ public_ipv6() {
   curl -6 -fsS --max-time 8 https://ifconfig.co/ip 2>/dev/null || true
 }
 
+local_ipv4_for_bind() {
+  local public_ip="$1" src
+  if [[ -n "$public_ip" ]] && ip -4 addr show | grep -qw "$public_ip"; then
+    echo "$public_ip"
+    return 0
+  fi
+  if [[ -n "$public_ip" ]]; then
+    warn "检测到公网 IPv4 不在本机网卡上，可能是 NAT 环境：$public_ip"
+  fi
+  src=$(ip -4 route get 8.8.8.8 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($i=="src") {print $(i+1); exit}}')
+  if [[ -n "$src" ]]; then
+    warn "IPv4 监听地址将使用本机实际出口地址：$src"
+    echo "$src"
+  else
+    warn "无法确定本机 IPv4 出口地址，IPv4 监听回退到 0.0.0.0"
+    echo "0.0.0.0"
+  fi
+}
+
+local_ipv6_for_bind() {
+  local public_ip="$1" src
+  if [[ -n "$public_ip" ]] && ip -6 addr show scope global | grep -qw "$public_ip"; then
+    echo "$public_ip"
+    return 0
+  fi
+  if [[ -n "$public_ip" ]]; then
+    warn "检测到公网 IPv6 不在本机网卡上，可能是 NAT/特殊路由环境：$public_ip"
+  fi
+  src=$(ip -6 route get 2001:4860:4860::8888 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($i=="src") {print $(i+1); exit}}')
+  if [[ -n "$src" ]]; then
+    warn "IPv6 监听地址将使用本机实际出口地址：$src"
+    echo "$src"
+  else
+    warn "无法确定本机 IPv6 出口地址，将跳过需要 IPv6 精确监听的入站。"
+    echo ""
+  fi
+}
+
 get_proc_by_port() {
   local proto="$1" port="$2"
   ss -H -lpn "$proto" "sport = :$port" 2>/dev/null | awk '{print $NF}' | head -n1
@@ -442,19 +480,27 @@ create_dns_records() {
   [[ "$enable_cdn" == "1" ]] && proxied_base=true || proxied_base=false
 
   if [[ -n "$ip4" ]]; then
-    cf_upsert_record "$BASE_DOMAIN" A "$ip4" "$proxied_base"
-    if stack_has_direct_protocol "${IPV4_PROTOCOLS:-1}"; then
+    if stack_has_cdn "${IPV4_PROTOCOLS:-0}"; then
+      cf_upsert_record "$BASE_DOMAIN" A "$ip4" true
+    else
+      info "IPv4 未选择 CDN 协议 2，跳过 $BASE_DOMAIN 的 A 橙云记录创建。"
+    fi
+    if stack_has_direct_protocol "${IPV4_PROTOCOLS:-0}"; then
       cf_upsert_record "v4.$BASE_DOMAIN" A "$ip4" false
     else
-      info "IPv4 策略未启用直连，跳过 v4.$BASE_DOMAIN DNS 记录创建。"
+      info "IPv4 未选择直连协议 1/3/4，跳过 v4.$BASE_DOMAIN DNS 记录创建。"
     fi
   fi
   if [[ -n "$ip6" ]]; then
-    cf_upsert_record "$BASE_DOMAIN" AAAA "$ip6" "$proxied_base"
-    if stack_has_direct_protocol "${IPV6_PROTOCOLS:-1}"; then
+    if stack_has_cdn "${IPV6_PROTOCOLS:-0}"; then
+      cf_upsert_record "$BASE_DOMAIN" AAAA "$ip6" true
+    else
+      info "IPv6 未选择 CDN 协议 2，跳过 $BASE_DOMAIN 的 AAAA 橙云记录创建。"
+    fi
+    if stack_has_direct_protocol "${IPV6_PROTOCOLS:-0}"; then
       cf_upsert_record "v6.$BASE_DOMAIN" AAAA "$ip6" false
     else
-      info "IPv6 策略未启用直连，跳过 v6.$BASE_DOMAIN DNS 记录创建。"
+      info "IPv6 未选择直连协议 1/3/4，跳过 v6.$BASE_DOMAIN DNS 记录创建。"
     fi
   fi
   log "DNS 记录处理完成。最多 3 个域名：BASE、v4.BASE、v6.BASE。"
@@ -564,46 +610,22 @@ generate_keys_if_needed() {
 }
 
 select_protocols() {
-  echo "请选择要安装的协议组合，可输入多个数字，例如 123、1234、12345："
-  echo "1. [默认直连] VLESS + XHTTP + REALITY        CDN: no，端口默认 2443，可自定义"
-  echo "2. [最高隐藏] VLESS + XHTTP + TLS + CDN     CDN: yes，端口只能 CF HTTPS 白名单"
-  echo "3. [UDP 高速] Xray Hysteria2                CDN: no，UDP 默认 443，可自定义"
-  echo "4. [可选备用] VLESS + REALITY + Vision      CDN: no，端口默认 3443，可自定义"
-  echo "5. [高级实验] XHTTP CDN + REALITY 分离      Alpha 暂只占位"
+  load_state
   local p
-  local default_protocols
-  default_protocols="${PROTOCOLS:-$(build_default_protocols_from_stack_strategy)}"
-  p=$(ask "默认安装" "$default_protocols")
-  [[ "$p" =~ ^[1-5]+$ ]] || die "协议组合只能由 1-5 数字组成。"
-  if [[ "$p" == *1* && "${NEED_DIRECT_PROTOCOL:-1}" == "0" ]]; then
-    warn "当前 IPv4/IPv6 都没有选择 XHTTP+REALITY 直连，但协议组合包含 1。"
-    if confirm "是否移除协议 1，避免生成无效直连入站？" "Y"; then
-      p="${p//1/}"
-      [[ -z "$p" ]] && p="3"
-    fi
-  fi
-  if [[ "$p" == *2* && "${NEED_CDN_PROTOCOL:-1}" == "0" ]]; then
-    warn "你前面选择不生成 CDN 节点，但协议组合包含 2。"
-    if confirm "是否移除协议 2？" "Y"; then
-      p="${p//2/}"
-      [[ -z "$p" ]] && p="3"
-    fi
-  fi
-  if [[ "$p" == *3* && "${NEED_HY2_PROTOCOL:-1}" == "0" ]]; then
-    warn "你前面选择不生成 Hysteria2，但协议组合包含 3。"
-    if confirm "是否移除协议 3？" "Y"; then
-      p="${p//3/}"
-      [[ -z "$p" ]] && p="1"
-    fi
-  fi
-  if [[ "$p" == *4* && "${IPV4_PROTOCOLS:-0}" != *4* && "${IPV6_PROTOCOLS:-0}" != *4* ]]; then
-    warn "当前 IPv4/IPv6 都没有选择 REALITY+Vision，但协议组合包含 4。"
-    if confirm "是否移除协议 4？" "Y"; then
-      p="${p//4/}"
-      [[ -z "$p" ]] && p="3"
-    fi
-  fi
+  p="$(build_default_protocols_from_stack_strategy)"
   save_kv "$STATE_FILE" PROTOCOLS "$p"
+
+  echo "===== 已根据 v4/v6 选择自动生成协议组合 ====="
+  echo "IPv4 直连协议: ${IPV4_PROTOCOLS:-0}"
+  echo "IPv6 直连协议: ${IPV6_PROTOCOLS:-0}"
+  echo "全局协议组合: $p"
+  echo
+  echo "协议说明："
+  echo "1 = VLESS + XHTTP + REALITY，直连协议，用 v4/v6 子域名"
+  echo "2 = VLESS + XHTTP + TLS + CDN，全局 CDN 协议，用母域名"
+  echo "3 = Xray Hysteria2，全局 UDP 协议，用母域名"
+  echo "4 = VLESS + REALITY + Vision，可选备用直连协议，用 v4/v6 子域名"
+  echo
 
   if [[ "$p" == *2* ]]; then
     save_kv "$STATE_FILE" ENABLE_CDN "1"
@@ -612,6 +634,8 @@ select_protocols() {
     valid_port "$port" || die "端口无效。"
     is_cf_https_port "$port" || die "CDN 模式端口必须是 Cloudflare HTTPS 可代理端口：$CF_HTTPS_PORTS"
     save_kv "$STATE_FILE" CDN_PORT "$port"
+  else
+    save_kv "$STATE_FILE" ENABLE_CDN "0"
   fi
 
   if [[ "$p" == *1* ]]; then
@@ -619,6 +643,13 @@ select_protocols() {
     port=$(ask "XHTTP + REALITY 直连端口，默认推荐 2443，可自定义" "${XHTTP_REALITY_PORT:-2443}")
     valid_port "$port" || die "端口无效。"
     save_kv "$STATE_FILE" XHTTP_REALITY_PORT "$port"
+  fi
+
+  if [[ "$p" == *4* ]]; then
+    local port
+    port=$(ask "REALITY + Vision 端口，默认推荐 3443，可自定义" "${REALITY_VISION_PORT:-3443}")
+    valid_port "$port" || die "端口无效。"
+    save_kv "$STATE_FILE" REALITY_VISION_PORT "$port"
   fi
 
   if [[ "$p" == *3* ]]; then
@@ -629,17 +660,13 @@ select_protocols() {
     warn "Xray Hysteria2 是较新功能。如连接失败，优先检查客户端内核、UDP 放行和 Xray 版本。"
   fi
 
-  if [[ "$p" == *4* ]]; then
-    local port
-    port=$(ask "REALITY + Vision 端口，默认推荐 3443，可自定义" "${REALITY_VISION_PORT:-3443}")
-    valid_port "$port" || die "端口无效。"
-    save_kv "$STATE_FILE" REALITY_VISION_PORT "$port"
-  fi
-
-  if confirm "是否启用 v4/v6 出口绑定？v4 入站走 IPv4 出口，v6 入站走 IPv6 出口" "Y"; then
-    save_kv "$STATE_FILE" ENABLE_IP_STACK_BINDING "1"
-  else
-    save_kv "$STATE_FILE" ENABLE_IP_STACK_BINDING "0"
+  if [[ "$p" == *1* || "$p" == *4* ]]; then
+    if confirm "是否启用 v4/v6 出口绑定？v4 入站走 IPv4 出口，v6 入站走 IPv6 出口" "Y"; then
+      save_kv "$STATE_FILE" ENABLE_IP_STACK_BINDING "1"
+    else
+      warn "未启用出口绑定时，直连入站会使用 0.0.0.0 通用监听，v4/v6 精细分流能力会降低。"
+      save_kv "$STATE_FILE" ENABLE_IP_STACK_BINDING "0"
+    fi
   fi
 
   log "协议组合：$p"
@@ -693,7 +720,14 @@ restore_latest_nginx_config() {
 preflight_ports() {
   load_state
   info "端口预检..."
-  local p proc
+  local p proc need_xhttp=0 need_vision=0
+
+  if protocol_enabled 1 && { stack_has_xhttp_reality "${IPV4_PROTOCOLS:-0}" || stack_has_xhttp_reality "${IPV6_PROTOCOLS:-0}"; }; then
+    need_xhttp=1
+  fi
+  if protocol_enabled 4 && { stack_has_vision "${IPV4_PROTOCOLS:-0}" || stack_has_vision "${IPV6_PROTOCOLS:-0}"; }; then
+    need_vision=1
+  fi
 
   if protocol_enabled 2; then
     p="${CDN_PORT:-443}"
@@ -703,7 +737,7 @@ preflight_ports() {
     fi
   fi
 
-  if protocol_enabled 1 && [[ "$direct_needed" == "1" ]]; then
+  if [[ "$need_xhttp" == "1" ]]; then
     p="${XHTTP_REALITY_PORT:-2443}"
     proc=$(get_proc_by_port -t "$p" || true)
     if [[ -n "$proc" && "$proc" != *xray* ]]; then
@@ -711,7 +745,7 @@ preflight_ports() {
     fi
   fi
 
-  if protocol_enabled 4; then
+  if [[ "$need_vision" == "1" ]]; then
     p="${REALITY_VISION_PORT:-3443}"
     proc=$(get_proc_by_port -t "$p" || true)
     if [[ -n "$proc" && "$proc" != *xray* ]]; then
@@ -747,19 +781,29 @@ generate_xray_config() {
   backup_configs
   mkdir -p /usr/local/etc/xray
 
-  local in_tmp out_tmp route_tmp first_in=1 first_out=1 first_route=1 ip4 ip6 bind direct_needed
+  local in_tmp out_tmp route_tmp first_in=1 first_out=1 first_route=1 ip4 ip6 bind bind_ip4 bind_ip6
+  local need_xhttp=0 need_vision=0 need_hy2=0
   in_tmp=$(mktemp); out_tmp=$(mktemp); route_tmp=$(mktemp)
-  ip4="${PUBLIC_IPV4:-$(public_ipv4)}"; ip6="${PUBLIC_IPV6:-$(public_ipv6)}"
+  ip4="${PUBLIC_IPV4:-$(public_ipv4)}"
+  ip6="${PUBLIC_IPV6:-$(public_ipv6)}"
   [[ -n "$ip4" ]] && save_kv "$STATE_FILE" PUBLIC_IPV4 "$ip4"
   [[ -n "$ip6" ]] && save_kv "$STATE_FILE" PUBLIC_IPV6 "$ip6"
+  bind_ip4=""
+  bind_ip6=""
+  [[ -n "$ip4" ]] && bind_ip4="$(local_ipv4_for_bind "$ip4")" && save_kv "$STATE_FILE" BIND_IPV4 "$bind_ip4"
+  [[ -n "$ip6" ]] && bind_ip6="$(local_ipv6_for_bind "$ip6")" && save_kv "$STATE_FILE" BIND_IPV6 "$bind_ip6"
   bind="${ENABLE_IP_STACK_BINDING:-1}"
-  if mode_has_direct "${IPV4_STRATEGY:-3}" || mode_has_direct "${IPV6_STRATEGY:-3}"; then
-    direct_needed="1"
-  else
-    direct_needed="0"
+
+  if protocol_enabled 1 && { stack_has_xhttp_reality "${IPV4_PROTOCOLS:-0}" || stack_has_xhttp_reality "${IPV6_PROTOCOLS:-0}"; }; then
+    need_xhttp=1
+  fi
+  if protocol_enabled 3 && { stack_has_hy2 "${IPV4_PROTOCOLS:-0}" || stack_has_hy2 "${IPV6_PROTOCOLS:-0}"; }; then
+    need_hy2=1
+  fi
+  if protocol_enabled 4 && { stack_has_vision "${IPV4_PROTOCOLS:-0}" || stack_has_vision "${IPV6_PROTOCOLS:-0}"; }; then
+    need_vision=1
   fi
 
-  # Outbounds
   append_json_obj "$out_tmp" first_out <<'EOF'
     {"tag": "direct", "protocol": "freedom"}
 EOF
@@ -773,12 +817,14 @@ EOF
     {"tag": "out-v6", "protocol": "freedom", "settings": {"domainStrategy": "UseIPv6"}}
 EOF
 
-  if protocol_enabled 1; then
-    if [[ "$bind" == "1" && -n "$ip4" && ( "${IPV4_STRATEGY:-3}" == "1" || "${IPV4_STRATEGY:-3}" == "3" ) ]]; then
+  # Per-stack direct inbounds are always bound to the selected stack IP.
+  # ENABLE_IP_STACK_BINDING controls outbound routing only, not listener separation.
+  if [[ "$need_xhttp" == "1" ]]; then
+    if [[ -n "$bind_ip4" && "${IPV4_PROTOCOLS:-0}" == *1* ]]; then
       append_json_obj "$in_tmp" first_in <<EOF
     {
       "tag": "in-v4-xhttp-reality",
-      "listen": "${ip4}",
+      "listen": "${bind_ip4}",
       "port": ${XHTTP_REALITY_PORT},
       "protocol": "vless",
       "settings": {"clients": [{"id": "${UUID}", "email": "v4-xhttp-reality"}], "decryption": "none"},
@@ -790,16 +836,20 @@ EOF
       }
     }
 EOF
-      append_json_obj "$route_tmp" first_route <<'EOF'
+      if [[ "$bind" == "1" ]]; then
+        append_json_obj "$route_tmp" first_route <<'EOF'
     {"type": "field", "inboundTag": ["in-v4-xhttp-reality"], "outboundTag": "out-v4"}
 EOF
+      fi
+    elif [[ "${IPV4_PROTOCOLS:-0}" == *1* ]]; then
+      warn "IPv4 选择了协议 1，但未检测到公网 IPv4，跳过 v4 XHTTP+REALITY 入站。"
     fi
 
-    if [[ "$bind" == "1" && -n "$ip6" && ( "${IPV6_STRATEGY:-3}" == "1" || "${IPV6_STRATEGY:-3}" == "3" ) ]]; then
+    if [[ -n "$bind_ip6" && "${IPV6_PROTOCOLS:-0}" == *1* ]]; then
       append_json_obj "$in_tmp" first_in <<EOF
     {
       "tag": "in-v6-xhttp-reality",
-      "listen": "${ip6}",
+      "listen": "${bind_ip6}",
       "port": ${XHTTP_REALITY_PORT},
       "protocol": "vless",
       "settings": {"clients": [{"id": "${UUID}", "email": "v6-xhttp-reality"}], "decryption": "none"},
@@ -811,30 +861,14 @@ EOF
       }
     }
 EOF
-      append_json_obj "$route_tmp" first_route <<'EOF'
+      if [[ "$bind" == "1" ]]; then
+        append_json_obj "$route_tmp" first_route <<'EOF'
     {"type": "field", "inboundTag": ["in-v6-xhttp-reality"], "outboundTag": "out-v6"}
 EOF
+      fi
+    elif [[ "${IPV6_PROTOCOLS:-0}" == *1* ]]; then
+      warn "IPv6 选择了协议 1，但未检测到公网 IPv6，跳过 v6 XHTTP+REALITY 入站。"
     fi
-
-    if [[ "$bind" != "1" && "$direct_needed" == "1" ]]; then
-      append_json_obj "$in_tmp" first_in <<EOF
-    {
-      "tag": "in-xhttp-reality",
-      "listen": "0.0.0.0",
-      "port": ${XHTTP_REALITY_PORT},
-      "protocol": "vless",
-      "settings": {"clients": [{"id": "${UUID}", "email": "xhttp-reality"}], "decryption": "none"},
-      "streamSettings": {
-        "network": "xhttp",
-        "security": "reality",
-        "xhttpSettings": {"path": "${XHTTP_REALITY_PATH}", "mode": "auto"},
-        "realitySettings": {"show": false, "dest": "${REALITY_TARGET}:443", "serverNames": ["${REALITY_TARGET}"], "privateKey": "${REALITY_PRIVATE_KEY}", "shortIds": ["${SHORT_ID}"]}
-      }
-    }
-EOF
-    fi
-  elif protocol_enabled 1 && [[ "$direct_needed" != "1" ]]; then
-    warn "协议 1 已选择，但分栈策略没有启用任何直连栈，已跳过 XHTTP+REALITY 入站生成。"
   fi
 
   if protocol_enabled 2; then
@@ -850,14 +884,15 @@ EOF
 EOF
   fi
 
-  if protocol_enabled 3; then
-    append_json_obj "$in_tmp" first_in <<EOF
+  if [[ "$need_hy2" == "1" ]]; then
+    if [[ -n "$bind_ip4" && "${IPV4_PROTOCOLS:-0}" == *3* ]]; then
+      append_json_obj "$in_tmp" first_in <<EOF
     {
-      "tag": "in-hysteria2-udp",
-      "listen": "0.0.0.0",
+      "tag": "in-v4-hysteria2-udp",
+      "listen": "${bind_ip4}",
       "port": ${HY2_PORT},
       "protocol": "hysteria",
-      "settings": {"version": 2, "clients": [{"auth": "${HY2_AUTH}", "email": "hy2"}]},
+      "settings": {"version": 2, "clients": [{"auth": "${HY2_AUTH}", "email": "v4-hy2"}]},
       "streamSettings": {
         "network": "hysteria",
         "security": "tls",
@@ -866,16 +901,50 @@ EOF
       }
     }
 EOF
+      if [[ "$bind" == "1" ]]; then
+        append_json_obj "$route_tmp" first_route <<'EOF'
+    {"type": "field", "inboundTag": ["in-v4-hysteria2-udp"], "outboundTag": "out-v4"}
+EOF
+      fi
+    elif [[ "${IPV4_PROTOCOLS:-0}" == *3* ]]; then
+      warn "IPv4 选择了协议 3，但未检测到公网 IPv4，跳过 v4 Hysteria2 入站。"
+    fi
+
+    if [[ -n "$bind_ip6" && "${IPV6_PROTOCOLS:-0}" == *3* ]]; then
+      append_json_obj "$in_tmp" first_in <<EOF
+    {
+      "tag": "in-v6-hysteria2-udp",
+      "listen": "${bind_ip6}",
+      "port": ${HY2_PORT},
+      "protocol": "hysteria",
+      "settings": {"version": 2, "clients": [{"auth": "${HY2_AUTH}", "email": "v6-hy2"}]},
+      "streamSettings": {
+        "network": "hysteria",
+        "security": "tls",
+        "tlsSettings": {"certificates": [{"certificateFile": "/etc/letsencrypt/live/${BASE_DOMAIN}/fullchain.pem", "keyFile": "/etc/letsencrypt/live/${BASE_DOMAIN}/privkey.pem"}]},
+        "hysteriaSettings": {"version": 2, "auth": "${HY2_AUTH}", "udpIdleTimeout": 60}
+      }
+    }
+EOF
+      if [[ "$bind" == "1" ]]; then
+        append_json_obj "$route_tmp" first_route <<'EOF'
+    {"type": "field", "inboundTag": ["in-v6-hysteria2-udp"], "outboundTag": "out-v6"}
+EOF
+      fi
+    elif [[ "${IPV6_PROTOCOLS:-0}" == *3* ]]; then
+      warn "IPv6 选择了协议 3，但未检测到公网 IPv6，跳过 v6 Hysteria2 入站。"
+    fi
   fi
 
-  if protocol_enabled 4; then
-    append_json_obj "$in_tmp" first_in <<EOF
+  if [[ "$need_vision" == "1" ]]; then
+    if [[ -n "$bind_ip4" && "${IPV4_PROTOCOLS:-0}" == *4* ]]; then
+      append_json_obj "$in_tmp" first_in <<EOF
     {
-      "tag": "in-reality-vision",
-      "listen": "0.0.0.0",
+      "tag": "in-v4-reality-vision",
+      "listen": "${bind_ip4}",
       "port": ${REALITY_VISION_PORT},
       "protocol": "vless",
-      "settings": {"clients": [{"id": "${UUID}", "flow": "xtls-rprx-vision", "email": "reality-vision"}], "decryption": "none"},
+      "settings": {"clients": [{"id": "${UUID}", "flow": "xtls-rprx-vision", "email": "v4-reality-vision"}], "decryption": "none"},
       "streamSettings": {
         "network": "raw",
         "security": "reality",
@@ -883,6 +952,38 @@ EOF
       }
     }
 EOF
+      if [[ "$bind" == "1" ]]; then
+        append_json_obj "$route_tmp" first_route <<'EOF'
+    {"type": "field", "inboundTag": ["in-v4-reality-vision"], "outboundTag": "out-v4"}
+EOF
+      fi
+    elif [[ "${IPV4_PROTOCOLS:-0}" == *4* ]]; then
+      warn "IPv4 选择了协议 4，但未检测到公网 IPv4，跳过 v4 REALITY+Vision 入站。"
+    fi
+
+    if [[ -n "$bind_ip6" && "${IPV6_PROTOCOLS:-0}" == *4* ]]; then
+      append_json_obj "$in_tmp" first_in <<EOF
+    {
+      "tag": "in-v6-reality-vision",
+      "listen": "${bind_ip6}",
+      "port": ${REALITY_VISION_PORT},
+      "protocol": "vless",
+      "settings": {"clients": [{"id": "${UUID}", "flow": "xtls-rprx-vision", "email": "v6-reality-vision"}], "decryption": "none"},
+      "streamSettings": {
+        "network": "raw",
+        "security": "reality",
+        "realitySettings": {"show": false, "dest": "${REALITY_TARGET}:443", "serverNames": ["${REALITY_TARGET}"], "privateKey": "${REALITY_PRIVATE_KEY}", "shortIds": ["${SHORT_ID}"]}
+      }
+    }
+EOF
+      if [[ "$bind" == "1" ]]; then
+        append_json_obj "$route_tmp" first_route <<'EOF'
+    {"type": "field", "inboundTag": ["in-v6-reality-vision"], "outboundTag": "out-v6"}
+EOF
+      fi
+    elif [[ "${IPV6_PROTOCOLS:-0}" == *4* ]]; then
+      warn "IPv6 选择了协议 4，但未检测到公网 IPv6，跳过 v6 REALITY+Vision 入站。"
+    fi
   fi
 
   cat >"$XRAY_CONFIG" <<EOF
@@ -919,6 +1020,11 @@ configure_nginx() {
   generate_keys_if_needed
   load_state
   mkdir -p "$WEB_ROOT" "$SUB_DIR"
+  local nginx_http_v6_listen="" nginx_https_v6_listen=""
+  if [[ -n "${PUBLIC_IPV6:-}" && "${IPV6_PROTOCOLS:-0}" == *2* ]]; then
+    nginx_http_v6_listen="    listen [::]:80;"
+    nginx_https_v6_listen="    listen [::]:${CDN_PORT:-443} ssl http2;"
+  fi
   cat >"$WEB_ROOT/index.html" <<EOF
 <!doctype html><html><head><meta charset="utf-8"><title>Welcome</title></head><body><h1>Welcome</h1><p>It works.</p></body></html>
 EOF
@@ -926,12 +1032,14 @@ EOF
   cat >"$NGINX_SITE" <<EOF
 server {
     listen 80;
+${nginx_http_v6_listen}
     server_name ${BASE_DOMAIN};
     return 301 https://\$host\$request_uri;
 }
 
 server {
     listen ${CDN_PORT:-443} ssl http2;
+${nginx_https_v6_listen}
     server_name ${BASE_DOMAIN};
 
     ssl_certificate /etc/letsencrypt/live/${BASE_DOMAIN}/fullchain.pem;
@@ -1003,7 +1111,27 @@ stack_protocols_has() {
 
 stack_has_direct_protocol() {
   local protos="$1"
-  [[ "$protos" == *"1"* || "$protos" == *"4"* ]]
+  [[ "$protos" == *"1"* || "$protos" == *"3"* || "$protos" == *"4"* ]]
+}
+
+stack_has_xhttp_reality() {
+  local protos="$1"
+  [[ "$protos" == *"1"* ]]
+}
+
+stack_has_cdn() {
+  local protos="$1"
+  [[ "$protos" == *"2"* ]]
+}
+
+stack_has_hy2() {
+  local protos="$1"
+  [[ "$protos" == *"3"* ]]
+}
+
+stack_has_vision() {
+  local protos="$1"
+  [[ "$protos" == *"4"* ]]
 }
 
 normalize_stack_protocols() {
@@ -1012,7 +1140,10 @@ normalize_stack_protocols() {
   p="${p// /}"
   [[ "$p" == "0" || -z "$p" ]] && { echo "0"; return 0; }
   [[ "$p" == *1* ]] && out="${out}1"
+  [[ "$p" == *2* ]] && out="${out}2"
+  [[ "$p" == *3* ]] && out="${out}3"
   [[ "$p" == *4* ]] && out="${out}4"
+  [[ "$p" == *5* ]] && out="${out}5"
   [[ -z "$out" ]] && out="0"
   echo "$out"
 }
@@ -1020,82 +1151,66 @@ normalize_stack_protocols() {
 select_one_stack_protocols() {
   local label="$1" current="$2" default_mode="$3" mode normalized
   echo >&2
-  echo "===== ${label} 直连协议选择 =====" >&2
-  echo "0. 不生成 ${label} 直连节点" >&2
-  echo "1. 生成 ${label} VLESS + XHTTP + REALITY" >&2
-  echo "4. 生成 ${label} VLESS + REALITY + Vision，可选备用" >&2
-  echo "14. 同时生成 ${label} 的 XHTTP+REALITY 和 REALITY+Vision" >&2
-  echo "说明：CDN 节点使用母域名 node.example.com，是全局节点，不在这里按 v4/v6 拆分。" >&2
-  mode=$(ask "请选择 ${label} 直连协议" "${current:-$default_mode}")
+  echo "===== ${label} 协议组合选择 =====" >&2
+  echo "0. 不生成 ${label} 节点" >&2
+  echo "1. ${label} VLESS + XHTTP + REALITY，直连，默认主力" >&2
+  echo "2. ${label} VLESS + XHTTP + TLS + CDN，CDN 隐藏，使用母域名" >&2
+  echo "3. ${label} Xray Hysteria2，UDP 高速备用" >&2
+  echo "4. ${label} VLESS + REALITY + Vision，可选直连备用" >&2
+  echo "5. ${label} XHTTP CDN + REALITY 分离，实验占位" >&2
+  echo "可以输入组合，例如：123、13、23、1234。" >&2
+  mode=$(ask "请选择 ${label} 协议组合" "${current:-$default_mode}")
   normalized=$(normalize_stack_protocols "$mode")
   echo "$normalized"
 }
 
 select_ip_stack_strategy() {
   load_state
-  local ip4 ip6 v4_protos v6_protos enable_cdn enable_hy2 default_p
+  local ip4 ip6 v4_protos v6_protos default_p
   ip4="${PUBLIC_IPV4:-$(public_ipv4)}"
   ip6="${PUBLIC_IPV6:-$(public_ipv6)}"
   [[ -n "$ip4" ]] && save_kv "$STATE_FILE" PUBLIC_IPV4 "$ip4"
   [[ -n "$ip6" ]] && save_kv "$STATE_FILE" PUBLIC_IPV6 "$ip6"
 
   echo
-  echo "===== IPv4 / IPv6 分协议部署 ====="
+  echo "===== IPv4 / IPv6 独立协议组合 ====="
   echo "说明："
-  echo "  v4.node.example.com / v6.node.example.com 用于直连协议。"
-  echo "  node.example.com 用于 CDN、伪装站和订阅。"
-  echo "  CDN 节点是母域名全局节点，不严格区分 v4/v6。"
+  echo "  IPv4 和 IPv6 各自输入协议组合，例如 IPv4=123，IPv6=13。"
+  echo "  1/4 是直连协议，使用 v4.node.example.com / v6.node.example.com。"
+  echo "  2 是 CDN 协议，使用母域名 node.example.com；IPv4 选 2 创建母域名 A 橙云，IPv6 选 2 创建母域名 AAAA 橙云。"
+  echo "  3 是 HY2 UDP 协议，按对应栈生成 v4/v6 节点。"
 
   if [[ -n "$ip4" ]]; then
-    v4_protos=$(select_one_stack_protocols "IPv4" "${IPV4_PROTOCOLS:-}" "1")
+    v4_protos=$(select_one_stack_protocols "IPv4" "${IPV4_PROTOCOLS:-}" "123")
     save_kv "$STATE_FILE" IPV4_PROTOCOLS "$v4_protos"
   else
     save_kv "$STATE_FILE" IPV4_PROTOCOLS "0"
-    warn "未检测到 IPv4，IPv4 直连协议设为 0。"
+    warn "未检测到 IPv4，IPv4 协议组合设为 0。"
   fi
 
   if [[ -n "$ip6" ]]; then
-    v6_protos=$(select_one_stack_protocols "IPv6" "${IPV6_PROTOCOLS:-}" "1")
+    v6_protos=$(select_one_stack_protocols "IPv6" "${IPV6_PROTOCOLS:-}" "123")
     save_kv "$STATE_FILE" IPV6_PROTOCOLS "$v6_protos"
   else
     save_kv "$STATE_FILE" IPV6_PROTOCOLS "0"
-    warn "未检测到 IPv6，IPv6 直连协议设为 0。"
-  fi
-
-  load_state
-  if stack_has_direct_protocol "${IPV4_PROTOCOLS:-0}" || stack_has_direct_protocol "${IPV6_PROTOCOLS:-0}"; then
-    save_kv "$STATE_FILE" NEED_DIRECT_PROTOCOL "1"
-  else
-    save_kv "$STATE_FILE" NEED_DIRECT_PROTOCOL "0"
-  fi
-
-  if confirm "是否生成全局 CDN 节点：VLESS + XHTTP + TLS + CDN？" "Y"; then
-    save_kv "$STATE_FILE" NEED_CDN_PROTOCOL "1"
-    save_kv "$STATE_FILE" ENABLE_CDN "1"
-  else
-    save_kv "$STATE_FILE" NEED_CDN_PROTOCOL "0"
-    save_kv "$STATE_FILE" ENABLE_CDN "0"
-  fi
-
-  if confirm "是否生成全局 Hysteria2 UDP 节点？" "Y"; then
-    save_kv "$STATE_FILE" NEED_HY2_PROTOCOL "1"
-  else
-    save_kv "$STATE_FILE" NEED_HY2_PROTOCOL "0"
+    warn "未检测到 IPv6，IPv6 协议组合设为 0。"
   fi
 
   default_p=$(build_default_protocols_from_stack_strategy)
   save_kv "$STATE_FILE" PROTOCOLS "$default_p"
-  log "分协议策略已保存：IPv4=${IPV4_PROTOCOLS:-0} IPv6=${IPV6_PROTOCOLS:-0} 全局协议=${default_p}"
+  if [[ "$default_p" == *2* ]]; then save_kv "$STATE_FILE" ENABLE_CDN "1"; else save_kv "$STATE_FILE" ENABLE_CDN "0"; fi
+  log "协议策略已保存：IPv4=${IPV4_PROTOCOLS:-0} IPv6=${IPV6_PROTOCOLS:-0} 实际需要=${default_p}"
 }
 
 build_default_protocols_from_stack_strategy() {
   load_state
   local p=""
-  if [[ "${IPV4_PROTOCOLS:-0}" == *1* || "${IPV6_PROTOCOLS:-0}" == *1* ]]; then p="${p}1"; fi
-  if [[ "${NEED_CDN_PROTOCOL:-1}" == "1" ]]; then p="${p}2"; fi
-  if [[ "${NEED_HY2_PROTOCOL:-1}" == "1" ]]; then p="${p}3"; fi
-  if [[ "${IPV4_PROTOCOLS:-0}" == *4* || "${IPV6_PROTOCOLS:-0}" == *4* ]]; then p="${p}4"; fi
-  [[ -z "$p" ]] && p="3"
+  [[ "${IPV4_PROTOCOLS:-0}" == *1* || "${IPV6_PROTOCOLS:-0}" == *1* ]] && p="${p}1"
+  [[ "${IPV4_PROTOCOLS:-0}" == *2* || "${IPV6_PROTOCOLS:-0}" == *2* ]] && p="${p}2"
+  [[ "${IPV4_PROTOCOLS:-0}" == *3* || "${IPV6_PROTOCOLS:-0}" == *3* ]] && p="${p}3"
+  [[ "${IPV4_PROTOCOLS:-0}" == *4* || "${IPV6_PROTOCOLS:-0}" == *4* ]] && p="${p}4"
+  [[ "${IPV4_PROTOCOLS:-0}" == *5* || "${IPV6_PROTOCOLS:-0}" == *5* ]] && p="${p}5"
+  [[ -z "$p" ]] && p="0"
   echo "$p"
 }
 
@@ -1214,8 +1329,8 @@ generate_subscription() {
   : >"$raw"
 
   if protocol_enabled 1; then
-    [[ -n "${PUBLIC_IPV4:-}" && ( "${IPV4_STRATEGY:-3}" == "1" || "${IPV4_STRATEGY:-3}" == "3" ) ]] && add_vless_xhttp_reality_link "v4.${BASE_DOMAIN}" "${NODE_NAME:-node}-v4-XHTTP-REALITY" "$raw"
-    [[ -n "${PUBLIC_IPV6:-}" && ( "${IPV6_STRATEGY:-3}" == "1" || "${IPV6_STRATEGY:-3}" == "3" ) ]] && add_vless_xhttp_reality_link "v6.${BASE_DOMAIN}" "${NODE_NAME:-node}-v6-XHTTP-REALITY" "$raw"
+    [[ -n "${PUBLIC_IPV4:-}" && "${IPV4_PROTOCOLS:-0}" == *1* ]] && add_vless_xhttp_reality_link "v4.${BASE_DOMAIN}" "${NODE_NAME:-node}-v4-XHTTP-REALITY" "$raw"
+    [[ -n "${PUBLIC_IPV6:-}" && "${IPV6_PROTOCOLS:-0}" == *1* ]] && add_vless_xhttp_reality_link "v6.${BASE_DOMAIN}" "${NODE_NAME:-node}-v6-XHTTP-REALITY" "$raw"
   fi
 
   if protocol_enabled 2; then
@@ -1231,11 +1346,14 @@ generate_subscription() {
     fi
   fi
 
-  protocol_enabled 3 && add_hy2_link "$BASE_DOMAIN" "${NODE_NAME:-node}-HY2-UDP${HY2_PORT:-443}" "$raw"
+  if protocol_enabled 3; then
+    [[ -n "${PUBLIC_IPV4:-}" && "${IPV4_PROTOCOLS:-0}" == *3* ]] && add_hy2_link "v4.${BASE_DOMAIN}" "${NODE_NAME:-node}-v4-HY2-UDP${HY2_PORT:-443}" "$raw"
+    [[ -n "${PUBLIC_IPV6:-}" && "${IPV6_PROTOCOLS:-0}" == *3* ]] && add_hy2_link "v6.${BASE_DOMAIN}" "${NODE_NAME:-node}-v6-HY2-UDP${HY2_PORT:-443}" "$raw"
+  fi
 
   if protocol_enabled 4; then
-    [[ -n "${PUBLIC_IPV4:-}" ]] && add_reality_vision_link "v4.${BASE_DOMAIN}" "${NODE_NAME:-node}-v4-REALITY-Vision" "$raw"
-    [[ -n "${PUBLIC_IPV6:-}" ]] && add_reality_vision_link "v6.${BASE_DOMAIN}" "${NODE_NAME:-node}-v6-REALITY-Vision" "$raw"
+    [[ -n "${PUBLIC_IPV4:-}" && "${IPV4_PROTOCOLS:-0}" == *4* ]] && add_reality_vision_link "v4.${BASE_DOMAIN}" "${NODE_NAME:-node}-v4-REALITY-Vision" "$raw"
+    [[ -n "${PUBLIC_IPV6:-}" && "${IPV6_PROTOCOLS:-0}" == *4* ]] && add_reality_vision_link "v6.${BASE_DOMAIN}" "${NODE_NAME:-node}-v6-REALITY-Vision" "$raw"
   fi
 
   sed -i '/^$/d' "$raw"
@@ -1712,7 +1830,7 @@ main_menu() {
     echo "6. Cloudflare 域名 / DNS / 小云朵管理"
     echo "7. 证书申请 / 续签 / 自动部署"
     echo "8. 查询 IPv4 / IPv6 / ASN 辅助报告"
-    echo "9. IPv4 / IPv6 分栈策略 + 协议组合并生成 Xray 配置"
+    echo "9. IPv4 / IPv6 分协议部署 + 生成 Xray 配置"
     echo "10. 配置 CDN / Nginx / 伪装站"
     echo "11. BestCF 优选域名管理，默认关闭"
     echo "12. 配置 Hysteria2 端口跳跃"
