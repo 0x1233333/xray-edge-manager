@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Xray Edge Manager / Xray Anti-Block Manager
-# v0.0.14 safe state writer, HY2 mport, BestCF fallback single-file installer
+# v0.0.21 HY2 NAT lifecycle and off-peak geodata timer
 #
 # Features:
 # - Xray-core only, no Docker, no sing-box
@@ -21,6 +21,17 @@
 # No personal domains, emails, IPs, or tokens are embedded in this script.
 
 set -Eeuo pipefail
+
+# Global temp cleanup registry. Any temp file/dir registered here will be
+# removed on normal exit or interruption. Missing paths are ignored.
+declare -a GLOBAL_TEMP_FILES=()
+cleanup_resources(){
+  local tmp
+  for tmp in "${GLOBAL_TEMP_FILES[@]:-}"; do
+    [[ -n "$tmp" && -e "$tmp" ]] && rm -rf -- "$tmp" 2>/dev/null || true
+  done
+}
+trap cleanup_resources EXIT INT TERM HUP QUIT
 
 APP_DIR="/root/.xray-edge-manager"
 STATE_FILE="$APP_DIR/state.env"
@@ -59,6 +70,25 @@ die()  { err "$*"; exit 1; }
 pause(){ read -r -p "按回车继续..." _ || true; }
 need_root(){ [[ "${EUID:-$(id -u)}" -eq 0 ]] || die "请使用 root 运行。"; }
 
+register_temp_path(){
+  local tmp="$1"
+  [[ -n "$tmp" ]] && GLOBAL_TEMP_FILES+=("$tmp")
+}
+
+mktemp_file(){
+  local tmp
+  tmp="$(mktemp "$@")" || die "创建临时文件失败。"
+  register_temp_path "$tmp"
+  echo "$tmp"
+}
+
+mktemp_dir(){
+  local tmp
+  tmp="$(mktemp -d "$@")" || die "创建临时目录失败。"
+  register_temp_path "$tmp"
+  echo "$tmp"
+}
+
 acquire_lock(){
   exec 9>"$LOCK_FILE"
   if ! flock -n 9; then
@@ -67,9 +97,39 @@ acquire_lock(){
   fi
 }
 
+safe_source_env_file(){
+  local file="$1" line key n=0
+  [[ -f "$file" ]] || return 0
+
+  # Do not source symlinks. State files contain credentials and are expected to
+  # be regular files under APP_DIR.
+  [[ ! -L "$file" ]] || die "拒绝读取符号链接状态文件：$file"
+  chmod 600 "$file" 2>/dev/null || true
+
+  # Keep compatibility with save_kv bash %q format, but reject lines that can
+  # perform shell execution when sourced. This avoids a risky state migration.
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    n=$((n + 1))
+    [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+    [[ "$line" =~ ^[[:space:]]*# ]] && continue
+    [[ "$line" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] || die "状态文件格式非法：$file:$n"
+    key="${line%%=*}"
+    [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "状态文件键名非法：$file:$n"
+
+    case "$line" in
+      *'$('*|*'`'*|*';'*|*'&'*|*'|'*|*'<'*|*'>'*)
+        die "状态文件包含不安全字符，拒绝 source：$file:$n"
+        ;;
+    esac
+  done < "$file"
+
+  # shellcheck disable=SC1090
+  source "$file"
+}
+
 load_state(){
-  if [[ -f "$STATE_FILE" ]]; then source "$STATE_FILE"; fi
-  if [[ -f "$CF_ENV" ]]; then source "$CF_ENV"; fi
+  safe_source_env_file "$STATE_FILE"
+  safe_source_env_file "$CF_ENV"
   return 0
 }
 
@@ -81,7 +141,7 @@ save_kv(){
   chmod 600 "$file" 2>/dev/null || true
   printf -v q '%q' "$value"
 
-  tmp="$(mktemp "${file}.tmp.XXXXXX")" || die "无法创建临时状态文件：${file}.tmp"
+  tmp="$(mktemp_file "${file}.tmp.XXXXXX")"
   awk -v k="$key" -v v="$q" '
     BEGIN { found = 0 }
     index($0, k "=") == 1 {
@@ -129,6 +189,21 @@ valid_port(){
 is_cf_https_port(){
   local p="$1" x
   for x in $CF_HTTPS_PORTS; do [[ "$p" == "$x" ]] && return 0; done
+  return 1
+}
+
+version_ge(){
+  local current="$1" minimum="$2" first
+  [[ -n "$current" && -n "$minimum" ]] || return 1
+  if command -v dpkg >/dev/null 2>&1; then
+    dpkg --compare-versions "$current" ge "$minimum"
+    return $?
+  fi
+  if command -v sort >/dev/null 2>&1; then
+    first=$(printf '%s\n%s\n' "$minimum" "$current" | sort -V | head -n1)
+    [[ "$first" == "$minimum" ]]
+    return $?
+  fi
   return 1
 }
 
@@ -194,30 +269,66 @@ install_deps(){
     curl wget jq openssl ca-certificates gnupg lsb-release \
     nginx certbot python3-certbot-dns-cloudflare \
     whois iproute2 iputils-ping iptables nftables tcpdump unzip tar sed grep coreutils perl \
-    cron socat util-linux
+    cron socat util-linux conntrack logrotate
   log "基础依赖安装完成。"
 }
 
+
+install_xray_logrotate(){
+  if [[ -d /etc/logrotate.d ]]; then
+    cat >/etc/logrotate.d/xray <<'EOF2'
+/var/log/xray/*.log {
+    daily
+    maxsize 20M
+    rotate 7
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+    create 0640 root root
+}
+EOF2
+  else
+    warn "未找到 /etc/logrotate.d，跳过 Xray 日志轮转配置。"
+  fi
+}
+
+install_xray_systemd_restart_policy(){
+  mkdir -p /etc/systemd/system/xray.service.d
+  cat >/etc/systemd/system/xray.service.d/10-xem-restart.conf <<'EOF2'
+[Unit]
+StartLimitIntervalSec=0
+
+[Service]
+Restart=on-failure
+RestartSec=5s
+EOF2
+}
 
 ensure_xray_service(){
   need_root
   command -v xray >/dev/null 2>&1 || die "未找到 xray 二进制文件，请先安装/升级 Xray-core。"
   mkdir -p /usr/local/etc/xray /var/log/xray /etc/systemd/system
 
+  install_xray_logrotate
+
   # Some uninstall/reinstall paths can leave the xray binary installed while the
   # systemd unit has been removed. Recreate a minimal service unit if needed.
   if [[ ! -f /etc/systemd/system/xray.service ]] && ! systemctl list-unit-files --type=service 2>/dev/null | awk '{print $1}' | grep -qx 'xray.service'; then
     warn "未检测到 xray.service，正在自动重建 systemd 服务。"
-    cat >/etc/systemd/system/xray.service <<'EOF'
+    cat >/etc/systemd/system/xray.service <<'EOF2'
 [Unit]
 Description=Xray Service
 Documentation=https://github.com/xtls
 After=network.target nss-lookup.target
+StartLimitIntervalSec=0
 
 [Service]
 User=root
 ExecStart=/usr/local/bin/xray run -config /usr/local/etc/xray/config.json
 Restart=on-failure
+RestartSec=5s
 RestartPreventExitStatus=23
 LimitNPROC=10000
 LimitNOFILE=1000000
@@ -226,8 +337,12 @@ RuntimeDirectoryMode=0755
 
 [Install]
 WantedBy=multi-user.target
-EOF
+EOF2
   fi
+
+  # Always add a drop-in so official installer generated services also get the
+  # anti-crash restart policy without replacing their full unit file.
+  install_xray_systemd_restart_policy
 
   systemctl daemon-reload
   systemctl enable xray >/dev/null 2>&1 || true
@@ -235,8 +350,20 @@ EOF
 
 install_or_upgrade_xray(){
   need_root
+  local installer installer_url
+  installer_url="https://github.com/XTLS/Xray-install/raw/main/install-release.sh"
+
+  warn "即将从 XTLS/Xray-install 官方仓库下载并执行 Xray 安装脚本。"
+  warn "这仍然属于远程脚本信任模型；脚本会先下载到临时文件并做 bash -n 语法检查，不再使用 curl | bash 直通执行。"
+  if [[ "${XEM_TRUST_REMOTE_XRAY_INSTALL:-0}" != "1" ]]; then
+    confirm "是否继续安装/升级 Xray-core？" "N" || die "已取消远程安装。你也可以先手动安装 xray，再回到脚本生成配置。"
+  fi
+
   info "安装/升级 Xray-core..."
-  bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install -u root
+  installer="$(mktemp_file /tmp/xray-install.XXXXXX.sh)"
+  curl -fL --retry 3 --retry-delay 2 --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time 120 -o "$installer" "$installer_url" || die "下载 Xray 官方安装脚本失败。"
+  bash -n "$installer" || die "下载的 Xray 安装脚本语法检查失败，拒绝执行。"
+  bash "$installer" install -u root
   ensure_xray_service
   log "Xray 安装/升级完成。"
   xray version || true
@@ -245,7 +372,7 @@ install_or_upgrade_xray(){
 update_geodata(){
   need_root
   local tmp status geoip_url geosite_url
-  tmp="$(mktemp -d)"
+  tmp="$(mktemp_dir)"
   status=0
   geoip_url="https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat"
   geosite_url="https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat"
@@ -309,11 +436,10 @@ ExecStart=/usr/local/bin/xem --geodata-update
 EOF2
   cat >/etc/systemd/system/xem-geodata-update.timer <<'EOF2'
 [Unit]
-Description=Run safe Xray geodata update every 3 days
+Description=Run safe Xray geodata update weekly during off-peak hours
 
 [Timer]
-OnBootSec=20min
-OnUnitActiveSec=3d
+OnCalendar=Mon *-*-* 04:00:00
 RandomizedDelaySec=1h
 Persistent=true
 
@@ -322,7 +448,7 @@ WantedBy=timers.target
 EOF2
   systemctl daemon-reload
   systemctl enable --now xem-geodata-update.timer
-  log "geodata 安全自动更新已启用：每 3 天一次。"
+  log "geodata 安全自动更新已启用：每周一凌晨 4-5 点期间执行。"
 }
 
 disable_geodata_timer(){
@@ -425,7 +551,7 @@ setup_cloudflare(){
   [[ -n "$token" ]] || die "API Token 不能为空。"
   cloudflare_token_risk_check "$token"
   save_kv "$CF_ENV" CF_API_TOKEN "$token"
-  source "$CF_ENV"
+  safe_source_env_file "$CF_ENV"
 
   zone_name=$(ask "请输入 Cloudflare Zone Name，例如 example.com" "${CF_ZONE_NAME:-}")
   zone_name=$(printf '%s' "$zone_name" | tr -d '[:space:]')
@@ -439,7 +565,7 @@ setup_cloudflare(){
   zone_id=$(echo "$resp" | jq -r '.result[0].id // empty')
   [[ -n "$zone_id" ]] || die "未查到 Zone ID。请确认 Zone Name 正确，且 Token 的 Zone Resources 包含该域名。"
   save_kv "$CF_ENV" CF_ZONE_ID "$zone_id"
-  source "$CF_ENV"
+  safe_source_env_file "$CF_ENV"
   cf_api GET "/zones/$zone_id/dns_records?per_page=1" >/dev/null || die "Token 无法读取 DNS 记录。"
   log "Cloudflare 已配置并通过权限测试：zone=$zone_name id=$zone_id"
 }
@@ -633,9 +759,20 @@ install_cert_deploy_hook(){
   cat > "$CERT_DEPLOY_HOOK" <<'EOF2'
 #!/usr/bin/env bash
 # Generated by Xray Edge Manager.
+# Certbot deploy hook: reload Nginx only after nginx -t; restart Xray only after xray -test.
 set -u
-systemctl reload nginx >/dev/null 2>&1 || systemctl restart nginx >/dev/null 2>&1 || true
-systemctl restart xray >/dev/null 2>&1 || true
+
+if command -v nginx >/dev/null 2>&1; then
+  if nginx -t >/dev/null 2>&1; then
+    systemctl reload nginx >/dev/null 2>&1 || systemctl restart nginx >/dev/null 2>&1 || true
+  fi
+fi
+
+if command -v xray >/dev/null 2>&1 && [[ -f /usr/local/etc/xray/config.json ]]; then
+  if xray run -test -config /usr/local/etc/xray/config.json >/dev/null 2>&1; then
+    systemctl restart xray >/dev/null 2>&1 || true
+  fi
+fi
 exit 0
 EOF2
   chmod 755 "$CERT_DEPLOY_HOOK"
@@ -689,19 +826,35 @@ choose_reality_target(){
   log "REALITY target: $target"
 }
 
+validate_x25519_key(){
+  local k="$1"
+  [[ "$k" =~ ^[A-Za-z0-9_-]{40,80}$ ]]
+}
+
 generate_keys_if_needed(){
   load_state
   command -v xray >/dev/null 2>&1 || die "请先安装 Xray。"
   [[ -n "${UUID:-}" ]] || save_kv "$STATE_FILE" UUID "$(xray uuid)"
   if [[ -z "${REALITY_PRIVATE_KEY:-}" || -z "${REALITY_PUBLIC_KEY:-}" ]]; then
-    local raw_output priv pub
-    raw_output=$(xray x25519 2>&1 | sed -r 's/\x1B\[[0-9;]*[mK]//g' || true)
+    local raw_output priv pub first_candidate second_candidate
+    raw_output=$(NO_COLOR=1 xray x25519 2>&1 | sed -r 's/\x1B\[[0-9;]*[mK]//g' | tr -d '\r' || true)
+
+    # Prefer semantic labels, because xray output wording is more stable than line numbers.
     priv=$(printf '%s\n' "$raw_output" | grep -iE 'Private[ _-]?key|PrivateKey|Seed' | awk -F':' '{print $2}' | tr -d '[:space:]' | head -n1)
     pub=$(printf '%s\n' "$raw_output" | grep -iE 'Public[ _-]?key|PublicKey|Password|Client' | awk -F':' '{print $2}' | tr -d '[:space:]' | head -n1)
-    if [[ -z "$priv" || -z "$pub" ]]; then
-      err "xray x25519 输出无法解析。脱色后的原始输出如下："
+
+    # Fallback: extract the first two base64url-looking tokens if labels change.
+    if ! validate_x25519_key "${priv:-}" || ! validate_x25519_key "${pub:-}"; then
+      first_candidate=$(printf '%s\n' "$raw_output" | grep -Eo '[A-Za-z0-9_-]{40,80}' | sed -n '1p' || true)
+      second_candidate=$(printf '%s\n' "$raw_output" | grep -Eo '[A-Za-z0-9_-]{40,80}' | sed -n '2p' || true)
+      priv="${first_candidate:-$priv}"
+      pub="${second_candidate:-$pub}"
+    fi
+
+    if ! validate_x25519_key "${priv:-}" || ! validate_x25519_key "${pub:-}"; then
+      err "xray x25519 输出无法可靠解析或密钥长度异常。脱色后的原始输出如下："
       printf '%s\n' "$raw_output" >&2
-      die "REALITY 密钥生成失败。请手动执行：xray x25519"
+      die "REALITY 密钥生成失败。请手动执行：xray x25519，并检查 Xray 版本。"
     fi
     save_kv "$STATE_FILE" REALITY_PRIVATE_KEY "$priv"
     save_kv "$STATE_FILE" REALITY_PUBLIC_KEY "$pub"
@@ -724,13 +877,36 @@ backup_configs(){
   [[ -f "$STATE_FILE" ]] && cp -a "$STATE_FILE" "$BACKUP_DIR/state.env.$ts.bak" || true
 }
 
+atomic_copy_into_place(){
+  local src="$1" dst="$2" dir base tmp
+  [[ -f "$src" ]] || return 1
+  dir=$(dirname "$dst")
+  base=$(basename "$dst")
+  mkdir -p "$dir" || return 1
+  tmp=$(mktemp_file "$dir/.${base}.restore.XXXXXX") || return 1
+  cp -a "$src" "$tmp" || { rm -f "$tmp"; return 1; }
+  mv -f "$tmp" "$dst"
+}
+
+atomic_move_into_place(){
+  local src="$1" dst="$2" mode="${3:-}" dir src_dir dst_dir
+  [[ -f "$src" ]] || die "原子替换源文件不存在：$src"
+  dir=$(dirname "$dst")
+  mkdir -p "$dir"
+  src_dir=$(cd "$(dirname "$src")" && pwd -P)
+  dst_dir=$(cd "$dir" && pwd -P)
+  [[ "$src_dir" == "$dst_dir" ]] || die "原子替换要求临时文件与目标文件位于同一目录。"
+  [[ -n "$mode" ]] && chmod "$mode" "$src" 2>/dev/null || true
+  mv -f "$src" "$dst"
+}
+
 restore_latest_xray_config(){
   load_state
   local bak="${LAST_XRAY_BACKUP:-}"
   [[ -n "$bak" && -f "$bak" ]] || bak=$(ls -1t "$BACKUP_DIR"/config.json.*.bak 2>/dev/null | head -n1 || true)
   [[ -n "$bak" && -f "$bak" ]] || { warn "未找到可回滚的 Xray 配置备份。"; return 1; }
-  cp -a "$bak" "$XRAY_CONFIG"
-  warn "已自动回滚 Xray 配置：$bak -> $XRAY_CONFIG"
+  atomic_copy_into_place "$bak" "$XRAY_CONFIG" || { warn "Xray 配置回滚失败：$bak -> $XRAY_CONFIG"; return 1; }
+  warn "已原子回滚 Xray 配置：$bak -> $XRAY_CONFIG"
 }
 
 restore_latest_nginx_config(){
@@ -738,8 +914,8 @@ restore_latest_nginx_config(){
   local bak="${LAST_NGINX_BACKUP:-}"
   [[ -n "$bak" && -f "$bak" ]] || bak=$(ls -1t "$BACKUP_DIR"/nginx.*.bak 2>/dev/null | head -n1 || true)
   [[ -n "$bak" && -f "$bak" ]] || { warn "未找到可回滚的 Nginx 配置备份。"; return 1; }
-  cp -a "$bak" "$NGINX_SITE"
-  warn "已自动回滚 Nginx 配置：$bak -> $NGINX_SITE"
+  atomic_copy_into_place "$bak" "$NGINX_SITE" || { warn "Nginx 配置回滚失败：$bak -> $NGINX_SITE"; return 1; }
+  warn "已原子回滚 Nginx 配置：$bak -> $NGINX_SITE"
 }
 
 get_proc_tcp(){ get_proc_by_port -t "$1" || true; }
@@ -786,8 +962,8 @@ generate_xray_config(){
   backup_configs
   mkdir -p /usr/local/etc/xray /var/log/xray
 
-  local in_tmp out_tmp route_tmp first_in=1 first_out=1 first_route=1 ip4 ip6 bind_ip4="" bind_ip6="" bind
-  in_tmp=$(mktemp); out_tmp=$(mktemp); route_tmp=$(mktemp)
+  local in_tmp out_tmp route_tmp xray_target_tmp first_in=1 first_out=1 first_route=1 ip4 ip6 bind_ip4="" bind_ip6="" bind
+  in_tmp=$(mktemp_file); out_tmp=$(mktemp_file); route_tmp=$(mktemp_file)
   ip4="${PUBLIC_IPV4:-$(public_ipv4)}"; ip6="${PUBLIC_IPV6:-$(public_ipv6)}"
   [[ -n "$ip4" ]] && save_kv "$STATE_FILE" PUBLIC_IPV4 "$ip4" && bind_ip4=$(local_ipv4_for_bind "$ip4") && save_kv "$STATE_FILE" BIND_IPV4 "$bind_ip4"
   [[ -n "$ip6" ]] && save_kv "$STATE_FILE" PUBLIC_IPV6 "$ip6" && bind_ip6=$(local_ipv6_for_bind "$ip6") && save_kv "$STATE_FILE" BIND_IPV6 "$bind_ip6"
@@ -874,7 +1050,8 @@ EOF2
     fi
   fi
 
-  cat > "$XRAY_CONFIG" <<EOF2
+  xray_target_tmp=$(mktemp_file "$(dirname "$XRAY_CONFIG")/.config.json.XXXXXX")
+  cat > "$xray_target_tmp" <<EOF2
 {
   "log":{"loglevel":"warning","access":"none","error":"/var/log/xray/error.log"},
   "inbounds":[
@@ -889,9 +1066,13 @@ $(cat "$route_tmp")
 }
 EOF2
   rm -f "$in_tmp" "$out_tmp" "$route_tmp"
-  if ! jq empty "$XRAY_CONFIG" >/dev/null 2>&1; then restore_latest_xray_config || true; die "生成的 Xray JSON 非法，已回滚。"; fi
-  if ! xray run -test -config "$XRAY_CONFIG" >/dev/null 2>&1; then restore_latest_xray_config || true; die "Xray 配置测试失败，已回滚。"; fi
-  log "Xray 配置生成并测试通过。"
+
+  # Do not overwrite the live Xray config until the candidate has passed all checks.
+  # The temp file is created in the same directory as the target so mv is atomic.
+  if ! jq empty "$xray_target_tmp" >/dev/null 2>&1; then die "生成的 Xray JSON 非法，已阻断更新，生产配置未被覆盖。"; fi
+  if ! xray run -test -config "$xray_target_tmp" >/dev/null 2>&1; then die "Xray 临时配置测试失败，已阻断更新，生产配置未被覆盖。"; fi
+  atomic_move_into_place "$xray_target_tmp" "$XRAY_CONFIG" "644"
+  log "Xray 配置生成、测试并原子化应用成功。"
 }
 
 
@@ -909,7 +1090,7 @@ install_random_camouflage(){
   local n zip tmp
   n=$((RANDOM % 9 + 1))
   zip="html${n}.zip"
-  tmp=$(mktemp -d)
+  tmp=$(mktemp_dir)
   info "随机下载伪装站模板：v2ray-agent/fodder/blog/unable/${zip}"
   if curl -fsSL --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time 60 -o "$tmp/$zip" "$FODDER_BASE_URL/$zip" && unzip -q "$tmp/$zip" -d "$tmp/site"; then
     rm -rf "$WEB_ROOT"/*
@@ -947,15 +1128,31 @@ configure_nginx(){
   touch "$WEB_ROOT/sub/${SUB_TOKEN}"
   chmod 644 "$WEB_ROOT/sub/${SUB_TOKEN}" 2>/dev/null || true
 
-  local nginx_http_v6_listen="" nginx_https_v6_listen=""
+  local nginx_http_v6_listen="" nginx_https_v6_listen="" nginx_https_listen="" nginx_http2_directive="" nginx_version="" nginx_target_tmp=""
+  nginx_version=$(nginx -v 2>&1 | sed -nE 's#.*nginx/([0-9.]+).*#\1#p' | head -n1 || true)
+  if version_ge "$nginx_version" "1.25.1"; then
+    nginx_https_listen="    listen ${CDN_PORT:-443} ssl;"
+    nginx_http2_directive="    http2 on;"
+    [[ -n "${PUBLIC_IPV6:-}" && "${IPV6_PROTOCOLS:-0}" == *2* ]] && nginx_https_v6_listen="    listen [::]:${CDN_PORT:-443} ssl;"
+    info "Nginx ${nginx_version:-unknown}：使用新版 HTTP/2 写法。"
+  else
+    # Older Nginx does not understand the standalone "http2 on;" directive.
+    # If dpkg is unavailable, version_ge falls back to sort -V; if both are unavailable,
+    # use the older syntax and let nginx -t be the final gatekeeper.
+    nginx_https_listen="    listen ${CDN_PORT:-443} ssl http2;"
+    nginx_http2_directive=""
+    [[ -n "${PUBLIC_IPV6:-}" && "${IPV6_PROTOCOLS:-0}" == *2* ]] && nginx_https_v6_listen="    listen [::]:${CDN_PORT:-443} ssl http2;"
+    info "Nginx ${nginx_version:-unknown}：使用兼容旧版的 HTTP/2 写法。"
+  fi
   if [[ -n "${PUBLIC_IPV6:-}" && "${IPV6_PROTOCOLS:-0}" == *2* ]]; then
     nginx_http_v6_listen="    listen [::]:80;"
-    nginx_https_v6_listen="    listen [::]:${CDN_PORT:-443} ssl;"
   fi
 
+  backup_configs
   install_random_camouflage
 
-  cat > "$NGINX_SITE" <<EOF2
+  nginx_target_tmp=$(mktemp_file "$(dirname "$NGINX_SITE")/.xray-edge-manager.conf.XXXXXX")
+  cat > "$nginx_target_tmp" <<EOF2
 server {
     listen 80;
 ${nginx_http_v6_listen}
@@ -964,8 +1161,8 @@ ${nginx_http_v6_listen}
 }
 
 server {
-    listen ${CDN_PORT:-443} ssl;
-    http2 on;
+${nginx_https_listen}
+${nginx_http2_directive}
 ${nginx_https_v6_listen}
     server_name ${BASE_DOMAIN};
 
@@ -1001,7 +1198,19 @@ ${nginx_https_v6_listen}
     }
 }
 EOF2
-  if ! nginx -t; then restore_latest_nginx_config || true; die "Nginx 配置测试失败，已回滚。"; fi
+  [[ -s "$nginx_target_tmp" ]] || die "生成的 Nginx 临时配置为空，已阻断更新。"
+  grep -q "server_name ${BASE_DOMAIN};" "$nginx_target_tmp" || die "Nginx 临时配置缺少 server_name，已阻断更新。"
+  grep -q "proxy_pass http://127.0.0.1:${XHTTP_CDN_LOCAL_PORT};" "$nginx_target_tmp" || die "Nginx 临时配置缺少 XHTTP proxy_pass，已阻断更新。"
+
+  # Nginx cannot safely test a non-included *.tmp site file in the live include tree.
+  # Apply the fully-written candidate atomically, then immediately run nginx -t and
+  # atomically roll back if the whole Nginx config tree rejects it.
+  atomic_move_into_place "$nginx_target_tmp" "$NGINX_SITE" "644"
+  if ! nginx -t; then
+    restore_latest_nginx_config || true
+    nginx -t >/dev/null 2>&1 || warn "Nginx 回滚后配置测试仍失败，请人工检查 /etc/nginx 配置。"
+    die "Nginx 配置测试失败，已尝试原子回滚。"
+  fi
   systemctl enable nginx >/dev/null 2>&1 || true
   if ! systemctl reload nginx && ! systemctl restart nginx; then restore_latest_nginx_config || true; die "Nginx reload/restart 失败，已回滚。"; fi
   log "Nginx / 伪装站 / 订阅路径配置完成。"
@@ -1283,20 +1492,82 @@ ensure_iptables(){
   fi
 }
 
+refresh_udp_conntrack_for_hy2(){
+  local start="$1" end="$2" to_port="$3" max_flush=500 count p
+  if ! command -v conntrack >/dev/null 2>&1; then
+    warn "未检测到 conntrack；旧 UDP 流可能需要等待内核超时后才会切换到新的 HY2 跳跃规则。"
+    return 0
+  fi
+
+  [[ "$start" =~ ^[0-9]+$ && "$end" =~ ^[0-9]+$ && "$start" -le "$end" ]] || {
+    warn "HY2 conntrack 刷新跳过：端口范围无效。"
+    return 0
+  }
+
+  count=$((end - start + 1))
+  if [[ "$count" -gt "$max_flush" ]]; then
+    warn "HY2 跳跃端口范围过大（$count > $max_flush），为避免 CPU 尖峰和误伤现有 443/UDP 连接，跳过 conntrack 精确清理。旧 UDP 流会等待内核超时。"
+    return 0
+  fi
+
+  # conntrack 的 --dport/--orig-port-dst 接受单个 PORT，不接受 iptables 风格的 start:end 范围。
+  # 因此逐端口精确清理跳跃入口端口，避免粗暴删除真实监听端口（如 443）的其它正常 HY2/UDP 会话。
+  for ((p=start; p<=end; p++)); do
+    conntrack -D -f ipv4 -p udp --orig-port-dst "$p" 2>/dev/null || true
+    conntrack -D -f ipv6 -p udp --orig-port-dst "$p" 2>/dev/null || true
+  done
+  log "已尝试精准刷新 $count 个 HY2 UDP 跳跃端口的 conntrack 记录。"
+}
+
+hy2_range_valid(){
+  local range="$1" start end
+  start="${range%%:*}"; end="${range##*:}"
+  [[ "$start" =~ ^[0-9]+$ && "$end" =~ ^[0-9]+$ && "$start" -ge 1 && "$end" -le 65535 && "$start" -le "$end" ]]
+}
+
+remove_hy2_nat_range(){
+  local range="$1" to_port="$2" start end removed=0
+  [[ -n "$range" && -n "$to_port" ]] || return 0
+  hy2_range_valid "$range" || { warn "跳过无效 HY2 跳跃范围：$range"; return 0; }
+  valid_port "$to_port" || { warn "跳过无效 HY2 目标端口：$to_port"; return 0; }
+  start="${range%%:*}"; end="${range##*:}"
+  if command -v iptables >/dev/null 2>&1; then
+    while iptables -t nat -D PREROUTING -p udp --dport "$start:$end" -j REDIRECT --to-ports "$to_port" 2>/dev/null; do removed=1; done
+  fi
+  if command -v ip6tables >/dev/null 2>&1; then
+    while ip6tables -t nat -D PREROUTING -p udp --dport "$start:$end" -j REDIRECT --to-ports "$to_port" 2>/dev/null; do removed=1; done
+  fi
+  [[ "$removed" == "1" ]] && info "已清理 HY2 历史 NAT 规则：UDP $start-$end -> $to_port" || true
+}
+
 enable_hy2_hopping(){
   load_state
   ensure_iptables
-  local range="$1" start end to_port
+  local range="$1" start end to_port old_range old_to_port
   to_port="${HY2_PORT:-443}"
+  hy2_range_valid "$range" || die "端口范围格式错误。"
+  valid_port "$to_port" || die "HY2_PORT 无效：$to_port"
+
+  old_range="${HY2_HOP_RANGE:-}"
+  old_to_port="${HY2_HOP_TO_PORT:-${HY2_PORT:-443}}"
+
+  # 状态机防漏：切换跳跃范围或真实监听端口前，先删除旧规则，避免 PREROUTING 中残留旧端口段。
+  if [[ -n "$old_range" && ( "$old_range" != "$range" || "$old_to_port" != "$to_port" ) ]]; then
+    info "检测到 HY2 跳跃规则变更，正在卸载历史规则：$old_range -> $old_to_port"
+    remove_hy2_nat_range "$old_range" "$old_to_port"
+    # 兼容 v0.0.20 及更早版本：当历史目标端口未单独保存时，额外尝试当前端口和 443。
+    [[ "$to_port" != "$old_to_port" ]] && remove_hy2_nat_range "$old_range" "$to_port"
+    [[ "443" != "$old_to_port" && "443" != "$to_port" ]] && remove_hy2_nat_range "$old_range" "443"
+  fi
+
   start="${range%%:*}"; end="${range##*:}"
-  [[ "$start" =~ ^[0-9]+$ && "$end" =~ ^[0-9]+$ && "$start" -le "$end" ]] || die "端口范围格式错误。"
   info "设置 HY2 UDP 端口跳跃：$start-$end -> $to_port"
-  while iptables -t nat -D PREROUTING -p udp --dport "$start:$end" -j REDIRECT --to-ports "$to_port" 2>/dev/null; do :; done
+  remove_hy2_nat_range "$range" "$to_port"
   iptables -t nat -A PREROUTING -p udp --dport "$start:$end" -j REDIRECT --to-ports "$to_port" || die "iptables 端口跳跃规则添加失败。"
   if command -v ip6tables >/dev/null 2>&1; then
-    while ip6tables -t nat -D PREROUTING -p udp --dport "$start:$end" -j REDIRECT --to-ports "$to_port" 2>/dev/null; do :; done
     ip6tables -t nat -A PREROUTING -p udp --dport "$start:$end" -j REDIRECT --to-ports "$to_port" 2>/dev/null || warn "ip6tables 规则添加失败，IPv6 跳跃可能不可用。"
   fi
+  refresh_udp_conntrack_for_hy2 "$start" "$end" "$to_port"
   if command -v netfilter-persistent >/dev/null 2>&1; then
     netfilter-persistent save || warn "netfilter-persistent save 失败。"
   elif confirm "是否安装 netfilter-persistent 持久化规则？" "Y"; then
@@ -1304,6 +1575,7 @@ enable_hy2_hopping(){
     netfilter-persistent save || true
   fi
   save_kv "$STATE_FILE" HY2_HOP_RANGE "$range"
+  save_kv "$STATE_FILE" HY2_HOP_TO_PORT "$to_port"
   if [[ "${XEM_INTERNAL_APPLY_HY2:-0}" != "1" ]]; then
     install_hy2_hopping_service
   fi
@@ -1562,7 +1834,7 @@ fetch_bestcf_all(){
   # Failure: do not use any third-party fallback; clear local BestCF cache so
   # protocol 5 falls back to the user's own BASE_DOMAIN CDN entry.
   local asset ok=0 tmp_dir
-  tmp_dir="$(mktemp -d "$BESTCF_DIR/.fetch.XXXXXX")" || { warn "无法创建 BestCF 临时目录，跳过更新。"; return 0; }
+  tmp_dir="$(mktemp_dir "$BESTCF_DIR/.fetch.XXXXXX")"
 
   for asset in $BESTCF_ASSETS; do
     rm -f "$tmp_dir/$asset" "$tmp_dir/$asset.tmp" "$tmp_dir/$asset.raw"
@@ -1877,7 +2149,7 @@ delete_remote_subscription(){
   local n tmp
   n=$(ask "请输入要删除的编号" "")
   [[ "$n" =~ ^[0-9]+$ ]] || { warn "编号无效。"; return 0; }
-  tmp=$(mktemp)
+  tmp=$(mktemp_file)
   awk -v n="$n" 'NR!=n' "$REMOTES_FILE" > "$tmp"
   mv "$tmp" "$REMOTES_FILE"
   log "已删除编号：$n"
@@ -1993,13 +2265,28 @@ show_installation_state(){
 
 remove_hy2_hopping_rules(){
   load_state
-  local range="${HY2_HOP_RANGE:-$DEFAULT_HY2_HOP_RANGE}" start end to_port
-  start="${range%%:*}"; end="${range##*:}"; to_port="${HY2_PORT:-443}"
-  [[ "$start" =~ ^[0-9]+$ && "$end" =~ ^[0-9]+$ ]] || { warn "端口范围无效：$range"; return 0; }
-  command -v iptables >/dev/null 2>&1 && while iptables -t nat -D PREROUTING -p udp --dport "$start:$end" -j REDIRECT --to-ports "$to_port" 2>/dev/null; do :; done
-  command -v ip6tables >/dev/null 2>&1 && while ip6tables -t nat -D PREROUTING -p udp --dport "$start:$end" -j REDIRECT --to-ports "$to_port" 2>/dev/null; do :; done
+  local range="${HY2_HOP_RANGE:-}" to_port="${HY2_HOP_TO_PORT:-${HY2_PORT:-443}}" start end
+  if [[ -z "$range" ]]; then
+    warn "状态文件中没有 HY2_HOP_RANGE，仍会尝试清理默认范围：$DEFAULT_HY2_HOP_RANGE -> $to_port"
+    range="$DEFAULT_HY2_HOP_RANGE"
+  fi
+  if hy2_range_valid "$range"; then
+    start="${range%%:*}"; end="${range##*:}"
+    remove_hy2_nat_range "$range" "$to_port"
+    [[ "$to_port" != "${HY2_PORT:-443}" ]] && remove_hy2_nat_range "$range" "${HY2_PORT:-443}"
+    [[ "$to_port" != "443" && "${HY2_PORT:-443}" != "443" ]] && remove_hy2_nat_range "$range" "443"
+    refresh_udp_conntrack_for_hy2 "$start" "$end" "$to_port"
+  else
+    warn "端口范围无效：$range"
+  fi
+
+  systemctl disable --now xem-hy2-hopping.service 2>/dev/null || true
+  rm -f /etc/systemd/system/xem-hy2-hopping.service
+  systemctl daemon-reload 2>/dev/null || true
   command -v netfilter-persistent >/dev/null 2>&1 && netfilter-persistent save || true
-  log "已尝试删除端口跳跃规则：UDP $start-$end -> $to_port。"
+  save_kv "$STATE_FILE" HY2_HOP_RANGE ""
+  save_kv "$STATE_FILE" HY2_HOP_TO_PORT ""
+  log "已删除 HY2 端口跳跃规则，并清空持久化状态，开机不会自动恢复旧规则。"
 }
 
 cf_get_record_json(){
@@ -2099,10 +2386,12 @@ full_uninstall_xem(){
   rm -f /etc/systemd/system/xem-bestcf-update.service /etc/systemd/system/xem-bestcf-update.timer
   rm -f /etc/systemd/system/xem-geodata-update.service /etc/systemd/system/xem-geodata-update.timer
   rm -f /etc/systemd/system/xem-hy2-hopping.service
-  rm -f "$CERT_DEPLOY_HOOK" 2>/dev/null || true
+  rm -f "$CERT_DEPLOY_HOOK" /etc/logrotate.d/xray 2>/dev/null || true
   remove_hy2_hopping_rules || true
 
-  bash -c "$(curl -fsSL --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time "$CURL_MAX_TIME" https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ remove || true
+  # Do not fetch and execute the remote Xray installer during uninstall.
+  # Local cleanup below removes the common files created by the official installer and this script.
+  rm -f /usr/local/bin/xray /usr/local/bin/xray_old 2>/dev/null || true
 
   rm -rf /usr/local/etc/xray /usr/local/share/xray /var/log/xray \
     /etc/systemd/system/xray.service /etc/systemd/system/xray@.service \
@@ -2164,7 +2453,7 @@ main_menu(){
   load_state
   while true; do
     echo
-    echo "===== Xray Edge Manager v0.0.12 ====="
+    echo "===== Xray Edge Manager v0.0.21 ====="
     echo "1. 首次部署向导，推荐"
     echo "2. 安装/升级基础依赖"
     echo "3. 安装/升级 Xray-core"
@@ -2191,7 +2480,7 @@ main_menu(){
       1) install_full; pause ;;
       2) install_deps; pause ;;
       3) install_or_upgrade_xray; pause ;;
-      4) update_geodata; if confirm "是否启用每 3 天安全自动更新 geodata？" "N"; then enable_geodata_timer; fi; pause ;;
+      4) update_geodata; if confirm "是否启用每周一凌晨 4-5 点安全自动更新 geodata？" "N"; then enable_geodata_timer; fi; pause ;;
       5) network_status; if confirm "是否应用稳定型网络优化？" "N"; then apply_stable_network_tuning; fi; pause ;;
       6) setup_cloudflare; create_dns_records; pause ;;
       7) issue_certificate; pause ;;
