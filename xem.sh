@@ -216,7 +216,11 @@ EOF
 
 configure_base_domain() {
   load_state
-  local d
+  local d force="${1:-0}"
+  if [[ "$force" != "1" && -n "${BASE_DOMAIN:-}" ]] && validate_base_domain "$BASE_DOMAIN"; then
+    info "已使用当前母域名：$BASE_DOMAIN"
+    return 0
+  fi
   while true; do
     d=$(ask "请输入母域名，必须三段式或以上，例如 node.example.com" "${BASE_DOMAIN:-}")
     if validate_base_domain "$d"; then
