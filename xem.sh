@@ -275,12 +275,14 @@ setup_cloudflare() {
   configure_base_domain
   local token zone_name zone_id ok
   token=$(ask "请输入 Cloudflare Restricted API Token，需 Zone:Read + DNS:Edit" "${CF_API_TOKEN:-}")
+  token=$(printf '%s' "$token" | tr -d '[:space:]')
   [[ -n "$token" ]] || die "API Token 不能为空。"
   cloudflare_token_risk_check "$token"
   save_kv "$CF_ENV" CF_API_TOKEN "$token"
   source "$CF_ENV"
 
   zone_name=$(ask "请输入 Cloudflare Zone Name，例如 example.com" "${CF_ZONE_NAME:-}")
+  zone_name=$(printf '%s' "$zone_name" | tr -d '[:space:]')
   [[ -n "$zone_name" ]] || die "Zone Name 不能为空。"
   save_kv "$CF_ENV" CF_ZONE_NAME "$zone_name"
 
@@ -292,7 +294,7 @@ setup_cloudflare() {
   ok=$(echo "$resp" | jq -r '.success')
   [[ "$ok" == "true" ]] || die "Cloudflare API 返回失败：$resp"
   zone_id=$(echo "$resp" | jq -r '.result[0].id // empty')
-  [[ -n "$zone_id" ]] || die "未查到 Zone ID，请确认 token 权限和 zone name。"
+  [[ -n "$zone_id" ]] || die "未查到 Zone ID。请确认 Zone Name 拼写无误，并确认创建 Token 时 Zone Resources 已包含该域名，未错选成其他域名。"
   save_kv "$CF_ENV" CF_ZONE_ID "$zone_id"
 
   # DNS record list API probe: verifies DNS read permission.
