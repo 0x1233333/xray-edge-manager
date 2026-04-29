@@ -1054,18 +1054,20 @@ ${nginx_https_v6_listen}
     root ${WEB_ROOT};
     index index.html;
 
-    location = ${XHTTP_CDN_PATH} {
-        proxy_http_version 1.1;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto https;
+    location ^~ ${XHTTP_CDN_PATH} {
         proxy_pass http://127.0.0.1:${XHTTP_CDN_LOCAL_PORT};
-    }
 
-    location = /sub/${SUB_TOKEN} {
-        default_type text/plain;
-        alias ${WEB_ROOT}/sub/${SUB_TOKEN};
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+
+        proxy_buffering off;
+        proxy_request_buffering off;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        client_max_body_size 0;
     }
 
     location / {
@@ -1311,15 +1313,44 @@ EOF
 EOF
   fi
   if protocol_enabled 3; then
-    cat >>"$f" <<EOF
-  - name: ${NODE_NAME:-node}-HY2-UDP
+    if [[ -n "${PUBLIC_IPV4:-}" && "${IPV4_PROTOCOLS:-0}" == *3* ]]; then
+      cat >>"$f" <<EOF
+  - name: ${NODE_NAME:-node}-v4-HY2-UDP${HY2_PORT:-443}
     type: hysteria2
-    server: ${BASE_DOMAIN}
+    server: v4.${BASE_DOMAIN}
     port: ${HY2_PORT:-443}
     password: ${HY2_AUTH}
     sni: ${BASE_DOMAIN}
-    # 如果启用了端口跳跃，可尝试把 port 改为跳跃范围内端口，例如 20000-20100。
+    skip-cert-verify: false
+    alpn:
+      - h3
 EOF
+      if [[ -n "${HY2_HOP_RANGE:-}" ]]; then
+        cat >>"$f" <<EOF
+    ports: ${HY2_HOP_RANGE/:/-}
+    hop-interval: 30
+EOF
+      fi
+    fi
+    if [[ -n "${PUBLIC_IPV6:-}" && "${IPV6_PROTOCOLS:-0}" == *3* ]]; then
+      cat >>"$f" <<EOF
+  - name: ${NODE_NAME:-node}-v6-HY2-UDP${HY2_PORT:-443}
+    type: hysteria2
+    server: v6.${BASE_DOMAIN}
+    port: ${HY2_PORT:-443}
+    password: ${HY2_AUTH}
+    sni: ${BASE_DOMAIN}
+    skip-cert-verify: false
+    alpn:
+      - h3
+EOF
+      if [[ -n "${HY2_HOP_RANGE:-}" ]]; then
+        cat >>"$f" <<EOF
+    ports: ${HY2_HOP_RANGE/:/-}
+    hop-interval: 30
+EOF
+      fi
+    fi
   fi
   log "Mihomo 参考片段已生成：$f"
 }
