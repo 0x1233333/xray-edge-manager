@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Xray Edge Manager / Xray Anti-Block Manager
-# v0.0.4 single-file installer
+# v0.0.5 single-file installer
 #
 # Features:
 # - Xray-core only, no Docker, no sing-box
@@ -466,7 +466,7 @@ select_protocols(){
       save_kv "$STATE_FILE" BESTCF_MODE "domain"
       save_kv "$STATE_FILE" BESTCF_PER_CATEGORY_LIMIT "1"
       save_kv "$STATE_FILE" BESTCF_TOTAL_LIMIT "1"
-      warn "检测到协议 5，已自动开启 BestCF：只生成 1 个优选域名节点。"
+      warn "检测到协议 5，已自动开启 BestCF：只生成 1 个优选域名节点；生成订阅前会自动拉取数据。"
     fi
   fi
 
@@ -1062,10 +1062,38 @@ EOF2
   log "Mihomo 参考片段已生成：$f"
 }
 
+ensure_bestcf_data_if_needed(){
+  load_state
+  # 协议 5 本质是 CDN/BestCF 入口扩展。只要启用了 5，或 BestCF 已开启，
+  # 生成订阅前就必须确保 BestCF 数据已拉取，否则只会生成一个普通母域名 Entry。
+  if ! protocol_enabled 5 && [[ "${BESTCF_ENABLED:-0}" != "1" ]]; then
+    return 0
+  fi
+
+  local mode="${BESTCF_MODE:-domain}"
+  local need_fetch=0
+
+  if [[ "$mode" == "isp_domain" ]]; then
+    [[ -s "$BESTCF_DIR/cmcc-ip.txt" ]] || need_fetch=1
+    [[ -s "$BESTCF_DIR/cucc-ip.txt" ]] || need_fetch=1
+    [[ -s "$BESTCF_DIR/ctcc-ip.txt" ]] || need_fetch=1
+    [[ -s "$BESTCF_DIR/bestcf-domain.txt" ]] || need_fetch=1
+  else
+    [[ -s "$BESTCF_DIR/bestcf-domain.txt" ]] || need_fetch=1
+  fi
+
+  if [[ "$need_fetch" == "1" ]]; then
+    info "BestCF 数据不存在或不完整，正在自动拉取。"
+    fetch_bestcf_all || warn "BestCF 自动拉取失败，将仅生成普通 CDN Entry 兜底。"
+  fi
+}
+
 generate_subscription(){
   load_state
   [[ -n "${BASE_DOMAIN:-}" ]] || die "请先设置母域名。"
   generate_keys_if_needed
+  load_state
+  ensure_bestcf_data_if_needed
   load_state
   mkdir -p "$SUB_DIR" "$WEB_ROOT/sub"
   local raw="$SUB_DIR/local.raw" b64="$SUB_DIR/local.b64"
@@ -1088,7 +1116,7 @@ generate_subscription(){
     after_count=$(wc -l < "$raw" 2>/dev/null || echo 0)
     if [[ "$after_count" -eq "$before_count" ]]; then
       add_vless_xhttp_cdn_link "$BASE_DOMAIN" "${NODE_NAME:-node}-CDN-XHTTP-Entry" "$raw" "${CDN_PORT:-443}"
-      warn "协议 5 未找到可用 BestCF 数据，已临时生成母域名 CDN Entry。请在菜单 11 更新 BestCF 后重新生成订阅。"
+      warn "协议 5 未找到可用 BestCF 数据，已临时生成母域名 CDN Entry。请稍后菜单 11 更新 BestCF，或检查 GitHub Release 数据源。"
     fi
   elif protocol_enabled 2; then
     generate_bestcf_subscription_nodes "$raw"
@@ -1848,7 +1876,7 @@ main_menu(){
   load_state
   while true; do
     echo
-    echo "===== Xray Edge Manager v0.0.4 ====="
+    echo "===== Xray Edge Manager v0.0.5 ====="
     echo "1. 首次部署向导，推荐"
     echo "2. 安装/升级基础依赖"
     echo "3. 安装/升级 Xray-core"
