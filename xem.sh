@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Xray Edge Manager / Xray Anti-Block Manager
-# v0.0.28 — protocol-5 / Nginx hardening patch
+# v0.0.30 — runtime dir guard + menu version fix
 #
 # Features:
 # - Xray-core only, no Docker, no sing-box
@@ -79,20 +79,56 @@ die()  { err "$*"; exit 1; }
 pause(){ read -r -p "按回车继续..." _ || true; }
 need_root(){ [[ "${EUID:-$(id -u)}" -eq 0 ]] || die "请使用 root 运行。"; }
 
+ensure_dir_or_die(){
+  local dir="$1"
+  [[ -n "$dir" ]] || return 0
+  if [[ -e "$dir" && ! -d "$dir" ]]; then
+    die "运行路径被同名文件占用，拒绝自动删除：$dir"
+  fi
+  mkdir -p "$dir" || die "创建运行目录失败：$dir"
+}
+
+ensure_runtime_dirs(){
+  # Keep runtime directories present even if an earlier failed run, cleanup task,
+  # or manual rm removed APP_DIR/tmp while the script is still being used.
+  local dir
+  for dir in "$APP_DIR" "$APP_DIR/tmp" "$SUB_DIR" "$BESTCF_DIR" "$BACKUP_DIR" "$DEBUG_DIR"; do
+    ensure_dir_or_die "$dir"
+  done
+  chmod 700 "$APP_DIR" "$APP_DIR/tmp" 2>/dev/null || true
+}
+
+
 register_temp_path(){
   local tmp="$1"
   [[ -n "$tmp" ]] && GLOBAL_TEMP_FILES+=("$tmp")
 }
 
+mktemp_parent_from_args(){
+  local arg
+  for arg in "$@"; do
+    [[ "$arg" == -* ]] && continue
+    dirname "$arg"
+    return 0
+  done
+  echo ""
+}
+
 mktemp_file(){
-  local tmp
+  local tmp parent
+  ensure_runtime_dirs
+  parent="$(mktemp_parent_from_args "$@")"
+  [[ -n "$parent" ]] && ensure_dir_or_die "$parent"
   tmp="$(mktemp "$@")" || die "创建临时文件失败。"
   register_temp_path "$tmp"
   echo "$tmp"
 }
 
 mktemp_dir(){
-  local tmp
+  local tmp parent
+  ensure_runtime_dirs
+  parent="$(mktemp_parent_from_args "$@")"
+  [[ -n "$parent" ]] && ensure_dir_or_die "$parent"
   tmp="$(mktemp -d "$@")" || die "创建临时目录失败。"
   register_temp_path "$tmp"
   echo "$tmp"
@@ -424,6 +460,7 @@ extract_sha256_from_dgst(){
 
 install_or_upgrade_xray_release_verified(){
   need_root
+  ensure_runtime_dirs
   local asset release_json tag asset_url dgst_url tmp zip dgst expected actual extract_dir xray_bin dat f
 
   asset="$(xray_release_asset_name)" || die "当前架构暂不支持自动匹配 Xray 官方 Release：$(uname -m)"
@@ -2854,7 +2891,7 @@ main_menu(){
   load_state
   while true; do
     echo
-    echo "===== Xray Edge Manager v0.0.28 ====="
+    echo "===== Xray Edge Manager v0.0.30 ====="
     echo "1. 首次部署向导，推荐"
     echo "2. 安装/升级基础依赖"
     echo "3. 安装/升级 Xray-core"
