@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Xray Edge Manager / Xray Anti-Block Manager
-# v0.0.6 single-file installer
+# v0.0.7 security-hardened single-file installer
 #
 # Features:
 # - Xray-core only, no Docker, no sing-box
@@ -46,6 +46,7 @@ BESTCF_RELEASE_API="https://api.github.com/repos/DustinWin/BestCF/releases/tags/
 BESTCF_ASSETS="cmcc-ip.txt cucc-ip.txt ctcc-ip.txt bestcf-ip.txt proxy-ip.txt bestcf-domain.txt"
 CURL_CONNECT_TIMEOUT=5
 CURL_MAX_TIME=20
+LOCK_FILE="/run/xray-edge-manager.lock"
 
 mkdir -p "$APP_DIR" "$SUB_DIR" "$BESTCF_DIR" "$BACKUP_DIR"
 
@@ -56,6 +57,15 @@ err()  { echo -e "\033[31m[ERR]\033[0m $*"; }
 die()  { err "$*"; exit 1; }
 pause(){ read -r -p "按回车继续..." _ || true; }
 need_root(){ [[ "${EUID:-$(id -u)}" -eq 0 ]] || die "请使用 root 运行。"; }
+
+acquire_lock(){
+  mkdir -p "$(dirname "$LOCK_FILE")"
+  exec 9>"$LOCK_FILE"
+  if ! flock -n 9; then
+    echo "[ERR] 检测到另一个 xray-edge-manager 实例正在运行，请稍后再试。" >&2
+    exit 1
+  fi
+}
 
 load_state(){
   if [[ -f "$STATE_FILE" ]]; then source "$STATE_FILE"; fi
@@ -172,7 +182,7 @@ install_deps(){
     curl wget jq openssl ca-certificates gnupg lsb-release \
     nginx certbot python3-certbot-dns-cloudflare \
     whois iproute2 iputils-ping iptables nftables tcpdump unzip tar sed grep coreutils \
-    cron socat
+    cron socat util-linux
   log "基础依赖安装完成。"
 }
 
@@ -221,9 +231,39 @@ install_or_upgrade_xray(){
 }
 
 update_geodata(){
+  update_geodata_safe
+}
+
+update_geodata_safe(){
   need_root
-  bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install-geodata
-  log "geodata 更新完成。"
+  local tmp geoip_url geosite_url
+  tmp="$(mktemp -d)"
+  geoip_url="https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat"
+  geosite_url="https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat"
+
+  cleanup_geodata_tmp(){ rm -rf "$tmp"; }
+  trap cleanup_geodata_tmp RETURN
+
+  info "安全更新 geoip.dat / geosite.dat：只下载数据文件和 sha256，不执行远程脚本。"
+
+  curl -fL --retry 3 --retry-delay 2 --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time 120 -o "$tmp/geoip.dat" "$geoip_url"
+  curl -fL --retry 3 --retry-delay 2 --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time 120 -o "$tmp/geoip.dat.sha256sum" "$geoip_url.sha256sum"
+  curl -fL --retry 3 --retry-delay 2 --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time 120 -o "$tmp/geosite.dat" "$geosite_url"
+  curl -fL --retry 3 --retry-delay 2 --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time 120 -o "$tmp/geosite.dat.sha256sum" "$geosite_url.sha256sum"
+
+  (
+    cd "$tmp"
+    sha256sum -c geoip.dat.sha256sum
+    sha256sum -c geosite.dat.sha256sum
+  )
+
+  install -d /usr/local/share/xray
+  install -m 644 "$tmp/geoip.dat" /usr/local/share/xray/geoip.dat.new
+  install -m 644 "$tmp/geosite.dat" /usr/local/share/xray/geosite.dat.new
+  mv -f /usr/local/share/xray/geoip.dat.new /usr/local/share/xray/geoip.dat
+  mv -f /usr/local/share/xray/geosite.dat.new /usr/local/share/xray/geosite.dat
+
+  log "geodata 已安全更新。"
 }
 
 configure_base_domain(){
@@ -680,6 +720,14 @@ EOF2
 EOF2
   append_json_obj "$out_tmp" first_out <<'EOF2'
     {"tag":"out-v6","protocol":"freedom","settings":{"domainStrategy":"UseIPv6"}}
+EOF2
+
+  # Zero-trust default: block access to private/local networks before any per-inbound routing rule.
+  append_json_obj "$route_tmp" first_route <<'EOF2'
+    {"type":"field","ip":["geoip:private","127.0.0.0/8","10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","169.254.0.0/16","::1/128","fc00::/7","fe80::/10"],"outboundTag":"block"}
+EOF2
+  append_json_obj "$route_tmp" first_route <<'EOF2'
+    {"type":"field","domain":["geosite:private"],"outboundTag":"block"}
 EOF2
 
   if protocol_enabled 1; then
@@ -1163,28 +1211,52 @@ ensure_iptables(){
   fi
 }
 
-enable_hy2_hopping(){
+apply_hy2_hopping_rules(){
   load_state
   ensure_iptables
-  local range="$1" start end to_port
+  local range="${1:-${HY2_HOP_RANGE:-$DEFAULT_HY2_HOP_RANGE}}" start end to_port
   to_port="${HY2_PORT:-443}"
   start="${range%%:*}"; end="${range##*:}"
   [[ "$start" =~ ^[0-9]+$ && "$end" =~ ^[0-9]+$ && "$start" -le "$end" ]] || die "端口范围格式错误。"
-  info "设置 HY2 UDP 端口跳跃：$start-$end -> $to_port"
+  info "应用 HY2 UDP 端口跳跃规则：$start-$end -> $to_port"
+
   while iptables -t nat -D PREROUTING -p udp --dport "$start:$end" -j REDIRECT --to-ports "$to_port" 2>/dev/null; do :; done
   iptables -t nat -A PREROUTING -p udp --dport "$start:$end" -j REDIRECT --to-ports "$to_port" || die "iptables 端口跳跃规则添加失败。"
+  iptables -t nat -C PREROUTING -p udp --dport "$start:$end" -j REDIRECT --to-ports "$to_port" 2>/dev/null || die "iptables 端口跳跃规则验证失败。"
+
   if command -v ip6tables >/dev/null 2>&1; then
     while ip6tables -t nat -D PREROUTING -p udp --dport "$start:$end" -j REDIRECT --to-ports "$to_port" 2>/dev/null; do :; done
     ip6tables -t nat -A PREROUTING -p udp --dport "$start:$end" -j REDIRECT --to-ports "$to_port" 2>/dev/null || warn "ip6tables 规则添加失败，IPv6 跳跃可能不可用。"
   fi
+
   if command -v netfilter-persistent >/dev/null 2>&1; then
     netfilter-persistent save || warn "netfilter-persistent save 失败。"
-  elif confirm "是否安装 netfilter-persistent 持久化规则？" "Y"; then
-    apt-get install -y iptables-persistent netfilter-persistent || true
-    netfilter-persistent save || true
   fi
+}
+
+enable_hy2_hopping(){
+  load_state
+  local range="$1"
   save_kv "$STATE_FILE" HY2_HOP_RANGE "$range"
-  log "端口跳跃规则已设置。请确认云安全组放行 UDP $start-$end。"
+  apply_hy2_hopping_rules "$range"
+  install_self_to_local_bin
+  cat >/etc/systemd/system/xem-hy2-hopping.service <<'EOF2'
+[Unit]
+Description=Apply Xray Edge Manager HY2 port hopping rules
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/xem --apply-hy2-hopping
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF2
+  systemctl daemon-reload
+  systemctl enable xem-hy2-hopping.service >/dev/null 2>&1 || true
+  log "端口跳跃规则已设置，并已安装启动恢复服务。请确认云安全组放行 UDP ${range/:/-}。"
 }
 
 configure_hy2_hopping_prompt(){
@@ -1558,7 +1630,27 @@ generate_bestcf_subscription_nodes(){
   fi
 }
 
+install_self_to_local_bin(){
+  need_root
+  mkdir -p /usr/local/bin
+
+  local src="${BASH_SOURCE[0]:-$0}"
+  if [[ -f "$src" && -s "$src" && "$src" != "/dev/fd/"* && "$src" != "bash" ]]; then
+    install -m 755 "$src" /usr/local/bin/xem
+    log "已安装本地命令：/usr/local/bin/xem"
+    return 0
+  fi
+
+  warn "当前可能是 bash <(curl ...) 方式运行，无法可靠复制自身。"
+  warn "将按用户主动操作从固定仓库地址安装一次本地命令；定时器以后只调用本地 /usr/local/bin/xem。"
+  curl -fsSL --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time 60 "$SCRIPT_RAW_URL" -o /usr/local/bin/xem
+  chmod +x /usr/local/bin/xem
+  bash -n /usr/local/bin/xem
+  log "已安装本地命令：/usr/local/bin/xem"
+}
+
 enable_bestcf_timer(){
+  install_self_to_local_bin
   cat >/etc/systemd/system/xem-bestcf-update.service <<EOF2
 [Unit]
 Description=Update BestCF data and regenerate Xray Edge Manager subscription
@@ -1567,7 +1659,7 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/bin/bash -lc 'bash <(curl -fsSL ${SCRIPT_RAW_URL}) --bestcf-update'
+ExecStart=/usr/local/bin/xem --bestcf-update
 EOF2
   cat >/etc/systemd/system/xem-bestcf-update.timer <<EOF2
 [Unit]
@@ -1963,6 +2055,10 @@ full_uninstall_xem(){
   fi
 
   rm -rf "$APP_DIR" "$LEGACY_APP_DIR" 2>/dev/null || true
+  systemctl disable --now xem-bestcf-update.timer xem-geodata-update.timer xem-hy2-hopping.service 2>/dev/null || true
+  rm -f /etc/systemd/system/xem-bestcf-update.service /etc/systemd/system/xem-bestcf-update.timer \
+        /etc/systemd/system/xem-geodata-update.service /etc/systemd/system/xem-geodata-update.timer \
+        /etc/systemd/system/xem-hy2-hopping.service 2>/dev/null || true
   systemctl daemon-reload 2>/dev/null || true
   systemctl reset-failed 2>/dev/null || true
   log "完整卸载完成。"
@@ -1990,12 +2086,49 @@ uninstall_menu(){
   done
 }
 
+enable_geodata_timer(){
+  install_self_to_local_bin
+  cat >/etc/systemd/system/xem-geodata-update.service <<'EOF2'
+[Unit]
+Description=Safely update Xray geodata
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/xem --geodata-update
+EOF2
+  cat >/etc/systemd/system/xem-geodata-update.timer <<'EOF2'
+[Unit]
+Description=Run safe Xray geodata update every 3 days
+
+[Timer]
+OnBootSec=20min
+OnUnitActiveSec=3d
+RandomizedDelaySec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF2
+  systemctl daemon-reload
+  systemctl enable --now xem-geodata-update.timer
+  log "已启用 geodata 每 3 天安全自动更新。"
+}
+
+disable_geodata_timer(){
+  systemctl disable --now xem-geodata-update.timer 2>/dev/null || true
+  rm -f /etc/systemd/system/xem-geodata-update.service /etc/systemd/system/xem-geodata-update.timer
+  systemctl daemon-reload 2>/dev/null || true
+  log "geodata 自动更新已关闭。"
+}
+
 main_menu(){
   need_root
   load_state
   while true; do
     echo
-    echo "===== Xray Edge Manager v0.0.6 ====="
+    echo "===== Xray Edge Manager v0.0.7 ====="
     echo "1. 首次部署向导，推荐"
     echo "2. 安装/升级基础依赖"
     echo "3. 安装/升级 Xray-core"
@@ -2022,7 +2155,7 @@ main_menu(){
       1) install_full; pause ;;
       2) install_deps; pause ;;
       3) install_or_upgrade_xray; pause ;;
-      4) update_geodata; pause ;;
+      4) update_geodata; if confirm "是否启用每 3 天安全自动更新 geodata？" "N"; then enable_geodata_timer; fi; pause ;;
       5) network_status; if confirm "是否应用稳定型网络优化？" "N"; then apply_stable_network_tuning; fi; pause ;;
       6) setup_cloudflare; create_dns_records; pause ;;
       7) issue_certificate; pause ;;
@@ -2045,12 +2178,34 @@ main_menu(){
   done
 }
 
-if [[ "${1:-}" == "--bestcf-update" ]]; then
-  need_root
-  load_state
-  fetch_bestcf_all
-  regenerate_subscriptions_after_change
-  exit 0
-fi
+case "${1:-}" in
+  --bestcf-update)
+    need_root
+    acquire_lock
+    load_state
+    fetch_bestcf_all
+    regenerate_subscriptions_after_change
+    exit 0
+    ;;
+  --geodata-update)
+    need_root
+    acquire_lock
+    update_geodata_safe
+    systemctl restart xray || true
+    exit 0
+    ;;
+  --apply-hy2-hopping)
+    need_root
+    acquire_lock
+    load_state
+    if [[ -n "${HY2_HOP_RANGE:-}" ]]; then
+      apply_hy2_hopping_rules "$HY2_HOP_RANGE"
+    else
+      warn "HY2_HOP_RANGE 未设置，跳过端口跳跃恢复。"
+    fi
+    exit 0
+    ;;
+esac
 
+acquire_lock
 main_menu "$@"
