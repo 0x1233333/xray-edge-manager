@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Xray Edge Manager / Xray Anti-Block Manager
-# v0.0.7 security-hardened single-file installer
+# v0.0.8 security-hardened single-file installer
 #
 # Features:
 # - Xray-core only, no Docker, no sing-box
@@ -241,29 +241,33 @@ update_geodata_safe(){
   geoip_url="https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat"
   geosite_url="https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat"
 
-  cleanup_geodata_tmp(){ rm -rf "$tmp"; }
-  trap cleanup_geodata_tmp RETURN
-
   info "安全更新 geoip.dat / geosite.dat：只下载数据文件和 sha256，不执行远程脚本。"
 
-  curl -fL --retry 3 --retry-delay 2 --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time 120 -o "$tmp/geoip.dat" "$geoip_url"
-  curl -fL --retry 3 --retry-delay 2 --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time 120 -o "$tmp/geoip.dat.sha256sum" "$geoip_url.sha256sum"
-  curl -fL --retry 3 --retry-delay 2 --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time 120 -o "$tmp/geosite.dat" "$geosite_url"
-  curl -fL --retry 3 --retry-delay 2 --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time 120 -o "$tmp/geosite.dat.sha256sum" "$geosite_url.sha256sum"
-
-  (
+  if (
     cd "$tmp"
+
+    curl -fL --retry 3 --retry-delay 2 --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time 120 -o geoip.dat "$geoip_url"
+    curl -fL --retry 3 --retry-delay 2 --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time 120 -o geoip.dat.sha256sum "$geoip_url.sha256sum"
+    curl -fL --retry 3 --retry-delay 2 --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time 120 -o geosite.dat "$geosite_url"
+    curl -fL --retry 3 --retry-delay 2 --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time 120 -o geosite.dat.sha256sum "$geosite_url.sha256sum"
+
     sha256sum -c geoip.dat.sha256sum
     sha256sum -c geosite.dat.sha256sum
-  )
+  ); then
+    install -d /usr/local/share/xray
+    install -m 644 "$tmp/geoip.dat" /usr/local/share/xray/geoip.dat.new
+    install -m 644 "$tmp/geosite.dat" /usr/local/share/xray/geosite.dat.new
 
-  install -d /usr/local/share/xray
-  install -m 644 "$tmp/geoip.dat" /usr/local/share/xray/geoip.dat.new
-  install -m 644 "$tmp/geosite.dat" /usr/local/share/xray/geosite.dat.new
-  mv -f /usr/local/share/xray/geoip.dat.new /usr/local/share/xray/geoip.dat
-  mv -f /usr/local/share/xray/geosite.dat.new /usr/local/share/xray/geosite.dat
+    mv -f /usr/local/share/xray/geoip.dat.new /usr/local/share/xray/geoip.dat
+    mv -f /usr/local/share/xray/geosite.dat.new /usr/local/share/xray/geosite.dat
 
-  log "geodata 已安全更新。"
+    rm -rf "$tmp"
+    log "geodata 已安全更新。"
+  else
+    rm -rf "$tmp"
+    warn "geodata 下载或 sha256 校验失败，已保留原文件。"
+    return 1
+  fi
 }
 
 configure_base_domain(){
@@ -2128,7 +2132,7 @@ main_menu(){
   load_state
   while true; do
     echo
-    echo "===== Xray Edge Manager v0.0.7 ====="
+    echo "===== Xray Edge Manager v0.0.8 ====="
     echo "1. 首次部署向导，推荐"
     echo "2. 安装/升级基础依赖"
     echo "3. 安装/升级 Xray-core"
