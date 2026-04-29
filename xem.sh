@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Xray Edge Manager / Xray Anti-Block Manager
-# v0.0.5 single-file installer
+# v0.0.6 single-file installer
 #
 # Features:
 # - Xray-core only, no Docker, no sing-box
@@ -43,7 +43,7 @@ CF_HTTPS_PORTS="443 2053 2083 2087 2096 8443"
 DEFAULT_HY2_HOP_RANGE="20000:20100"
 SCRIPT_RAW_URL="https://raw.githubusercontent.com/0x1233333/xray-edge-manager/main/xem.sh"
 BESTCF_RELEASE_API="https://api.github.com/repos/DustinWin/BestCF/releases/tags/bestcf"
-BESTCF_ASSETS="cmcc-ip.txt cucc-ip.txt ctcc-ip.txt bestcf-domain.txt"
+BESTCF_ASSETS="cmcc-ip.txt cucc-ip.txt ctcc-ip.txt bestcf-ip.txt proxy-ip.txt bestcf-domain.txt"
 CURL_CONNECT_TIMEOUT=5
 CURL_MAX_TIME=20
 
@@ -1264,7 +1264,9 @@ asn_report(){
 
 bestcf_asset_url(){
   local asset="$1" url=""
-  url=$(curl -fsSL --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time "$CURL_MAX_TIME" "$BESTCF_RELEASE_API" 2>/dev/null \
+  url=$(curl -fsSL --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time "$CURL_MAX_TIME" \
+    -H "Accept: application/vnd.github+json" \
+    "$BESTCF_RELEASE_API" 2>/dev/null \
     | jq -r --arg name "$asset" '.assets[]? | select(.name == $name) | .browser_download_url' \
     | head -n1 || true)
   if [[ -z "$url" || "$url" == "null" ]]; then
@@ -1273,78 +1275,175 @@ bestcf_asset_url(){
   echo "$url"
 }
 
-sanitize_bestcf_ip_file(){
-  sed 's/\r$//' | grep -E '^[0-9A-Fa-f:.]+$' | awk '!seen[$0]++'
+normalize_bestcf_label(){
+  local label="$1" fallback="$2"
+  label="${label:-$fallback}"
+  label="$(printf '%s' "$label" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+  label="$(printf '%s' "$label" | tr ' /#:@[]()' '_________' | sed -E 's/[^A-Za-z0-9._-]+/_/g;s/_+/_/g;s/^_//;s/_$//')"
+  [[ -n "$label" ]] || label="$fallback"
+  printf '%s' "$label"
 }
 
-sanitize_bestcf_domain_file(){
-  sed 's/\r$//' \
-    | grep -Eoi '(\*\.)?([A-Za-z0-9_-]+\.)+[A-Za-z]{2,}' \
-    | sed -E 's/^\*\.//I' \
-    | grep -Eiv '^(github\.com|raw\.githubusercontent\.com|githubusercontent\.com|cloudflare\.com|example\.com)$' \
-    | awk '!seen[$0]++'
+parse_bestcf_ip_file(){
+  local input="$1" output="$2" default_port="${3:-443}"
+  local line addr label clean port fallback_label
+
+  : > "$output"
+
+  while IFS= read -r line; do
+    line="$(printf '%s' "$line" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    [[ -z "$line" || "$line" == \#* ]] && continue
+
+    if [[ "$line" == *"#"* ]]; then
+      addr="${line%%#*}"
+      label="${line#*#}"
+    else
+      addr="$line"
+      label="BestCF"
+    fi
+
+    addr="$(printf '%s' "$addr" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    label="$(printf '%s' "$label" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    port="$default_port"
+    clean=""
+
+    if [[ "$addr" =~ ^\[([0-9A-Fa-f:]+)\]:([0-9]{1,5})$ ]]; then
+      clean="${BASH_REMATCH[1]}"
+      port="${BASH_REMATCH[2]}"
+    elif [[ "$addr" =~ ^\[([0-9A-Fa-f:]+)\]$ ]]; then
+      clean="${BASH_REMATCH[1]}"
+    elif [[ "$addr" =~ ^(([0-9]{1,3}\.){3}[0-9]{1,3}):([0-9]{1,5})$ ]]; then
+      clean="${BASH_REMATCH[1]}"
+      port="${BASH_REMATCH[3]}"
+    elif [[ "$addr" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+      clean="$addr"
+    elif [[ "$addr" == *:* && "$addr" =~ ^[0-9A-Fa-f:]+$ ]]; then
+      clean="$addr"
+    else
+      continue
+    fi
+
+    if ! is_cf_https_port "$port"; then
+      port="$default_port"
+    fi
+
+    fallback_label="BestCF"
+    if [[ "$clean" == *:* ]]; then fallback_label="BestCF-IPv6"; else fallback_label="BestCF-IPv4"; fi
+    label="$(normalize_bestcf_label "$label" "$fallback_label")"
+
+    printf '%s|%s|%s\n' "$clean" "$port" "$label" >> "$output"
+  done < "$input"
+
+  awk -F'|' 'NF>=3 && !seen[$1 "|" $2]++' "$output" > "${output}.tmp"
+  mv "${output}.tmp" "$output"
+}
+
+parse_bestcf_domain_file(){
+  local input="$1" output="$2" line label n=1
+  : > "$output"
+
+  while IFS= read -r line; do
+    line="$(printf '%s' "$line" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    [[ -z "$line" || "$line" == \#* ]] && continue
+
+    if [[ "$line" == *"#"* ]]; then
+      label="${line#*#}"
+      line="${line%%#*}"
+    else
+      label="CFDomain_${n}"
+    fi
+
+    line="$(printf '%s' "$line" | sed -E 's/^\*\.//I;s/^[[:space:]]*//;s/[[:space:]]*$//')"
+    [[ "$line" =~ ^([A-Za-z0-9-]+\.)+[A-Za-z]{2,}$ ]] || continue
+    case "$line" in
+      github.com|githubusercontent.com|raw.githubusercontent.com|cloudflare.com|example.com) continue ;;
+    esac
+    label="$(normalize_bestcf_label "$label" "CFDomain_${n}")"
+    printf '%s|%s|%s\n' "$line" "${CDN_PORT:-443}" "$label" >> "$output"
+    n=$((n+1))
+  done < "$input"
+
+  awk -F'|' 'NF>=3 && !seen[$1]++' "$output" > "${output}.tmp"
+  mv "${output}.tmp" "$output"
 }
 
 download_bestcf_asset(){
-  local asset="$1" output="$2" url tmp
+  local asset="$1" output="$2" kind="${3:-auto}" url tmp raw
   mkdir -p "$BESTCF_DIR"
   tmp="${output}.tmp"
+  raw="${output}.raw"
   url=$(bestcf_asset_url "$asset")
   info "下载 BestCF：$asset"
-  if ! curl -fsSL --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time "$CURL_MAX_TIME" "$url" > "$tmp.raw" 2>/dev/null; then
+
+  if ! curl -fL --retry 3 --retry-delay 2 \
+    --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time "$CURL_MAX_TIME" \
+    -A "xray-edge-manager" "$url" -o "$raw" 2>/dev/null; then
     warn "下载失败：$asset"
-    rm -f "$tmp.raw" "$tmp"
+    rm -f "$raw" "$tmp"
     return 1
   fi
-  if [[ "$asset" == *domain* ]]; then
-    sanitize_bestcf_domain_file < "$tmp.raw" > "$tmp"
-  else
-    sanitize_bestcf_ip_file < "$tmp.raw" > "$tmp"
+
+  if [[ "$kind" == "auto" ]]; then
+    if [[ "$asset" == *domain* ]]; then kind="domain"; else kind="ip"; fi
   fi
-  rm -f "$tmp.raw"
+
+  if [[ "$kind" == "domain" ]]; then
+    parse_bestcf_domain_file "$raw" "$tmp"
+  else
+    parse_bestcf_ip_file "$raw" "$tmp" "${CDN_PORT:-443}"
+  fi
+
   if [[ -s "$tmp" ]]; then
     mv "$tmp" "$output"
+    rm -f "$raw"
     return 0
   fi
-  rm -f "$tmp"
+
+  rm -f "$tmp" "$raw"
   warn "BestCF 文件为空或格式不可用：$asset"
   return 1
 }
 
 fetch_bestcf_all(){
   mkdir -p "$BESTCF_DIR"
-  download_bestcf_asset "cmcc-ip.txt" "$BESTCF_DIR/cmcc-ip.txt" || true
-  download_bestcf_asset "cucc-ip.txt" "$BESTCF_DIR/cucc-ip.txt" || true
-  download_bestcf_asset "ctcc-ip.txt" "$BESTCF_DIR/ctcc-ip.txt" || true
-  download_bestcf_asset "bestcf-domain.txt" "$BESTCF_DIR/bestcf-domain.txt" || true
+
+  download_bestcf_asset "cmcc-ip.txt" "$BESTCF_DIR/cmcc-ip.txt" "ip" || true
+  download_bestcf_asset "cucc-ip.txt" "$BESTCF_DIR/cucc-ip.txt" "ip" || true
+  download_bestcf_asset "ctcc-ip.txt" "$BESTCF_DIR/ctcc-ip.txt" "ip" || true
+  download_bestcf_asset "bestcf-ip.txt" "$BESTCF_DIR/bestcf-ip.txt" "ip" || true
+  download_bestcf_asset "proxy-ip.txt" "$BESTCF_DIR/proxy-ip.txt" "ip" || true
+  download_bestcf_asset "bestcf-domain.txt" "$BESTCF_DIR/bestcf-domain.txt" "domain" || true
+
   if [[ ! -s "$BESTCF_DIR/bestcf-domain.txt" ]]; then
     warn "优选域名文件不可用，写入内置兜底域名。"
     cat > "$BESTCF_DIR/bestcf-domain.txt" <<'EOF2'
-cf.090227.xyz
-cloudflare-dl.byoip.top
-cf.877774.xyz
-saas.sin.fan
-bestcf.030101.xyz
-www.visa.cn
-mfa.gov.ua
-www.shopify.com
+cf.090227.xyz|443|CFDomain_fallback_1
+cloudflare-dl.byoip.top|443|CFDomain_fallback_2
+cf.877774.xyz|443|CFDomain_fallback_3
+saas.sin.fan|443|CFDomain_fallback_4
+bestcf.030101.xyz|443|CFDomain_fallback_5
+www.visa.cn|443|CFDomain_fallback_6
+mfa.gov.ua|443|CFDomain_fallback_7
+www.shopify.com|443|CFDomain_fallback_8
 EOF2
   fi
+
   show_bestcf_count
 }
 
 fetch_bestcf_domains(){ fetch_bestcf_all; }
 
+bestcf_file_count(){
+  local f="$1"
+  [[ -s "$f" ]] && wc -l < "$f" | tr -d '[:space:]' || echo 0
+}
+
 show_bestcf_count(){
   load_state
   echo "===== BestCF 数据数量 ====="
   local f
-  for f in cmcc-ip.txt cucc-ip.txt ctcc-ip.txt bestcf-domain.txt; do
-    if [[ -s "$BESTCF_DIR/$f" ]]; then
-      echo "$f: $(wc -l < "$BESTCF_DIR/$f")"
-    else
-      echo "$f: 0"
-    fi
+  for f in cmcc-ip.txt cucc-ip.txt ctcc-ip.txt bestcf-ip.txt proxy-ip.txt bestcf-domain.txt; do
+    echo "$f: $(bestcf_file_count "$BESTCF_DIR/$f")"
   done
   echo "当前模式: enabled=${BESTCF_ENABLED:-0}, mode=${BESTCF_MODE:-off}"
   case "${BESTCF_MODE:-off}" in
@@ -1353,6 +1452,7 @@ show_bestcf_count(){
     *) echo "节点策略: 关闭" ;;
   esac
 }
+
 set_bestcf_limits(){
   echo "===== BestCF 节点数量模式 ====="
   echo "1. 只生成 1 个优选域名节点，节点最少，推荐"
@@ -1381,6 +1481,7 @@ set_bestcf_limits(){
   load_state
   regenerate_subscriptions_after_change
 }
+
 enable_bestcf_domain_only(){
   fetch_bestcf_all
   save_kv "$STATE_FILE" BESTCF_ENABLED "1"
@@ -1391,6 +1492,7 @@ enable_bestcf_domain_only(){
   log "BestCF 已启用：只生成 1 个优选域名节点。"
   regenerate_subscriptions_after_change
 }
+
 enable_bestcf_isp_domain(){
   fetch_bestcf_all
   save_kv "$STATE_FILE" BESTCF_ENABLED "1"
@@ -1401,6 +1503,7 @@ enable_bestcf_isp_domain(){
   log "BestCF 已启用：1 个优选域名 + 三网各 1 个 IP，最多 4 个节点。"
   regenerate_subscriptions_after_change
 }
+
 disable_bestcf(){
   save_kv "$STATE_FILE" BESTCF_ENABLED "0"
   save_kv "$STATE_FILE" BESTCF_MODE "off"
@@ -1408,13 +1511,29 @@ disable_bestcf(){
   log "BestCF 已关闭。"
   regenerate_subscriptions_after_change
 }
+
 add_bestcf_nodes_from_file(){
-  local file="$1" label="$2" raw="$3" max_each="$4" total_ref="$5" total_limit="$6" d n=1
+  local file="$1" fallback_label="$2" raw="$3" max_each="$4" total_ref="$5" total_limit="$6"
+  local line server port label name n=1
   [[ -s "$file" ]] || return 0
-  while read -r d; do
-    [[ -z "$d" || "$d" =~ ^# ]] && continue
+
+  while IFS='|' read -r server port label _rest; do
+    [[ -z "${server:-}" || "$server" =~ ^# ]] && continue
     [[ "${!total_ref}" -ge "$total_limit" ]] && return 0
-    add_vless_xhttp_cdn_link "$d" "${NODE_NAME:-node}-${label}-${n}" "$raw" "${CDN_PORT:-443}"
+
+    if [[ -z "${port:-}" || -z "${label:-}" ]]; then
+      port="${CDN_PORT:-443}"
+      label="${fallback_label}_${n}"
+    fi
+
+    if ! is_cf_https_port "$port"; then
+      port="${CDN_PORT:-443}"
+    fi
+
+    label="$(normalize_bestcf_label "$label" "${fallback_label}_${n}")"
+    name="${NODE_NAME:-node}-${label}"
+    add_vless_xhttp_cdn_link "$server" "$name" "$raw" "$port"
+
     n=$((n+1))
     printf -v "$total_ref" '%s' "$(( ${!total_ref} + 1 ))"
     [[ "$n" -gt "$max_each" ]] && break
@@ -1431,7 +1550,6 @@ generate_bestcf_subscription_nodes(){
   fi
 
   if [[ "$mode" == "isp_domain" ]]; then
-    # 固定最多 4 个：移动 1、联通 1、电信 1、优选域名 1。缺失的分类自动跳过，不用其它分类无限补位。
     add_bestcf_nodes_from_file "$BESTCF_DIR/cmcc-ip.txt" "CMCC-CFIP" "$raw" 1 total 4
     add_bestcf_nodes_from_file "$BESTCF_DIR/cucc-ip.txt" "CUCC-CFIP" "$raw" 1 total 4
     add_bestcf_nodes_from_file "$BESTCF_DIR/ctcc-ip.txt" "CTCC-CFIP" "$raw" 1 total 4
@@ -1439,6 +1557,7 @@ generate_bestcf_subscription_nodes(){
     return 0
   fi
 }
+
 enable_bestcf_timer(){
   cat >/etc/systemd/system/xem-bestcf-update.service <<EOF2
 [Unit]
@@ -1876,7 +1995,7 @@ main_menu(){
   load_state
   while true; do
     echo
-    echo "===== Xray Edge Manager v0.0.5 ====="
+    echo "===== Xray Edge Manager v0.0.6 ====="
     echo "1. 首次部署向导，推荐"
     echo "2. 安装/升级基础依赖"
     echo "3. 安装/升级 Xray-core"
