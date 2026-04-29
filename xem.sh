@@ -223,6 +223,7 @@ configure_base_domain() {
   fi
   while true; do
     d=$(ask "请输入母域名，必须三段式或以上，例如 node.example.com" "${BASE_DOMAIN:-}")
+    d=$(printf '%s' "$d" | tr -d '[:space:]')
     if validate_base_domain "$d"; then
       save_kv "$STATE_FILE" BASE_DOMAIN "$d"
       log "母域名已设置：$d"
@@ -230,6 +231,82 @@ configure_base_domain() {
     else
       warn "域名不合格。必须类似 node.example.com，不能是 example.com 这种二段根域。"
     fi
+  done
+}
+
+prepare_base_domain_for_install() {
+  load_state
+  if [[ -n "${BASE_DOMAIN:-}" ]] && validate_base_domain "$BASE_DOMAIN"; then
+    echo "检测到上次保存的母域名：$BASE_DOMAIN"
+    echo "1. 继续使用这个母域名"
+    echo "2. 重新输入母域名"
+    local c
+    c=$(ask "请选择" "1")
+    case "$c" in
+      1) info "继续使用当前母域名：$BASE_DOMAIN" ;;
+      2) configure_base_domain 1 ;;
+      *) warn "无效选择，继续使用当前母域名：$BASE_DOMAIN" ;;
+    esac
+  else
+    configure_base_domain 1
+  fi
+}
+
+reset_base_domain() {
+  load_state
+  if [[ -n "${BASE_DOMAIN:-}" ]]; then
+    warn "当前母域名：$BASE_DOMAIN"
+  else
+    warn "当前未保存母域名。"
+  fi
+  if confirm "是否重新设置母域名？这不会自动删除旧 DNS 记录" "N"; then
+    configure_base_domain 1
+    log "母域名已重置。后续请重新运行 DNS / 证书 / Nginx / 订阅相关菜单。"
+  fi
+}
+
+show_installation_state() {
+  load_state
+  echo "===== 安装状态检测 ====="
+  echo "APP_DIR: $APP_DIR"
+  echo "BASE_DOMAIN: ${BASE_DOMAIN:-未设置}"
+  echo "PROTOCOLS: ${PROTOCOLS:-未设置}"
+  echo "ENABLE_CDN: ${ENABLE_CDN:-未设置}"
+  echo "BESTCF_ENABLED: ${BESTCF_ENABLED:-0}"
+  echo "Xray config: $([[ -f "$XRAY_CONFIG" ]] && echo 存在 || echo 不存在)"
+  echo "Nginx site: $([[ -f "$NGINX_SITE" ]] && echo 存在 || echo 不存在)"
+  echo "Cloudflare env: $([[ -f "$CF_ENV" ]] && echo 存在 || echo 不存在)"
+  echo "Certificate: $([[ -n "${BASE_DOMAIN:-}" && -d "/etc/letsencrypt/live/${BASE_DOMAIN}" ]] && echo 存在 || echo 不存在或未检测)"
+  echo "Subscription: $([[ -f "$SUB_DIR/local.b64" ]] && echo 存在 || echo 不存在)"
+  echo
+  systemctl is-active xray >/dev/null 2>&1 && echo "Xray service: active" || echo "Xray service: inactive/unknown"
+  systemctl is-active nginx >/dev/null 2>&1 && echo "Nginx service: active" || echo "Nginx service: inactive/unknown"
+}
+
+installation_state_menu() {
+  while true; do
+    echo
+    echo "===== 安装状态 / 母域名管理 ====="
+    echo "1. 查看当前安装状态"
+    echo "2. 重新设置母域名"
+    echo "3. 清理脚本状态文件，保留系统服务与配置"
+    echo "0. 返回"
+    local c
+    c=$(ask "请选择" "0")
+    case "$c" in
+      1) show_installation_state; pause ;;
+      2) reset_base_domain; pause ;;
+      3)
+        if confirm "确认清理 $STATE_FILE？这会让脚本忘记上次输入，但不会删除 Xray/Nginx/证书" "N"; then
+          cp -a "$STATE_FILE" "$BACKUP_DIR/state.env.manual-clear.$(date +%F-%H%M%S).bak" 2>/dev/null || true
+          rm -f "$STATE_FILE"
+          log "已清理脚本状态文件。"
+        fi
+        pause
+        ;;
+      0) break ;;
+      *) warn "无效选择。" ;;
+    esac
   done
 }
 
@@ -274,7 +351,10 @@ setup_cloudflare() {
   load_state
   configure_base_domain
   local token zone_name zone_id ok
-  token=$(ask "请输入 Cloudflare Restricted API Token，需 Zone:Read + DNS:Edit" "${CF_API_TOKEN:-}")
+  echo "Cloudflare API Token 创建教程："
+echo "  https://github.com/0x1233333/xray-edge-manager/blob/main/examples/cloudflare-api-token.md"
+echo "请使用 Restricted API Token，不要使用 Global API Key。"
+token=$(ask "请输入 Cloudflare Restricted API Token，需 Zone:Read + DNS:Edit" "${CF_API_TOKEN:-}")
   token=$(printf '%s' "$token" | tr -d '[:space:]')
   [[ -n "$token" ]] || die "API Token 不能为空。"
   cloudflare_token_risk_check "$token"
@@ -1156,7 +1236,7 @@ install_full() {
   install_deps
   install_or_upgrade_xray
   update_geodata
-  configure_base_domain
+  prepare_base_domain_for_install
   setup_cloudflare
   asn_report
   select_protocols
@@ -1215,6 +1295,212 @@ subscription_menu() {
   done
 }
 
+cf_get_record_json() {
+  local name="$1" type="$2"
+  load_state
+  [[ -n "${CF_API_TOKEN:-}" && -n "${CF_ZONE_ID:-}" ]] || return 1
+  curl -fsS --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time "$CURL_MAX_TIME" -G \
+    "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/dns_records" \
+    -H "Authorization: Bearer $CF_API_TOKEN" \
+    --data-urlencode "type=$type" \
+    --data-urlencode "name=$name"
+}
+
+cf_delete_record_by_id() {
+  local rec_id="$1"
+  [[ -n "$rec_id" ]] || return 1
+  cf_api DELETE "/zones/$CF_ZONE_ID/dns_records/$rec_id" >/dev/null
+}
+
+cf_delete_owned_record() {
+  local name="$1" type="$2" expected="$3" resp rec_id content
+  [[ -n "$expected" ]] || { warn "跳过 $type $name：本机对应 IP 为空。"; return 0; }
+  resp=$(cf_get_record_json "$name" "$type") || { warn "无法读取 $type $name，跳过。"; return 0; }
+  rec_id=$(echo "$resp" | jq -r '.result[0].id // empty')
+  content=$(echo "$resp" | jq -r '.result[0].content // empty')
+  if [[ -z "$rec_id" ]]; then
+    info "Cloudflare 中不存在 $type $name，跳过。"
+    return 0
+  fi
+  if [[ "$content" != "$expected" ]]; then
+    warn "跳过删除 $type $name：当前记录指向 $content，不等于本机 IP $expected。"
+    warn "这可能已经被迁移到其他机器，为防止误伤不会删除。"
+    return 0
+  fi
+  if cf_delete_record_by_id "$rec_id"; then
+    log "已删除 Cloudflare DNS 记录：$type $name -> $content"
+  else
+    warn "删除失败：$type $name"
+  fi
+}
+
+delete_cloudflare_records_with_ownership_check() {
+  load_state
+  [[ -n "${BASE_DOMAIN:-}" ]] || { warn "BASE_DOMAIN 未设置，无法清理 DNS。"; return 0; }
+  [[ -n "${CF_API_TOKEN:-}" && -n "${CF_ZONE_ID:-}" ]] || { warn "Cloudflare API 未配置，无法清理 DNS。"; return 0; }
+  local ip4 ip6
+  ip4="${PUBLIC_IPV4:-$(public_ipv4)}"
+  ip6="${PUBLIC_IPV6:-$(public_ipv6)}"
+  warn "即将尝试删除 Cloudflare DNS 记录，但只删除仍指向本机 IP 的记录。"
+  echo "目标记录："
+  echo "  $BASE_DOMAIN A/AAAA"
+  echo "  v4.$BASE_DOMAIN A"
+  echo "  v6.$BASE_DOMAIN AAAA"
+  echo "本机 IP："
+  echo "  IPv4: ${ip4:-无}"
+  echo "  IPv6: ${ip6:-无}"
+  if ! confirm "确认执行 DNS 归属权校验删除？" "N"; then
+    warn "已取消 DNS 清理。"
+    return 0
+  fi
+  cf_delete_owned_record "$BASE_DOMAIN" A "$ip4"
+  cf_delete_owned_record "v4.$BASE_DOMAIN" A "$ip4"
+  cf_delete_owned_record "$BASE_DOMAIN" AAAA "$ip6"
+  cf_delete_owned_record "v6.$BASE_DOMAIN" AAAA "$ip6"
+}
+
+remove_hy2_hopping_rules() {
+  load_state
+  local range="${HY2_HOP_RANGE:-$DEFAULT_HY2_HOP_RANGE}" start end to_port
+  start="${range%%:*}"; end="${range##*:}"; to_port="${HY2_PORT:-443}"
+  if [[ "$start" =~ ^[0-9]+$ && "$end" =~ ^[0-9]+$ ]]; then
+    while iptables -t nat -D PREROUTING -p udp --dport "$start:$end" -j REDIRECT --to-ports "$to_port" 2>/dev/null; do :; done
+    if command -v ip6tables >/dev/null 2>&1; then
+      while ip6tables -t nat -D PREROUTING -p udp --dport "$start:$end" -j REDIRECT --to-ports "$to_port" 2>/dev/null; do :; done
+    fi
+    command -v netfilter-persistent >/dev/null 2>&1 && netfilter-persistent save || true
+    log "已尝试删除端口跳跃规则：UDP $start-$end -> $to_port。"
+  else
+    warn "端口跳跃范围无效，跳过规则删除：$range"
+  fi
+}
+
+full_uninstall_xem() {
+  need_root
+  load_state
+  echo "===== 完整卸载 Xray Edge Manager ====="
+  warn "这会清理本脚本部署的 Xray、Nginx 站点、订阅、状态目录和端口跳跃规则。"
+  warn "适合纯节点机器；如果这台机器还有其他网站或服务，请不要继续。"
+  if ! confirm "确认完整卸载？" "N"; then
+    warn "已取消。"
+    return 0
+  fi
+
+  if ! confirm "请再次确认：这台机器只用于当前节点，允许清理相关服务和配置" "N"; then
+    warn "已取消。"
+    return 0
+  fi
+
+  mkdir -p "$BACKUP_DIR" 2>/dev/null || true
+  local ts="$(date +%F-%H%M%S)"
+  [[ -f "$XRAY_CONFIG" ]] && cp -a "$XRAY_CONFIG" "$BACKUP_DIR/config.json.before-uninstall.$ts.bak" 2>/dev/null || true
+  [[ -f "$NGINX_SITE" ]] && cp -a "$NGINX_SITE" "$BACKUP_DIR/nginx.before-uninstall.$ts.bak" 2>/dev/null || true
+  [[ -f "$STATE_FILE" ]] && cp -a "$STATE_FILE" "$BACKUP_DIR/state.env.before-uninstall.$ts.bak" 2>/dev/null || true
+
+  info "停止服务..."
+  systemctl stop xray 2>/dev/null || true
+  systemctl disable xray 2>/dev/null || true
+  systemctl stop nginx 2>/dev/null || true
+
+  info "删除 Hysteria2 端口跳跃规则..."
+  remove_hy2_hopping_rules || true
+
+  info "调用 Xray 官方卸载脚本 remove..."
+  bash -c "$(curl -fsSL --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time "$CURL_MAX_TIME" https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ remove || warn "Xray 官方 remove 执行失败或已不存在，继续清理残留。"
+
+  info "清理 Xray 残留文件..."
+  rm -rf \
+    /usr/local/etc/xray \
+    /usr/local/share/xray \
+    /var/log/xray \
+    /etc/systemd/system/xray.service \
+    /etc/systemd/system/xray@.service \
+    /etc/systemd/system/xray.service.d \
+    /etc/systemd/system/xray@.service.d 2>/dev/null || true
+
+  info "清理 Nginx 站点与伪装目录..."
+  rm -f "$NGINX_SITE" 2>/dev/null || true
+  rm -rf "$WEB_ROOT" 2>/dev/null || true
+
+  if [[ -n "${BASE_DOMAIN:-}" ]]; then
+    info "尝试通过 Certbot 原生命令删除证书：$BASE_DOMAIN"
+    if command -v certbot >/dev/null 2>&1; then
+      certbot delete --cert-name "$BASE_DOMAIN" --non-interactive 2>/dev/null || warn "Certbot 未能删除证书，可能证书不存在或名称不同。为避免破坏 Certbot 状态，脚本不手动 rm letsencrypt 内部目录。"
+    fi
+  fi
+
+  if confirm "是否同时移除 Nginx / Certbot / Cloudflare DNS 插件包？纯节点机器可选 Y" "Y"; then
+    warn "该操作会移除 Nginx / Certbot 相关软件包。若此机器还有其他网站业务，请立刻取消。"
+    local mode
+    echo "1. apt remove，保留部分全局配置，较稳妥"
+    echo "2. apt purge，彻底清理软件包配置，纯节点机器可选"
+    mode=$(ask "请选择软件包移除方式" "1")
+    if command -v apt-get >/dev/null 2>&1; then
+      export DEBIAN_FRONTEND=noninteractive
+      if [[ "$mode" == "2" ]]; then
+        if confirm "最后确认 apt purge？这会清理 Nginx/Certbot 全局配置" "N"; then
+          apt-get purge -y nginx nginx-common nginx-core certbot python3-certbot-dns-cloudflare 2>/dev/null || true
+        fi
+      else
+        apt-get remove -y nginx nginx-common nginx-core certbot python3-certbot-dns-cloudflare 2>/dev/null || true
+      fi
+      apt-get autoremove -y 2>/dev/null || true
+    else
+      warn "未检测到 apt-get，跳过软件包移除。"
+    fi
+  fi
+
+  info "清理脚本状态目录..."
+  if confirm "是否尝试删除 Cloudflare DNS 记录？仅删除仍指向本机 IP 的记录，默认不删" "N"; then
+    delete_cloudflare_records_with_ownership_check || true
+  fi
+
+  rm -rf "$APP_DIR" 2>/dev/null || true
+
+  systemctl daemon-reload 2>/dev/null || true
+  systemctl reset-failed 2>/dev/null || true
+
+  log "完整卸载完成。"
+  warn "Cloudflare DNS 记录不会自动删除。你可以在 Cloudflare 后台手动删除 node/v4/v6 相关记录，或后续再加 DNS 清理功能。"
+}
+
+uninstall_menu() {
+  while true; do
+    echo
+    echo "===== 卸载 / 清理 ====="
+    echo "1. 完整卸载本脚本环境，推荐纯节点机器使用"
+    echo "2. 仅停止并禁用 Xray 服务"
+    echo "3. 仅删除 Hysteria2 端口跳跃规则"
+    echo "4. 仅清理脚本状态目录 $APP_DIR"
+    echo "5. 删除 Cloudflare DNS 记录，带归属权校验，默认不删"
+    echo "0. 返回"
+    local c
+    c=$(ask "请选择" "0")
+    case "$c" in
+      1) full_uninstall_xem; pause ;;
+      2)
+        if confirm "确认停止并禁用 xray 服务？" "N"; then
+          systemctl stop xray 2>/dev/null || true
+          systemctl disable xray 2>/dev/null || true
+          log "已停止并禁用 xray。"
+        fi
+        pause
+        ;;
+      3) remove_hy2_hopping_rules; pause ;;
+      4)
+        if confirm "确认删除 $APP_DIR？这会删除脚本状态、订阅、本地缓存和备份" "N"; then
+          rm -rf "$APP_DIR"
+          log "已删除脚本状态目录。"
+        fi
+        pause
+        ;;
+      5) delete_cloudflare_records_with_ownership_check; pause ;;
+      0) break ;;
+      *) warn "无效选择。" ;;
+    esac
+  done
+}
+
 main_menu() {
   need_root
   load_state
@@ -1239,6 +1525,8 @@ main_menu() {
     echo "16. 查看分享链接 / 订阅链接"
     echo "17. 重启服务"
     echo "18. 部署摘要"
+    echo "19. 安装状态 / 母域名管理"
+    echo "20. 卸载 / 清理"
     echo "0. 退出"
     local c; c=$(ask "请选择" "0")
     case "$c" in
@@ -1260,6 +1548,8 @@ main_menu() {
       16) show_links; pause ;;
       17) restart_services; pause ;;
       18) deployment_summary; pause ;;
+      19) installation_state_menu ;;
+      20) uninstall_menu ;;
       0) exit 0 ;;
       *) warn "无效选择。" ;;
     esac
