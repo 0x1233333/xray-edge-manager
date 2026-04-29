@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Xray Edge Manager / Xray Anti-Block Manager
-# v0.0.2 single-file installer
+# v0.0.3 single-file installer
 #
 # Features:
 # - Xray-core only, no Docker, no sing-box
@@ -424,6 +424,17 @@ select_protocols(){
     save_kv "$STATE_FILE" ENABLE_CDN "0"
   fi
 
+  # 协议 5 的意义是 CDN/BestCF 入口扩展。若用户选择 5，则自动开启 BestCF 域名模式；否则 5 会和普通 CDN 节点重复，没有实际意义。
+  if [[ "$p" == *5* ]]; then
+    if [[ "${BESTCF_ENABLED:-0}" != "1" ]]; then
+      save_kv "$STATE_FILE" BESTCF_ENABLED "1"
+      save_kv "$STATE_FILE" BESTCF_MODE "domain"
+      save_kv "$STATE_FILE" BESTCF_PER_CATEGORY_LIMIT "1"
+      save_kv "$STATE_FILE" BESTCF_TOTAL_LIMIT "1"
+      warn "检测到协议 5，已自动开启 BestCF：只生成 1 个优选域名节点。"
+    fi
+  fi
+
   if [[ "$p" == *1* ]]; then
     port=$(ask "XHTTP + REALITY 直连端口，默认推荐 2443，可自定义" "${XHTTP_REALITY_PORT:-2443}")
     valid_port "$port" || die "端口无效。"
@@ -451,9 +462,9 @@ select_protocols(){
       save_kv "$STATE_FILE" ENABLE_IP_STACK_BINDING "0"
     fi
   fi
+  load_state
   log "协议组合：$p"
 }
-
 create_dns_records(){
   load_state
   [[ -n "${BASE_DOMAIN:-}" ]] || configure_base_domain
@@ -1034,9 +1045,16 @@ generate_subscription(){
     add_vless_xhttp_cdn_link "$BASE_DOMAIN" "${NODE_NAME:-node}-CDN-XHTTP-Origin" "$raw" "${CDN_PORT:-443}"
   fi
 
+  # 5 = CDN 入口扩展。优先生成 BestCF 节点；若 BestCF 数据还没拉取，则保留一个母域名入口，防止节点为空。
   if protocol_enabled 5; then
-    add_vless_xhttp_cdn_link "$BASE_DOMAIN" "${NODE_NAME:-node}-CDN-XHTTP-Entry" "$raw" "${CDN_PORT:-443}"
+    local before_count after_count
+    before_count=$(wc -l < "$raw" 2>/dev/null || echo 0)
     generate_bestcf_subscription_nodes "$raw"
+    after_count=$(wc -l < "$raw" 2>/dev/null || echo 0)
+    if [[ "$after_count" -eq "$before_count" ]]; then
+      add_vless_xhttp_cdn_link "$BASE_DOMAIN" "${NODE_NAME:-node}-CDN-XHTTP-Entry" "$raw" "${CDN_PORT:-443}"
+      warn "协议 5 未找到可用 BestCF 数据，已临时生成母域名 CDN Entry。请在菜单 11 更新 BestCF 后重新生成订阅。"
+    fi
   elif protocol_enabled 2; then
     generate_bestcf_subscription_nodes "$raw"
   fi
@@ -1061,6 +1079,17 @@ generate_subscription(){
   echo "订阅链接： https://${BASE_DOMAIN}/sub/${SUB_TOKEN}"
 }
 
+regenerate_subscriptions_after_change(){
+  load_state
+  if [[ -z "${BASE_DOMAIN:-}" ]]; then
+    warn "未设置母域名，跳过自动刷新订阅。"
+    return 0
+  fi
+  generate_subscription || { warn "本机订阅自动刷新失败，请稍后手动执行菜单 14 -> 1。"; return 0; }
+  if [[ -s "${REMOTES_FILE:-$SUB_DIR/remotes.conf}" ]]; then
+    merge_remote_subscriptions || warn "合并订阅自动刷新失败，请稍后手动执行菜单 14 -> 8。"
+  fi
+}
 ensure_iptables(){
   command -v iptables >/dev/null 2>&1 && return 0
   warn "未检测到 iptables，端口跳跃需要它。"
@@ -1230,6 +1259,7 @@ EOF2
 fetch_bestcf_domains(){ fetch_bestcf_all; }
 
 show_bestcf_count(){
+  load_state
   echo "===== BestCF 数据数量 ====="
   local f
   for f in cmcc-ip.txt cucc-ip.txt ctcc-ip.txt bestcf-domain.txt; do
@@ -1239,42 +1269,68 @@ show_bestcf_count(){
       echo "$f: 0"
     fi
   done
-  echo "模式: ${BESTCF_MODE:-off}，每类: ${BESTCF_PER_CATEGORY_LIMIT:-2}，总上限: ${BESTCF_TOTAL_LIMIT:-10}"
+  echo "当前模式: enabled=${BESTCF_ENABLED:-0}, mode=${BESTCF_MODE:-off}"
+  case "${BESTCF_MODE:-off}" in
+    domain) echo "节点策略: 只生成 1 个优选域名节点" ;;
+    isp_domain) echo "节点策略: 1 个优选域名 + 三网各 1 个 IP，最多 4 个节点" ;;
+    *) echo "节点策略: 关闭" ;;
+  esac
 }
-
 set_bestcf_limits(){
-  local per total
-  per=$(ask "每类最多生成几个 BestCF 节点，建议 1-3" "${BESTCF_PER_CATEGORY_LIMIT:-2}")
-  total=$(ask "BestCF 总节点上限，建议 6-12" "${BESTCF_TOTAL_LIMIT:-10}")
-  [[ "$per" =~ ^[0-9]+$ && "$per" -ge 1 ]] || per=2
-  [[ "$total" =~ ^[0-9]+$ && "$total" -ge 1 ]] || total=10
-  save_kv "$STATE_FILE" BESTCF_PER_CATEGORY_LIMIT "$per"
-  save_kv "$STATE_FILE" BESTCF_TOTAL_LIMIT "$total"
-  log "BestCF 节点数量限制已保存：每类 $per，总上限 $total。"
+  echo "===== BestCF 节点数量模式 ====="
+  echo "1. 只生成 1 个优选域名节点，节点最少，推荐"
+  echo "2. 生成 1 个优选域名 + 三网各 1 个 IP，最多 4 个节点"
+  echo "0. 返回"
+  local c
+  c=$(ask "请选择" "1")
+  case "$c" in
+    1)
+      save_kv "$STATE_FILE" BESTCF_ENABLED "1"
+      save_kv "$STATE_FILE" BESTCF_MODE "domain"
+      save_kv "$STATE_FILE" BESTCF_PER_CATEGORY_LIMIT "1"
+      save_kv "$STATE_FILE" BESTCF_TOTAL_LIMIT "1"
+      log "BestCF 数量模式：只生成 1 个优选域名节点。"
+      ;;
+    2)
+      save_kv "$STATE_FILE" BESTCF_ENABLED "1"
+      save_kv "$STATE_FILE" BESTCF_MODE "isp_domain"
+      save_kv "$STATE_FILE" BESTCF_PER_CATEGORY_LIMIT "1"
+      save_kv "$STATE_FILE" BESTCF_TOTAL_LIMIT "4"
+      log "BestCF 数量模式：1 个优选域名 + 三网各 1 个 IP，最多 4 个节点。"
+      ;;
+    0) return 0 ;;
+    *) warn "无效选择。" ;;
+  esac
+  load_state
+  regenerate_subscriptions_after_change
 }
-
 enable_bestcf_domain_only(){
   fetch_bestcf_all
   save_kv "$STATE_FILE" BESTCF_ENABLED "1"
   save_kv "$STATE_FILE" BESTCF_MODE "domain"
-  set_bestcf_limits
-  log "BestCF 已启用：只生成优选域名节点。重新生成订阅后生效。"
+  save_kv "$STATE_FILE" BESTCF_PER_CATEGORY_LIMIT "1"
+  save_kv "$STATE_FILE" BESTCF_TOTAL_LIMIT "1"
+  load_state
+  log "BestCF 已启用：只生成 1 个优选域名节点。"
+  regenerate_subscriptions_after_change
 }
-
 enable_bestcf_isp_domain(){
   fetch_bestcf_all
   save_kv "$STATE_FILE" BESTCF_ENABLED "1"
   save_kv "$STATE_FILE" BESTCF_MODE "isp_domain"
-  set_bestcf_limits
-  log "BestCF 已启用：三网 IP + 优选域名兜底。重新生成订阅后生效。"
+  save_kv "$STATE_FILE" BESTCF_PER_CATEGORY_LIMIT "1"
+  save_kv "$STATE_FILE" BESTCF_TOTAL_LIMIT "4"
+  load_state
+  log "BestCF 已启用：1 个优选域名 + 三网各 1 个 IP，最多 4 个节点。"
+  regenerate_subscriptions_after_change
 }
-
 disable_bestcf(){
   save_kv "$STATE_FILE" BESTCF_ENABLED "0"
   save_kv "$STATE_FILE" BESTCF_MODE "off"
-  log "BestCF 已关闭。重新生成订阅后生效。"
+  load_state
+  log "BestCF 已关闭。"
+  regenerate_subscriptions_after_change
 }
-
 add_bestcf_nodes_from_file(){
   local file="$1" label="$2" raw="$3" max_each="$4" total_ref="$5" total_limit="$6" d n=1
   [[ -s "$file" ]] || return 0
@@ -1289,18 +1345,23 @@ add_bestcf_nodes_from_file(){
 }
 
 generate_bestcf_subscription_nodes(){
-  local raw="$1" mode="${BESTCF_MODE:-domain}" per="${BESTCF_PER_CATEGORY_LIMIT:-2}" total_limit="${BESTCF_TOTAL_LIMIT:-10}" total=0
+  local raw="$1" mode="${BESTCF_MODE:-domain}" total=0
   [[ "${BESTCF_ENABLED:-0}" == "1" ]] || return 0
-  [[ "$per" =~ ^[0-9]+$ ]] || per=2
-  [[ "$total_limit" =~ ^[0-9]+$ ]] || total_limit=10
-  if [[ "$mode" == "isp_domain" ]]; then
-    add_bestcf_nodes_from_file "$BESTCF_DIR/cmcc-ip.txt" "CMCC-CFIP" "$raw" "$per" total "$total_limit"
-    add_bestcf_nodes_from_file "$BESTCF_DIR/cucc-ip.txt" "CUCC-CFIP" "$raw" "$per" total "$total_limit"
-    add_bestcf_nodes_from_file "$BESTCF_DIR/ctcc-ip.txt" "CTCC-CFIP" "$raw" "$per" total "$total_limit"
-  fi
-  add_bestcf_nodes_from_file "$BESTCF_DIR/bestcf-domain.txt" "CFDomain" "$raw" "$per" total "$total_limit"
-}
 
+  if [[ "$mode" == "domain" ]]; then
+    add_bestcf_nodes_from_file "$BESTCF_DIR/bestcf-domain.txt" "CFDomain" "$raw" 1 total 1
+    return 0
+  fi
+
+  if [[ "$mode" == "isp_domain" ]]; then
+    # 固定最多 4 个：移动 1、联通 1、电信 1、优选域名 1。缺失的分类自动跳过，不用其它分类无限补位。
+    add_bestcf_nodes_from_file "$BESTCF_DIR/cmcc-ip.txt" "CMCC-CFIP" "$raw" 1 total 4
+    add_bestcf_nodes_from_file "$BESTCF_DIR/cucc-ip.txt" "CUCC-CFIP" "$raw" 1 total 4
+    add_bestcf_nodes_from_file "$BESTCF_DIR/ctcc-ip.txt" "CTCC-CFIP" "$raw" 1 total 4
+    add_bestcf_nodes_from_file "$BESTCF_DIR/bestcf-domain.txt" "CFDomain" "$raw" 1 total 4
+    return 0
+  fi
+}
 enable_bestcf_timer(){
   cat >/etc/systemd/system/xem-bestcf-update.service <<EOF2
 [Unit]
@@ -1502,42 +1563,43 @@ merge_remote_subscriptions(){
 
 subscription_menu(){
   while true; do
+    load_state
     echo; echo "===== 订阅管理 ====="
     echo "1. 重新生成本机 b64 订阅"
     echo "2. 查看分享链接 / 订阅链接"
-    echo "3. 设置节点名称"
-    echo "4. 添加远程 b64 订阅"
+    echo "3. 设置节点名称，并自动刷新订阅"
+    echo "4. 添加远程 b64 订阅，并自动刷新合并订阅"
     echo "5. 查看远程订阅列表"
-    echo "6. 删除一个远程订阅"
-    echo "7. 清空远程订阅"
+    echo "6. 删除一个远程订阅，并自动刷新合并订阅"
+    echo "7. 清空远程订阅，并自动刷新合并订阅"
     echo "8. 拉取并生成合并订阅"
     echo "0. 返回"
     local c; c=$(ask "请选择" "0")
     case "$c" in
-      1) generate_subscription ;;
+      1) regenerate_subscriptions_after_change ;;
       2) show_links ;;
-      3) configure_node_name ;;
-      4) add_remote_subscription ;;
+      3) configure_node_name; regenerate_subscriptions_after_change ;;
+      4) add_remote_subscription; merge_remote_subscriptions ;;
       5) list_remote_subscriptions ;;
-      6) delete_remote_subscription ;;
-      7) clear_remote_subscriptions ;;
+      6) delete_remote_subscription; merge_remote_subscriptions ;;
+      7) clear_remote_subscriptions; merge_remote_subscriptions ;;
       8) merge_remote_subscriptions ;;
       0) break ;;
       *) warn "无效选择。" ;;
     esac
   done
 }
-
 bestcf_menu(){
   while true; do
+    load_state
     echo; echo "===== BestCF 管理，默认关闭 ====="
-    echo "当前状态: enabled=${BESTCF_ENABLED:-0}, mode=${BESTCF_MODE:-off}, per=${BESTCF_PER_CATEGORY_LIMIT:-2}, total=${BESTCF_TOTAL_LIMIT:-10}"
-    echo "1. 启用：只生成优选域名节点，节点少"
-    echo "2. 启用：三网 IP + 优选域名兜底"
-    echo "3. 关闭 BestCF"
-    echo "4. 立即更新 BestCF 数据"
+    echo "当前状态: enabled=${BESTCF_ENABLED:-0}, mode=${BESTCF_MODE:-off}"
+    echo "1. 启用：只生成 1 个优选域名节点，节点最少"
+    echo "2. 启用：1 个优选域名 + 三网各 1 个 IP，最多 4 个节点"
+    echo "3. 关闭 BestCF，并自动刷新订阅"
+    echo "4. 立即更新 BestCF 数据，并自动刷新订阅"
     echo "5. 查看当前数据数量"
-    echo "6. 设置每类数量 / 总上限"
+    echo "6. 设置节点数量模式，并自动刷新订阅"
     echo "7. 启用 12 小时自动更新"
     echo "8. 关闭自动更新"
     echo "0. 返回"
@@ -1546,7 +1608,7 @@ bestcf_menu(){
       1) enable_bestcf_domain_only ;;
       2) enable_bestcf_isp_domain ;;
       3) disable_bestcf ;;
-      4) fetch_bestcf_all ;;
+      4) fetch_bestcf_all; regenerate_subscriptions_after_change ;;
       5) show_bestcf_count ;;
       6) set_bestcf_limits ;;
       7) enable_bestcf_timer ;;
@@ -1556,7 +1618,6 @@ bestcf_menu(){
     esac
   done
 }
-
 show_installation_state(){
   load_state
   echo "APP_DIR: $APP_DIR"
@@ -1738,7 +1799,7 @@ main_menu(){
   load_state
   while true; do
     echo
-    echo "===== Xray Edge Manager v0.0.2 ====="
+    echo "===== Xray Edge Manager v0.0.3 ====="
     echo "1. 首次部署向导，推荐"
     echo "2. 安装/升级基础依赖"
     echo "3. 安装/升级 Xray-core"
@@ -1770,7 +1831,7 @@ main_menu(){
       6) setup_cloudflare; create_dns_records; pause ;;
       7) issue_certificate; pause ;;
       8) asn_report; pause ;;
-      9) asn_report; select_ip_stack_strategy; select_protocols; choose_reality_target; generate_xray_config; pause ;;
+      9) asn_report; select_ip_stack_strategy; select_protocols; choose_reality_target; generate_xray_config; regenerate_subscriptions_after_change; pause ;;
       10) configure_nginx; pause ;;
       11) bestcf_menu ;;
       12) configure_hy2_hopping_prompt; pause ;;
@@ -1792,7 +1853,7 @@ if [[ "${1:-}" == "--bestcf-update" ]]; then
   need_root
   load_state
   fetch_bestcf_all
-  generate_subscription
+  regenerate_subscriptions_after_change
   exit 0
 fi
 
