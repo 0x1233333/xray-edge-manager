@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Xray Edge Manager / Xray Anti-Block Manager
-# Alpha R5 single-file installer
+# v0.0.1 single-file installer
 #
 # Features:
 # - Xray-core only, no Docker, no sing-box
@@ -12,9 +12,9 @@
 # - Protocols:
 #   1 = VLESS + XHTTP + REALITY direct
 #   2 = VLESS + XHTTP + TLS + CDN via Nginx
-#   3 = Xray Hysteria2 UDP, experimental
+#   3 = Xray Hysteria2 UDP high-speed backup
 #   4 = VLESS + REALITY + Vision backup direct
-#   5 = VLESS + XHTTP + TLS + CDN split-entry nodes using the same CDN inbound
+#   5 = VLESS + XHTTP + TLS + CDN extra CDN/BestCF entry using the same CDN inbound
 # - NAT-aware: PUBLIC IP is used for DNS; BIND IP is used for Xray listen.
 # - Public subscription is copied to /var/www, not read from /root by Nginx.
 #
@@ -332,7 +332,7 @@ select_one_stack_protocols(){
   echo "2. ${label} VLESS + XHTTP + TLS + CDN，CDN 隐藏，使用母域名" >&2
   echo "3. ${label} Xray Hysteria2，UDP 高速备用，实验" >&2
   echo "4. ${label} VLESS + REALITY + Vision，可选直连备用" >&2
-  echo "5. ${label} XHTTP + TLS + CDN 分离入口，复用 CDN 入站，可配合 BestCF/域名前置" >&2
+  echo "5. ${label} VLESS + XHTTP + TLS + CDN 入口扩展，复用 CDN 入站，可配合 BestCF/优选域名/域名前置" >&2
   echo "可以输入组合，例如：123、13、23、1234。" >&2
   mode=$(ask "请选择 ${label} 协议组合" "${current:-$default_mode}")
   normalized=$(normalize_stack_protocols "$mode")
@@ -924,7 +924,7 @@ EOF2
 
   if protocol_enabled 5; then
     cat >> "$f" <<EOF2
-  - name: ${NODE_NAME:-node}-CDN-XHTTP-Split-Origin
+  - name: ${NODE_NAME:-node}-CDN-XHTTP-Entry
     type: vless
     server: ${BASE_DOMAIN}
     port: ${CDN_PORT:-443}
@@ -1001,12 +1001,12 @@ generate_subscription(){
   fi
 
   if protocol_enabled 5; then
-    add_vless_xhttp_cdn_link "$BASE_DOMAIN" "${NODE_NAME:-node}-CDN-XHTTP-Split-Origin" "$raw" "${CDN_PORT:-443}"
+    add_vless_xhttp_cdn_link "$BASE_DOMAIN" "${NODE_NAME:-node}-CDN-XHTTP-Entry" "$raw" "${CDN_PORT:-443}"
     if [[ "${BESTCF_ENABLED:-0}" == "1" && -s "$BESTCF_DIR/bestcf-domain.txt" ]]; then
       n=1
       while read -r d; do
         [[ -z "$d" || "$d" =~ ^# ]] && continue
-        add_vless_xhttp_cdn_link "$d" "${NODE_NAME:-node}-CDN-Split-BestCF-${n}" "$raw" "${CDN_PORT:-443}"
+        add_vless_xhttp_cdn_link "$d" "${NODE_NAME:-node}-CDN-XHTTP-BestCF-${n}" "$raw" "${CDN_PORT:-443}"
         n=$((n+1)); [[ "$n" -gt "${BESTCF_NODE_LIMIT:-10}" ]] && break
       done < "$BESTCF_DIR/bestcf-domain.txt"
     fi
@@ -1205,7 +1205,7 @@ deployment_summary(){
   protocol_enabled 2 && echo "  XHTTP+TLS+CDN: TCP ${CDN_PORT:-443} -> 127.0.0.1:${XHTTP_CDN_LOCAL_PORT:-31301}"
   protocol_enabled 3 && echo "  Xray Hysteria2: UDP ${HY2_PORT:-443}，ALPN h3"
   protocol_enabled 4 && echo "  REALITY+Vision: TCP ${REALITY_VISION_PORT:-3443}"
-  protocol_enabled 5 && echo "  XHTTP CDN split-entry: TCP ${CDN_PORT:-443} -> 127.0.0.1:${XHTTP_CDN_LOCAL_PORT:-31301}"
+  protocol_enabled 5 && echo "  XHTTP+TLS+CDN 入口扩展: TCP ${CDN_PORT:-443} -> 127.0.0.1:${XHTTP_CDN_LOCAL_PORT:-31301}"
   [[ -n "${HY2_HOP_RANGE:-}" ]] && echo "  HY2 端口跳跃: UDP ${HY2_HOP_RANGE/:/-} -> ${HY2_PORT:-443}"
   echo "订阅: https://${BASE_DOMAIN:-BASE}/sub/${SUB_TOKEN:-TOKEN}"
 }
@@ -1449,7 +1449,7 @@ main_menu(){
   load_state
   while true; do
     echo
-    echo "===== Xray Edge Manager Alpha R5 ====="
+    echo "===== Xray Edge Manager v0.0.1 ====="
     echo "1. 首次部署向导，推荐"
     echo "2. 安装/升级基础依赖"
     echo "3. 安装/升级 Xray-core"
