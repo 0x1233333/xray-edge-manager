@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Xray Edge Manager / Xray Anti-Block Manager
-# v0.0.3 single-file installer
+# v0.0.4 single-file installer
 #
 # Features:
 # - Xray-core only, no Docker, no sing-box
@@ -176,11 +176,46 @@ install_deps(){
   log "基础依赖安装完成。"
 }
 
+
+ensure_xray_service(){
+  need_root
+  command -v xray >/dev/null 2>&1 || die "未找到 xray 二进制文件，请先安装/升级 Xray-core。"
+  mkdir -p /usr/local/etc/xray /var/log/xray /etc/systemd/system
+
+  # Some uninstall/reinstall paths can leave the xray binary installed while the
+  # systemd unit has been removed. Recreate a minimal service unit if needed.
+  if [[ ! -f /etc/systemd/system/xray.service ]] && ! systemctl list-unit-files --type=service 2>/dev/null | awk '{print $1}' | grep -qx 'xray.service'; then
+    warn "未检测到 xray.service，正在自动重建 systemd 服务。"
+    cat >/etc/systemd/system/xray.service <<'EOF'
+[Unit]
+Description=Xray Service
+Documentation=https://github.com/xtls
+After=network.target nss-lookup.target
+
+[Service]
+User=root
+ExecStart=/usr/local/bin/xray run -config /usr/local/etc/xray/config.json
+Restart=on-failure
+RestartPreventExitStatus=23
+LimitNPROC=10000
+LimitNOFILE=1000000
+RuntimeDirectory=xray
+RuntimeDirectoryMode=0755
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  fi
+
+  systemctl daemon-reload
+  systemctl enable xray >/dev/null 2>&1 || true
+}
+
 install_or_upgrade_xray(){
   need_root
   info "安装/升级 Xray-core..."
   bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install -u root
-  systemctl enable xray >/dev/null 2>&1 || true
+  ensure_xray_service
   log "Xray 安装/升级完成。"
   xray version || true
 }
@@ -1155,10 +1190,24 @@ handle_firewall_ports(){
 }
 
 restart_services(){
-  if ! xray run -test -config "$XRAY_CONFIG" >/dev/null 2>&1; then restore_latest_xray_config || true; die "Xray 配置测试失败，已回滚。"; fi
-  if ! systemctl restart xray; then restore_latest_xray_config || true; die "Xray 重启失败，已回滚。"; fi
+  ensure_xray_service
+  if ! xray run -test -config "$XRAY_CONFIG" >/dev/null 2>&1; then
+    restore_latest_xray_config || true
+    die "Xray 配置测试失败，已回滚。"
+  fi
+  if ! systemctl restart xray; then
+    restore_latest_xray_config || true
+    ensure_xray_service || true
+    if xray run -test -config "$XRAY_CONFIG" >/dev/null 2>&1; then
+      systemctl restart xray || true
+    fi
+    die "Xray 重启失败，已回滚。"
+  fi
   if [[ -f "$NGINX_SITE" ]]; then
-    if ! nginx -t >/dev/null 2>&1; then restore_latest_nginx_config || true; die "Nginx 配置测试失败，已回滚。"; fi
+    if ! nginx -t >/dev/null 2>&1; then
+      restore_latest_nginx_config || true
+      die "Nginx 配置测试失败，已回滚。"
+    fi
     systemctl reload nginx || systemctl restart nginx || { restore_latest_nginx_config || true; die "Nginx reload/restart 失败，已回滚。"; }
   fi
   log "服务已重启。"
@@ -1799,7 +1848,7 @@ main_menu(){
   load_state
   while true; do
     echo
-    echo "===== Xray Edge Manager v0.0.3 ====="
+    echo "===== Xray Edge Manager v0.0.4 ====="
     echo "1. 首次部署向导，推荐"
     echo "2. 安装/升级基础依赖"
     echo "3. 安装/升级 Xray-core"
