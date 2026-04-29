@@ -519,6 +519,7 @@ EOF
 
   local email
   email=$(ask "请输入证书邮箱，留空则不绑定邮箱" "${CERT_EMAIL:-}")
+  email=$(printf '%s' "$email" | tr -d '[:space:]')
   [[ -n "$email" ]] && save_kv "$STATE_FILE" CERT_EMAIL "$email"
 
   if [[ -n "$email" ]]; then
@@ -1023,8 +1024,7 @@ configure_nginx() {
   local nginx_http_v6_listen="" nginx_https_v6_listen=""
   if [[ -n "${PUBLIC_IPV6:-}" && "${IPV6_PROTOCOLS:-0}" == *2* ]]; then
     nginx_http_v6_listen="    listen [::]:80;"
-    nginx_https_v6_listen="    listen [::]:${CDN_PORT:-443} ssl;
-    http2 on;"
+    nginx_https_v6_listen="    listen [::]:${CDN_PORT:-443} ssl;"
   fi
   cat >"$WEB_ROOT/index.html" <<EOF
 <!doctype html><html><head><meta charset="utf-8"><title>Welcome</title></head><body><h1>Welcome</h1><p>It works.</p></body></html>
