@@ -512,15 +512,48 @@ generate_keys_if_needed() {
   load_state
   command -v xray >/dev/null 2>&1 || die "请先安装 Xray。"
   [[ -n "${UUID:-}" ]] || save_kv "$STATE_FILE" UUID "$(xray uuid)"
+
   if [[ -z "${REALITY_PRIVATE_KEY:-}" || -z "${REALITY_PUBLIC_KEY:-}" ]]; then
-    local k priv pub
-    k=$(xray x25519)
-    priv=$(echo "$k" | awk -F': ' '/Private key/ {print $2}')
-    pub=$(echo "$k" | awk -F': ' '/Public key/ {print $2}')
-    [[ -n "$priv" && -n "$pub" ]] || die "xray x25519 生成失败。"
+    local raw_output priv pub
+
+    # Execute xray x25519 and normalize its output before parsing.
+    # Some versions or terminal environments may emit ANSI color codes.
+    raw_output=$(xray x25519 2>&1 | sed -r 's/\[[0-9;]*[mK]//g' || true)
+
+    # Xray x25519 output changed across versions. Known variants include:
+    #   Private key: xxx
+    #   Public key: xxx
+    #   PrivateKey: xxx
+    #   Password: xxx
+    #   Password (PublicKey): xxx
+    # Keep parsing tolerant and strip all whitespace from extracted keys.
+    priv=$(printf '%s
+' "$raw_output" \
+      | grep -iE 'Private[ _-]?key|PrivateKey|Seed' \
+      | awk -F':' '{print $2}' \
+      | tr -d '[:space:]' \
+      | head -n1)
+
+    pub=$(printf '%s
+' "$raw_output" \
+      | grep -iE 'Public[ _-]?key|PublicKey|Password|Client' \
+      | awk -F':' '{print $2}' \
+      | tr -d '[:space:]' \
+      | head -n1)
+
+    if [[ -z "$priv" || -z "$pub" ]]; then
+      err "xray x25519 输出无法解析。脱色后的原始输出如下："
+      err "==== xray x25519 output begin ===="
+      printf '%s
+' "$raw_output" >&2
+      err "==== xray x25519 output end ===="
+      die "REALITY 密钥生成失败。请确认 Xray 版本支持 x25519，或手动执行：xray x25519"
+    fi
+
     save_kv "$STATE_FILE" REALITY_PRIVATE_KEY "$priv"
     save_kv "$STATE_FILE" REALITY_PUBLIC_KEY "$pub"
   fi
+
   [[ -n "${SHORT_ID:-}" ]] || save_kv "$STATE_FILE" SHORT_ID "$(rand_hex 8)"
   [[ -n "${XHTTP_REALITY_PATH:-}" ]] || save_kv "$STATE_FILE" XHTTP_REALITY_PATH "$(rand_path)"
   [[ -n "${XHTTP_CDN_PATH:-}" ]] || save_kv "$STATE_FILE" XHTTP_CDN_PATH "$(rand_path)"
