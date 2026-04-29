@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Xray Edge Manager / Xray Anti-Block Manager
-# v0.0.1 single-file installer
+# v0.0.2 single-file installer
 #
 # Features:
 # - Xray-core only, no Docker, no sing-box
@@ -27,6 +27,7 @@ STATE_FILE="$APP_DIR/state.env"
 CF_ENV="$APP_DIR/cloudflare.env"
 CF_CRED="$APP_DIR/cloudflare.ini"
 SUB_DIR="$APP_DIR/subscription"
+REMOTES_FILE="$SUB_DIR/remotes.conf"
 BESTCF_DIR="$APP_DIR/bestcf"
 BACKUP_DIR="$APP_DIR/backups"
 XRAY_CONFIG="/usr/local/etc/xray/config.json"
@@ -40,7 +41,9 @@ FODDER_BASE_URL="https://raw.githubusercontent.com/mack-a/v2ray-agent/master/fod
 
 CF_HTTPS_PORTS="443 2053 2083 2087 2096 8443"
 DEFAULT_HY2_HOP_RANGE="20000:20100"
-BESTCF_DOMAIN_URL="https://raw.githubusercontent.com/DustinWin/BestCF/main/bestcf-domain.txt"
+SCRIPT_RAW_URL="https://raw.githubusercontent.com/0x1233333/xray-edge-manager/main/xem.sh"
+BESTCF_RELEASE_API="https://api.github.com/repos/DustinWin/BestCF/releases/tags/bestcf"
+BESTCF_ASSETS="cmcc-ip.txt cucc-ip.txt ctcc-ip.txt bestcf-domain.txt"
 CURL_CONNECT_TIMEOUT=5
 CURL_MAX_TIME=20
 
@@ -204,6 +207,21 @@ configure_base_domain(){
     fi
     warn "域名不合格。必须类似 node.example.com，不能是 example.com 这种二段根域。"
   done
+}
+
+configure_node_name(){
+  load_state
+  local default_name name
+  if [[ -n "${BASE_DOMAIN:-}" ]]; then
+    default_name="${BASE_DOMAIN%%.*}"
+  else
+    default_name="node"
+  fi
+  name=$(ask "请输入节点名称，用于订阅中区分机器，例如 jp1/us1/oracle-tokyo" "${NODE_NAME:-$default_name}")
+  name=$(printf '%s' "$name" | tr -cd 'A-Za-z0-9_.-' | sed 's/^[-_.]*//; s/[-_.]*$//')
+  [[ -n "$name" ]] || name="node"
+  save_kv "$STATE_FILE" NODE_NAME "$name"
+  log "节点名称已设置：$name"
 }
 
 prepare_base_domain_for_install(){
@@ -523,6 +541,7 @@ generate_keys_if_needed(){
   [[ -n "${XHTTP_CDN_PATH:-}" ]] || save_kv "$STATE_FILE" XHTTP_CDN_PATH "$(rand_path)"
   [[ -n "${HY2_AUTH:-}" ]] || save_kv "$STATE_FILE" HY2_AUTH "$(rand_hex 16)"
   [[ -n "${SUB_TOKEN:-}" ]] || save_kv "$STATE_FILE" SUB_TOKEN "$(rand_token)"
+  [[ -n "${MERGED_SUB_TOKEN:-}" ]] || save_kv "$STATE_FILE" MERGED_SUB_TOKEN "$(rand_token)"
   [[ -n "${XHTTP_CDN_LOCAL_PORT:-}" ]] || save_kv "$STATE_FILE" XHTTP_CDN_LOCAL_PORT "31301"
   load_state
 }
@@ -796,9 +815,10 @@ ${nginx_https_v6_listen}
         client_max_body_size 0;
     }
 
-    location = /sub/${SUB_TOKEN} {
+    location ^~ /sub/ {
         default_type text/plain;
-        alias ${WEB_ROOT}/sub/${SUB_TOKEN};
+        root ${WEB_ROOT};
+        try_files \$uri =404;
     }
 
     location / {
@@ -821,26 +841,39 @@ uri_encode(){
   echo "$out"
 }
 
+format_uri_host(){
+  local h="$1"
+  if [[ "$h" == *:* && "$h" != \[*\] ]]; then
+    echo "[$h]"
+  else
+    echo "$h"
+  fi
+}
+
 add_vless_xhttp_reality_link(){
-  local server="$1" name="$2" raw="$3" path_enc
+  local server="$1" name="$2" raw="$3" path_enc server_uri
+  server_uri=$(format_uri_host "$server")
   path_enc=$(uri_encode "$XHTTP_REALITY_PATH")
-  echo "vless://${UUID}@${server}:${XHTTP_REALITY_PORT}?encryption=none&security=reality&sni=${REALITY_TARGET}&fp=chrome&pbk=${REALITY_PUBLIC_KEY}&sid=${SHORT_ID}&type=xhttp&path=${path_enc}&mode=auto#$(uri_encode "$name")" >> "$raw"
+  echo "vless://${UUID}@${server_uri}:${XHTTP_REALITY_PORT}?encryption=none&security=reality&sni=${REALITY_TARGET}&fp=chrome&pbk=${REALITY_PUBLIC_KEY}&sid=${SHORT_ID}&type=xhttp&path=${path_enc}&mode=auto#$(uri_encode "$name")" >> "$raw"
 }
 
 add_vless_xhttp_cdn_link(){
-  local server="$1" name="$2" raw="$3" port="${4:-443}" path_enc
+  local server="$1" name="$2" raw="$3" port="${4:-443}" path_enc server_uri
+  server_uri=$(format_uri_host "$server")
   path_enc=$(uri_encode "$XHTTP_CDN_PATH")
-  echo "vless://${UUID}@${server}:${port}?encryption=none&security=tls&sni=${BASE_DOMAIN}&fp=chrome&type=xhttp&host=${BASE_DOMAIN}&path=${path_enc}&mode=auto#$(uri_encode "$name")" >> "$raw"
+  echo "vless://${UUID}@${server_uri}:${port}?encryption=none&security=tls&sni=${BASE_DOMAIN}&fp=chrome&type=xhttp&host=${BASE_DOMAIN}&path=${path_enc}&mode=auto#$(uri_encode "$name")" >> "$raw"
 }
 
 add_reality_vision_link(){
-  local server="$1" name="$2" raw="$3"
-  echo "vless://${UUID}@${server}:${REALITY_VISION_PORT}?encryption=none&security=reality&sni=${REALITY_TARGET}&fp=chrome&pbk=${REALITY_PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&flow=xtls-rprx-vision#$(uri_encode "$name")" >> "$raw"
+  local server="$1" name="$2" raw="$3" server_uri
+  server_uri=$(format_uri_host "$server")
+  echo "vless://${UUID}@${server_uri}:${REALITY_VISION_PORT}?encryption=none&security=reality&sni=${REALITY_TARGET}&fp=chrome&pbk=${REALITY_PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&flow=xtls-rprx-vision#$(uri_encode "$name")" >> "$raw"
 }
 
 add_hy2_link(){
-  local server="$1" name="$2" raw="$3"
-  echo "hysteria2://${HY2_AUTH}@${server}:${HY2_PORT:-443}?sni=${BASE_DOMAIN}&insecure=0&alpn=h3#$(uri_encode "$name")" >> "$raw"
+  local server="$1" name="$2" raw="$3" server_uri
+  server_uri=$(format_uri_host "$server")
+  echo "hysteria2://${HY2_AUTH}@${server_uri}:${HY2_PORT:-443}?sni=${BASE_DOMAIN}&insecure=0&alpn=h3#$(uri_encode "$name")" >> "$raw"
 }
 
 generate_mihomo_reference(){
@@ -988,42 +1021,31 @@ generate_subscription(){
   [[ -n "${BASE_DOMAIN:-}" ]] || die "请先设置母域名。"
   generate_keys_if_needed
   load_state
-  mkdir -p "$SUB_DIR"
-  local raw="$SUB_DIR/local.raw" b64="$SUB_DIR/local.b64" d n
+  mkdir -p "$SUB_DIR" "$WEB_ROOT/sub"
+  local raw="$SUB_DIR/local.raw" b64="$SUB_DIR/local.b64"
   : > "$raw"
 
   if protocol_enabled 1; then
     [[ -n "${PUBLIC_IPV4:-}" && "${IPV4_PROTOCOLS:-0}" == *1* ]] && add_vless_xhttp_reality_link "v4.${BASE_DOMAIN}" "${NODE_NAME:-node}-v4-XHTTP-REALITY" "$raw"
     [[ -n "${PUBLIC_IPV6:-}" && "${IPV6_PROTOCOLS:-0}" == *1* ]] && add_vless_xhttp_reality_link "v6.${BASE_DOMAIN}" "${NODE_NAME:-node}-v6-XHTTP-REALITY" "$raw"
   fi
+
   if protocol_enabled 2; then
     add_vless_xhttp_cdn_link "$BASE_DOMAIN" "${NODE_NAME:-node}-CDN-XHTTP-Origin" "$raw" "${CDN_PORT:-443}"
   fi
 
   if protocol_enabled 5; then
     add_vless_xhttp_cdn_link "$BASE_DOMAIN" "${NODE_NAME:-node}-CDN-XHTTP-Entry" "$raw" "${CDN_PORT:-443}"
-    if [[ "${BESTCF_ENABLED:-0}" == "1" && -s "$BESTCF_DIR/bestcf-domain.txt" ]]; then
-      n=1
-      while read -r d; do
-        [[ -z "$d" || "$d" =~ ^# ]] && continue
-        add_vless_xhttp_cdn_link "$d" "${NODE_NAME:-node}-CDN-XHTTP-BestCF-${n}" "$raw" "${CDN_PORT:-443}"
-        n=$((n+1)); [[ "$n" -gt "${BESTCF_NODE_LIMIT:-10}" ]] && break
-      done < "$BESTCF_DIR/bestcf-domain.txt"
-    fi
+    generate_bestcf_subscription_nodes "$raw"
   elif protocol_enabled 2; then
-    if [[ "${BESTCF_ENABLED:-0}" == "1" && -s "$BESTCF_DIR/bestcf-domain.txt" ]]; then
-      n=1
-      while read -r d; do
-        [[ -z "$d" || "$d" =~ ^# ]] && continue
-        add_vless_xhttp_cdn_link "$d" "${NODE_NAME:-node}-CDN-BestCF-${n}" "$raw" "${CDN_PORT:-443}"
-        n=$((n+1)); [[ "$n" -gt "${BESTCF_NODE_LIMIT:-10}" ]] && break
-      done < "$BESTCF_DIR/bestcf-domain.txt"
-    fi
+    generate_bestcf_subscription_nodes "$raw"
   fi
+
   if protocol_enabled 3; then
     [[ -n "${PUBLIC_IPV4:-}" && "${IPV4_PROTOCOLS:-0}" == *3* ]] && add_hy2_link "v4.${BASE_DOMAIN}" "${NODE_NAME:-node}-v4-HY2-UDP${HY2_PORT:-443}" "$raw"
     [[ -n "${PUBLIC_IPV6:-}" && "${IPV6_PROTOCOLS:-0}" == *3* ]] && add_hy2_link "v6.${BASE_DOMAIN}" "${NODE_NAME:-node}-v6-HY2-UDP${HY2_PORT:-443}" "$raw"
   fi
+
   if protocol_enabled 4; then
     [[ -n "${PUBLIC_IPV4:-}" && "${IPV4_PROTOCOLS:-0}" == *4* ]] && add_reality_vision_link "v4.${BASE_DOMAIN}" "${NODE_NAME:-node}-v4-REALITY-Vision" "$raw"
     [[ -n "${PUBLIC_IPV6:-}" && "${IPV6_PROTOCOLS:-0}" == *4* ]] && add_reality_vision_link "v6.${BASE_DOMAIN}" "${NODE_NAME:-node}-v6-REALITY-Vision" "$raw"
@@ -1031,7 +1053,6 @@ generate_subscription(){
 
   sed -i '/^$/d' "$raw"
   base64 -w0 "$raw" > "$b64"
-  mkdir -p "$WEB_ROOT/sub"
   cp -f "$b64" "$WEB_ROOT/sub/$SUB_TOKEN"
   chmod 755 "$WEB_ROOT" "$WEB_ROOT/sub" 2>/dev/null || true
   chmod 644 "$WEB_ROOT/sub/$SUB_TOKEN" 2>/dev/null || true
@@ -1135,22 +1156,186 @@ asn_report(){
   echo
 }
 
-fetch_bestcf_domains(){
+bestcf_asset_url(){
+  local asset="$1" url=""
+  url=$(curl -fsSL --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time "$CURL_MAX_TIME" "$BESTCF_RELEASE_API" 2>/dev/null \
+    | jq -r --arg name "$asset" '.assets[]? | select(.name == $name) | .browser_download_url' \
+    | head -n1 || true)
+  if [[ -z "$url" || "$url" == "null" ]]; then
+    url="https://github.com/DustinWin/BestCF/releases/download/bestcf/${asset}"
+  fi
+  echo "$url"
+}
+
+sanitize_bestcf_ip_file(){
+  sed 's/\r$//' | grep -E '^[0-9A-Fa-f:.]+$' | awk '!seen[$0]++'
+}
+
+sanitize_bestcf_domain_file(){
+  sed 's/\r$//' \
+    | grep -Eoi '(\*\.)?([A-Za-z0-9_-]+\.)+[A-Za-z]{2,}' \
+    | sed -E 's/^\*\.//I' \
+    | grep -Eiv '^(github\.com|raw\.githubusercontent\.com|githubusercontent\.com|cloudflare\.com|example\.com)$' \
+    | awk '!seen[$0]++'
+}
+
+download_bestcf_asset(){
+  local asset="$1" output="$2" url tmp
   mkdir -p "$BESTCF_DIR"
-  curl -fsSL "$BESTCF_DOMAIN_URL" | sed 's/\r$//' | grep -E '^[A-Za-z0-9*_.-]+\.[A-Za-z0-9_.-]+$' | sed 's/^\*\.//g' | awk '!seen[$0]++' > "$BESTCF_DIR/bestcf-domain.txt.tmp"
-  mv "$BESTCF_DIR/bestcf-domain.txt.tmp" "$BESTCF_DIR/bestcf-domain.txt"
-  log "BestCF 域名数量：$(wc -l < "$BESTCF_DIR/bestcf-domain.txt")"
+  tmp="${output}.tmp"
+  url=$(bestcf_asset_url "$asset")
+  info "下载 BestCF：$asset"
+  if ! curl -fsSL --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time "$CURL_MAX_TIME" "$url" > "$tmp.raw" 2>/dev/null; then
+    warn "下载失败：$asset"
+    rm -f "$tmp.raw" "$tmp"
+    return 1
+  fi
+  if [[ "$asset" == *domain* ]]; then
+    sanitize_bestcf_domain_file < "$tmp.raw" > "$tmp"
+  else
+    sanitize_bestcf_ip_file < "$tmp.raw" > "$tmp"
+  fi
+  rm -f "$tmp.raw"
+  if [[ -s "$tmp" ]]; then
+    mv "$tmp" "$output"
+    return 0
+  fi
+  rm -f "$tmp"
+  warn "BestCF 文件为空或格式不可用：$asset"
+  return 1
 }
 
-enable_bestcf(){
-  fetch_bestcf_domains
+fetch_bestcf_all(){
+  mkdir -p "$BESTCF_DIR"
+  download_bestcf_asset "cmcc-ip.txt" "$BESTCF_DIR/cmcc-ip.txt" || true
+  download_bestcf_asset "cucc-ip.txt" "$BESTCF_DIR/cucc-ip.txt" || true
+  download_bestcf_asset "ctcc-ip.txt" "$BESTCF_DIR/ctcc-ip.txt" || true
+  download_bestcf_asset "bestcf-domain.txt" "$BESTCF_DIR/bestcf-domain.txt" || true
+  if [[ ! -s "$BESTCF_DIR/bestcf-domain.txt" ]]; then
+    warn "优选域名文件不可用，写入内置兜底域名。"
+    cat > "$BESTCF_DIR/bestcf-domain.txt" <<'EOF2'
+cf.090227.xyz
+cloudflare-dl.byoip.top
+cf.877774.xyz
+saas.sin.fan
+bestcf.030101.xyz
+www.visa.cn
+mfa.gov.ua
+www.shopify.com
+EOF2
+  fi
+  show_bestcf_count
+}
+
+fetch_bestcf_domains(){ fetch_bestcf_all; }
+
+show_bestcf_count(){
+  echo "===== BestCF 数据数量 ====="
+  local f
+  for f in cmcc-ip.txt cucc-ip.txt ctcc-ip.txt bestcf-domain.txt; do
+    if [[ -s "$BESTCF_DIR/$f" ]]; then
+      echo "$f: $(wc -l < "$BESTCF_DIR/$f")"
+    else
+      echo "$f: 0"
+    fi
+  done
+  echo "模式: ${BESTCF_MODE:-off}，每类: ${BESTCF_PER_CATEGORY_LIMIT:-2}，总上限: ${BESTCF_TOTAL_LIMIT:-10}"
+}
+
+set_bestcf_limits(){
+  local per total
+  per=$(ask "每类最多生成几个 BestCF 节点，建议 1-3" "${BESTCF_PER_CATEGORY_LIMIT:-2}")
+  total=$(ask "BestCF 总节点上限，建议 6-12" "${BESTCF_TOTAL_LIMIT:-10}")
+  [[ "$per" =~ ^[0-9]+$ && "$per" -ge 1 ]] || per=2
+  [[ "$total" =~ ^[0-9]+$ && "$total" -ge 1 ]] || total=10
+  save_kv "$STATE_FILE" BESTCF_PER_CATEGORY_LIMIT "$per"
+  save_kv "$STATE_FILE" BESTCF_TOTAL_LIMIT "$total"
+  log "BestCF 节点数量限制已保存：每类 $per，总上限 $total。"
+}
+
+enable_bestcf_domain_only(){
+  fetch_bestcf_all
   save_kv "$STATE_FILE" BESTCF_ENABLED "1"
-  local limit; limit=$(ask "每个节点最多生成多少个 BestCF 域名入口" "${BESTCF_NODE_LIMIT:-10}")
-  save_kv "$STATE_FILE" BESTCF_NODE_LIMIT "$limit"
-  log "BestCF 已启用。重新生成订阅后生效。"
+  save_kv "$STATE_FILE" BESTCF_MODE "domain"
+  set_bestcf_limits
+  log "BestCF 已启用：只生成优选域名节点。重新生成订阅后生效。"
 }
 
-disable_bestcf(){ save_kv "$STATE_FILE" BESTCF_ENABLED "0"; log "BestCF 已关闭。"; }
+enable_bestcf_isp_domain(){
+  fetch_bestcf_all
+  save_kv "$STATE_FILE" BESTCF_ENABLED "1"
+  save_kv "$STATE_FILE" BESTCF_MODE "isp_domain"
+  set_bestcf_limits
+  log "BestCF 已启用：三网 IP + 优选域名兜底。重新生成订阅后生效。"
+}
+
+disable_bestcf(){
+  save_kv "$STATE_FILE" BESTCF_ENABLED "0"
+  save_kv "$STATE_FILE" BESTCF_MODE "off"
+  log "BestCF 已关闭。重新生成订阅后生效。"
+}
+
+add_bestcf_nodes_from_file(){
+  local file="$1" label="$2" raw="$3" max_each="$4" total_ref="$5" total_limit="$6" d n=1
+  [[ -s "$file" ]] || return 0
+  while read -r d; do
+    [[ -z "$d" || "$d" =~ ^# ]] && continue
+    [[ "${!total_ref}" -ge "$total_limit" ]] && return 0
+    add_vless_xhttp_cdn_link "$d" "${NODE_NAME:-node}-${label}-${n}" "$raw" "${CDN_PORT:-443}"
+    n=$((n+1))
+    printf -v "$total_ref" '%s' "$(( ${!total_ref} + 1 ))"
+    [[ "$n" -gt "$max_each" ]] && break
+  done < "$file"
+}
+
+generate_bestcf_subscription_nodes(){
+  local raw="$1" mode="${BESTCF_MODE:-domain}" per="${BESTCF_PER_CATEGORY_LIMIT:-2}" total_limit="${BESTCF_TOTAL_LIMIT:-10}" total=0
+  [[ "${BESTCF_ENABLED:-0}" == "1" ]] || return 0
+  [[ "$per" =~ ^[0-9]+$ ]] || per=2
+  [[ "$total_limit" =~ ^[0-9]+$ ]] || total_limit=10
+  if [[ "$mode" == "isp_domain" ]]; then
+    add_bestcf_nodes_from_file "$BESTCF_DIR/cmcc-ip.txt" "CMCC-CFIP" "$raw" "$per" total "$total_limit"
+    add_bestcf_nodes_from_file "$BESTCF_DIR/cucc-ip.txt" "CUCC-CFIP" "$raw" "$per" total "$total_limit"
+    add_bestcf_nodes_from_file "$BESTCF_DIR/ctcc-ip.txt" "CTCC-CFIP" "$raw" "$per" total "$total_limit"
+  fi
+  add_bestcf_nodes_from_file "$BESTCF_DIR/bestcf-domain.txt" "CFDomain" "$raw" "$per" total "$total_limit"
+}
+
+enable_bestcf_timer(){
+  cat >/etc/systemd/system/xem-bestcf-update.service <<EOF2
+[Unit]
+Description=Update BestCF data and regenerate Xray Edge Manager subscription
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash -lc 'bash <(curl -fsSL ${SCRIPT_RAW_URL}) --bestcf-update'
+EOF2
+  cat >/etc/systemd/system/xem-bestcf-update.timer <<EOF2
+[Unit]
+Description=Run BestCF update every 12 hours
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=12h
+RandomizedDelaySec=30min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF2
+  systemctl daemon-reload
+  systemctl enable --now xem-bestcf-update.timer
+  log "BestCF 12 小时自动更新已启用。"
+}
+
+disable_bestcf_timer(){
+  systemctl disable --now xem-bestcf-update.timer 2>/dev/null || true
+  rm -f /etc/systemd/system/xem-bestcf-update.service /etc/systemd/system/xem-bestcf-update.timer
+  systemctl daemon-reload 2>/dev/null || true
+  log "BestCF 自动更新已关闭。"
+}
 
 network_status(){
   uname -a
@@ -1186,8 +1371,14 @@ show_status(){
 
 show_links(){
   load_state
-  echo "订阅链接： https://${BASE_DOMAIN:-<BASE_DOMAIN>}/sub/${SUB_TOKEN:-<TOKEN>}"
+  echo "===== 本机订阅 ====="
+  echo "https://${BASE_DOMAIN:-<BASE_DOMAIN>}/sub/${SUB_TOKEN:-<TOKEN>}"
+  if [[ -n "${MERGED_SUB_TOKEN:-}" ]]; then
+    echo "===== 合并订阅 ====="
+    echo "https://${BASE_DOMAIN:-<BASE_DOMAIN>}/sub/${MERGED_SUB_TOKEN}"
+  fi
   echo
+  echo "===== local.raw ====="
   [[ -f "$SUB_DIR/local.raw" ]] && cat "$SUB_DIR/local.raw" || warn "尚未生成 local.raw。"
   echo
   [[ -f "$SUB_DIR/mihomo-reference.yaml" ]] && echo "Mihomo 参考片段：$SUB_DIR/mihomo-reference.yaml" || true
@@ -1198,6 +1389,7 @@ deployment_summary(){
   echo
   echo "===== 部署摘要 ====="
   echo "母域名: ${BASE_DOMAIN:-未设置}"
+  echo "节点名称: ${NODE_NAME:-node}"
   echo "IPv4 协议: ${IPV4_PROTOCOLS:-0}"
   echo "IPv6 协议: ${IPV6_PROTOCOLS:-0}"
   echo "实际协议组合: ${PROTOCOLS:-0}"
@@ -1207,7 +1399,9 @@ deployment_summary(){
   protocol_enabled 4 && echo "  REALITY+Vision: TCP ${REALITY_VISION_PORT:-3443}"
   protocol_enabled 5 && echo "  XHTTP+TLS+CDN 入口扩展: TCP ${CDN_PORT:-443} -> 127.0.0.1:${XHTTP_CDN_LOCAL_PORT:-31301}"
   [[ -n "${HY2_HOP_RANGE:-}" ]] && echo "  HY2 端口跳跃: UDP ${HY2_HOP_RANGE/:/-} -> ${HY2_PORT:-443}"
+  echo "BestCF: ${BESTCF_ENABLED:-0} / ${BESTCF_MODE:-off} / 每类${BESTCF_PER_CATEGORY_LIMIT:-2} / 总上限${BESTCF_TOTAL_LIMIT:-10}"
   echo "订阅: https://${BASE_DOMAIN:-BASE}/sub/${SUB_TOKEN:-TOKEN}"
+  [[ -n "${MERGED_SUB_TOKEN:-}" ]] && echo "合并订阅: https://${BASE_DOMAIN:-BASE}/sub/${MERGED_SUB_TOKEN}"
 }
 
 install_full(){
@@ -1217,6 +1411,7 @@ install_full(){
   update_geodata
   prepare_base_domain_for_install
   setup_cloudflare
+  configure_node_name
   asn_report
   select_ip_stack_strategy
   select_protocols
@@ -1233,16 +1428,100 @@ install_full(){
   log "首次部署流程完成。"
 }
 
+list_remote_subscriptions(){
+  touch "$REMOTES_FILE"
+  echo "===== 远程订阅列表 ====="
+  if [[ ! -s "$REMOTES_FILE" ]]; then
+    warn "暂无远程订阅。"
+    return 0
+  fi
+  nl -ba "$REMOTES_FILE" | sed 's/\t/. /'
+}
+
+add_remote_subscription(){
+  mkdir -p "$SUB_DIR"
+  local name url
+  name=$(ask "请输入远程订阅名称，方便区分来源" "remote")
+  name=$(printf '%s' "$name" | tr -cd 'A-Za-z0-9_.-' | sed 's/^[-_.]*//; s/[-_.]*$//')
+  [[ -n "$name" ]] || name="remote"
+  url=$(ask "请输入远程 base64 订阅 URL" "")
+  [[ -n "$url" ]] || { warn "URL 为空，取消。"; return 0; }
+  touch "$REMOTES_FILE"
+  echo "${name}|${url}" >> "$REMOTES_FILE"
+  log "已添加远程订阅：$name"
+}
+
+delete_remote_subscription(){
+  touch "$REMOTES_FILE"
+  list_remote_subscriptions
+  local n tmp
+  n=$(ask "请输入要删除的编号" "")
+  [[ "$n" =~ ^[0-9]+$ ]] || { warn "编号无效。"; return 0; }
+  tmp=$(mktemp)
+  awk -v n="$n" 'NR!=n' "$REMOTES_FILE" > "$tmp"
+  mv "$tmp" "$REMOTES_FILE"
+  log "已删除编号：$n"
+}
+
+clear_remote_subscriptions(){
+  if confirm "确认清空所有远程订阅？" "N"; then
+    : > "$REMOTES_FILE"
+    log "已清空远程订阅。"
+  fi
+}
+
+merge_remote_subscriptions(){
+  load_state
+  generate_keys_if_needed
+  load_state
+  mkdir -p "$SUB_DIR" "$WEB_ROOT/sub"
+  [[ -f "$SUB_DIR/local.raw" ]] || generate_subscription
+  touch "$REMOTES_FILE"
+  local remote_raw="$SUB_DIR/remote.raw" merged="$SUB_DIR/merged.raw" merged_b64="$SUB_DIR/merged.b64"
+  local name url data
+  : > "$remote_raw"
+  while IFS='|' read -r name url; do
+    [[ -z "${url:-}" || "$name" =~ ^# ]] && continue
+    info "拉取远程订阅：$name"
+    data=$(curl -fsSL --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time 30 "$url" 2>/dev/null || true)
+    [[ -z "$data" ]] && { warn "拉取失败：$name"; continue; }
+    if printf '%s' "$data" | base64 -d >> "$remote_raw" 2>/dev/null; then
+      echo >> "$remote_raw"
+    else
+      warn "解码失败：$name"
+    fi
+  done < "$REMOTES_FILE"
+  cat "$SUB_DIR/local.raw" "$remote_raw" 2>/dev/null | sed '/^$/d' | awk '!seen[$0]++' > "$merged"
+  base64 -w0 "$merged" > "$merged_b64"
+  cp -f "$merged_b64" "$WEB_ROOT/sub/$MERGED_SUB_TOKEN"
+  chmod 755 "$WEB_ROOT" "$WEB_ROOT/sub" 2>/dev/null || true
+  chmod 644 "$WEB_ROOT/sub/$MERGED_SUB_TOKEN" 2>/dev/null || true
+  log "合并订阅已生成：$merged_b64"
+  echo "合并订阅链接： https://${BASE_DOMAIN}/sub/${MERGED_SUB_TOKEN}"
+}
+
 subscription_menu(){
   while true; do
     echo; echo "===== 订阅管理 ====="
     echo "1. 重新生成本机 b64 订阅"
     echo "2. 查看分享链接 / 订阅链接"
+    echo "3. 设置节点名称"
+    echo "4. 添加远程 b64 订阅"
+    echo "5. 查看远程订阅列表"
+    echo "6. 删除一个远程订阅"
+    echo "7. 清空远程订阅"
+    echo "8. 拉取并生成合并订阅"
     echo "0. 返回"
     local c; c=$(ask "请选择" "0")
     case "$c" in
       1) generate_subscription ;;
       2) show_links ;;
+      3) configure_node_name ;;
+      4) add_remote_subscription ;;
+      5) list_remote_subscriptions ;;
+      6) delete_remote_subscription ;;
+      7) clear_remote_subscriptions ;;
+      8) merge_remote_subscriptions ;;
       0) break ;;
       *) warn "无效选择。" ;;
     esac
@@ -1251,18 +1530,27 @@ subscription_menu(){
 
 bestcf_menu(){
   while true; do
-    echo; echo "===== BestCF 优选域名管理，默认关闭 ====="
-    echo "1. 启用 BestCF 并立即拉取"
-    echo "2. 关闭 BestCF"
-    echo "3. 立即拉取"
-    echo "4. 查看数量"
+    echo; echo "===== BestCF 管理，默认关闭 ====="
+    echo "当前状态: enabled=${BESTCF_ENABLED:-0}, mode=${BESTCF_MODE:-off}, per=${BESTCF_PER_CATEGORY_LIMIT:-2}, total=${BESTCF_TOTAL_LIMIT:-10}"
+    echo "1. 启用：只生成优选域名节点，节点少"
+    echo "2. 启用：三网 IP + 优选域名兜底"
+    echo "3. 关闭 BestCF"
+    echo "4. 立即更新 BestCF 数据"
+    echo "5. 查看当前数据数量"
+    echo "6. 设置每类数量 / 总上限"
+    echo "7. 启用 12 小时自动更新"
+    echo "8. 关闭自动更新"
     echo "0. 返回"
     local c; c=$(ask "请选择" "0")
     case "$c" in
-      1) enable_bestcf ;;
-      2) disable_bestcf ;;
-      3) fetch_bestcf_domains ;;
-      4) [[ -f "$BESTCF_DIR/bestcf-domain.txt" ]] && wc -l "$BESTCF_DIR/bestcf-domain.txt" || warn "暂无数据。" ;;
+      1) enable_bestcf_domain_only ;;
+      2) enable_bestcf_isp_domain ;;
+      3) disable_bestcf ;;
+      4) fetch_bestcf_all ;;
+      5) show_bestcf_count ;;
+      6) set_bestcf_limits ;;
+      7) enable_bestcf_timer ;;
+      8) disable_bestcf_timer ;;
       0) break ;;
       *) warn "无效选择。" ;;
     esac
@@ -1273,6 +1561,7 @@ show_installation_state(){
   load_state
   echo "APP_DIR: $APP_DIR"
   echo "BASE_DOMAIN: ${BASE_DOMAIN:-未设置}"
+  echo "NODE_NAME: ${NODE_NAME:-未设置}"
   echo "IPV4_PROTOCOLS: ${IPV4_PROTOCOLS:-未设置}"
   echo "IPV6_PROTOCOLS: ${IPV6_PROTOCOLS:-未设置}"
   echo "PROTOCOLS: ${PROTOCOLS:-未设置}"
@@ -1449,7 +1738,7 @@ main_menu(){
   load_state
   while true; do
     echo
-    echo "===== Xray Edge Manager v0.0.1 ====="
+    echo "===== Xray Edge Manager v0.0.2 ====="
     echo "1. 首次部署向导，推荐"
     echo "2. 安装/升级基础依赖"
     echo "3. 安装/升级 Xray-core"
@@ -1498,5 +1787,13 @@ main_menu(){
     esac
   done
 }
+
+if [[ "${1:-}" == "--bestcf-update" ]]; then
+  need_root
+  load_state
+  fetch_bestcf_all
+  generate_subscription
+  exit 0
+fi
 
 main_menu "$@"
