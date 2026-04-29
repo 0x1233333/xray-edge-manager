@@ -428,11 +428,19 @@ create_dns_records() {
 
   if [[ -n "$ip4" ]]; then
     cf_upsert_record "$BASE_DOMAIN" A "$ip4" "$proxied_base"
-    cf_upsert_record "v4.$BASE_DOMAIN" A "$ip4" false
+    if mode_has_direct "${IPV4_STRATEGY:-3}"; then
+      cf_upsert_record "v4.$BASE_DOMAIN" A "$ip4" false
+    else
+      info "IPv4 策略未启用直连，跳过 v4.$BASE_DOMAIN DNS 记录创建。"
+    fi
   fi
   if [[ -n "$ip6" ]]; then
     cf_upsert_record "$BASE_DOMAIN" AAAA "$ip6" "$proxied_base"
-    cf_upsert_record "v6.$BASE_DOMAIN" AAAA "$ip6" false
+    if mode_has_direct "${IPV6_STRATEGY:-3}"; then
+      cf_upsert_record "v6.$BASE_DOMAIN" AAAA "$ip6" false
+    else
+      info "IPv6 策略未启用直连，跳过 v6.$BASE_DOMAIN DNS 记录创建。"
+    fi
   fi
   log "DNS 记录处理完成。最多 3 个域名：BASE、v4.BASE、v6.BASE。"
 }
@@ -515,8 +523,24 @@ select_protocols() {
   echo "4. [可选备用] VLESS + REALITY + Vision      CDN: no，端口默认 3443，可自定义"
   echo "5. [高级实验] XHTTP CDN + REALITY 分离      Alpha 暂只占位"
   local p
-  p=$(ask "默认安装" "${PROTOCOLS:-123}")
+  local default_protocols
+  default_protocols="${PROTOCOLS:-$(build_default_protocols_from_stack_strategy)}"
+  p=$(ask "默认安装" "$default_protocols")
   [[ "$p" =~ ^[1-5]+$ ]] || die "协议组合只能由 1-5 数字组成。"
+  if [[ "$p" == *1* && "${NEED_DIRECT_PROTOCOL:-1}" == "0" ]]; then
+    warn "当前 IPv4/IPv6 策略均未启用直连，但协议组合包含 1。"
+    if confirm "是否移除协议 1，避免生成无效直连入站？" "Y"; then
+      p="${p//1/}"
+      [[ -z "$p" ]] && p="3"
+    fi
+  fi
+  if [[ "$p" == *2* && "${NEED_CDN_PROTOCOL:-1}" == "0" ]]; then
+    warn "当前 IPv4/IPv6 策略均未启用 CDN，但协议组合包含 2。"
+    if confirm "是否移除协议 2？" "Y"; then
+      p="${p//2/}"
+      [[ -z "$p" ]] && p="3"
+    fi
+  fi
   save_kv "$STATE_FILE" PROTOCOLS "$p"
 
   if [[ "$p" == *2* ]]; then
@@ -617,7 +641,7 @@ preflight_ports() {
     fi
   fi
 
-  if protocol_enabled 1; then
+  if protocol_enabled 1 && [[ "$direct_needed" == "1" ]]; then
     p="${XHTTP_REALITY_PORT:-2443}"
     proc=$(get_proc_by_port -t "$p" || true)
     if [[ -n "$proc" && "$proc" != *xray* ]]; then
@@ -661,12 +685,17 @@ generate_xray_config() {
   backup_configs
   mkdir -p /usr/local/etc/xray
 
-  local in_tmp out_tmp route_tmp first_in=1 first_out=1 first_route=1 ip4 ip6 bind
+  local in_tmp out_tmp route_tmp first_in=1 first_out=1 first_route=1 ip4 ip6 bind direct_needed
   in_tmp=$(mktemp); out_tmp=$(mktemp); route_tmp=$(mktemp)
   ip4="${PUBLIC_IPV4:-$(public_ipv4)}"; ip6="${PUBLIC_IPV6:-$(public_ipv6)}"
   [[ -n "$ip4" ]] && save_kv "$STATE_FILE" PUBLIC_IPV4 "$ip4"
   [[ -n "$ip6" ]] && save_kv "$STATE_FILE" PUBLIC_IPV6 "$ip6"
   bind="${ENABLE_IP_STACK_BINDING:-1}"
+  if mode_has_direct "${IPV4_STRATEGY:-3}" || mode_has_direct "${IPV6_STRATEGY:-3}"; then
+    direct_needed="1"
+  else
+    direct_needed="0"
+  fi
 
   # Outbounds
   append_json_obj "$out_tmp" first_out <<'EOF'
@@ -683,7 +712,7 @@ EOF
 EOF
 
   if protocol_enabled 1; then
-    if [[ "$bind" == "1" && -n "$ip4" ]]; then
+    if [[ "$bind" == "1" && -n "$ip4" && ( "${IPV4_STRATEGY:-3}" == "1" || "${IPV4_STRATEGY:-3}" == "3" ) ]]; then
       append_json_obj "$in_tmp" first_in <<EOF
     {
       "tag": "in-v4-xhttp-reality",
@@ -704,7 +733,7 @@ EOF
 EOF
     fi
 
-    if [[ "$bind" == "1" && -n "$ip6" ]]; then
+    if [[ "$bind" == "1" && -n "$ip6" && ( "${IPV6_STRATEGY:-3}" == "1" || "${IPV6_STRATEGY:-3}" == "3" ) ]]; then
       append_json_obj "$in_tmp" first_in <<EOF
     {
       "tag": "in-v6-xhttp-reality",
@@ -725,7 +754,7 @@ EOF
 EOF
     fi
 
-    if [[ "$bind" != "1" || ( -z "$ip4" && -z "$ip6" ) ]]; then
+    if [[ "$bind" != "1" && "$direct_needed" == "1" ]]; then
       append_json_obj "$in_tmp" first_in <<EOF
     {
       "tag": "in-xhttp-reality",
@@ -742,6 +771,8 @@ EOF
     }
 EOF
     fi
+  elif protocol_enabled 1 && [[ "$direct_needed" != "1" ]]; then
+    warn "协议 1 已选择，但分栈策略没有启用任何直连栈，已跳过 XHTTP+REALITY 入站生成。"
   fi
 
   if protocol_enabled 2; then
@@ -903,6 +934,86 @@ asn_report() {
   info "建议：优质 v4/v6 可选 XHTTP+REALITY；普通/绕路线路可选 XHTTP+TLS+CDN。"
 }
 
+mode_has_direct() {
+  [[ "$1" == "1" || "$1" == "3" ]]
+}
+
+mode_has_cdn() {
+  [[ "$1" == "2" || "$1" == "3" ]]
+}
+
+select_one_stack_strategy() {
+  local label="$1" current="$2" default_mode="$3" mode
+  echo
+  echo "===== ${label} 部署策略 ====="
+  echo "1. 直连优先：生成 ${label} XHTTP + REALITY"
+  echo "2. CDN 优先：不生成 ${label} 直连，只使用母域名 CDN 节点"
+  echo "3. 双保险：同时生成 ${label} 直连 + CDN 节点"
+  echo "4. 跳过：不生成 ${label} 相关直连节点"
+  mode=$(ask "请选择 ${label} 策略" "${current:-$default_mode}")
+  case "$mode" in
+    1|2|3|4) echo "$mode" ;;
+    *) warn "无效选择，使用默认策略 $default_mode"; echo "$default_mode" ;;
+  esac
+}
+
+select_ip_stack_strategy() {
+  load_state
+  local ip4 ip6 v4_mode v6_mode
+  ip4="${PUBLIC_IPV4:-$(public_ipv4)}"
+  ip6="${PUBLIC_IPV6:-$(public_ipv6)}"
+  [[ -n "$ip4" ]] && save_kv "$STATE_FILE" PUBLIC_IPV4 "$ip4"
+  [[ -n "$ip6" ]] && save_kv "$STATE_FILE" PUBLIC_IPV6 "$ip6"
+
+  echo
+  echo "===== IPv4 / IPv6 分栈部署策略 ====="
+  echo "说明："
+  echo "  v4.node.example.com / v6.node.example.com 用于直连协议。"
+  echo "  node.example.com 用于 CDN、伪装站和订阅。"
+  echo "  CDN 节点是母域名节点，不严格区分 v4/v6；分栈主要控制是否生成 v4/v6 直连节点。"
+
+  if [[ -n "$ip4" ]]; then
+    v4_mode=$(select_one_stack_strategy "IPv4" "${IPV4_STRATEGY:-}" "3")
+    save_kv "$STATE_FILE" IPV4_STRATEGY "$v4_mode"
+  else
+    save_kv "$STATE_FILE" IPV4_STRATEGY "4"
+    warn "未检测到 IPv4，IPv4 策略设为跳过。"
+  fi
+
+  if [[ -n "$ip6" ]]; then
+    v6_mode=$(select_one_stack_strategy "IPv6" "${IPV6_STRATEGY:-}" "3")
+    save_kv "$STATE_FILE" IPV6_STRATEGY "$v6_mode"
+  else
+    save_kv "$STATE_FILE" IPV6_STRATEGY "4"
+    warn "未检测到 IPv6，IPv6 策略设为跳过。"
+  fi
+
+  load_state
+  if mode_has_direct "${IPV4_STRATEGY:-4}" || mode_has_direct "${IPV6_STRATEGY:-4}"; then
+    save_kv "$STATE_FILE" NEED_DIRECT_PROTOCOL "1"
+  else
+    save_kv "$STATE_FILE" NEED_DIRECT_PROTOCOL "0"
+  fi
+  if mode_has_cdn "${IPV4_STRATEGY:-4}" || mode_has_cdn "${IPV6_STRATEGY:-4}"; then
+    save_kv "$STATE_FILE" NEED_CDN_PROTOCOL "1"
+    save_kv "$STATE_FILE" ENABLE_CDN "1"
+  else
+    save_kv "$STATE_FILE" NEED_CDN_PROTOCOL "0"
+  fi
+
+  log "分栈策略已保存：IPv4=${IPV4_STRATEGY:-4} IPv6=${IPV6_STRATEGY:-4}"
+}
+
+build_default_protocols_from_stack_strategy() {
+  load_state
+  local p=""
+  [[ "${NEED_DIRECT_PROTOCOL:-1}" == "1" ]] && p="${p}1"
+  [[ "${NEED_CDN_PROTOCOL:-1}" == "1" ]] && p="${p}2"
+  p="${p}3"
+  [[ -z "$p" ]] && p="123"
+  echo "$p"
+}
+
 uri_encode() {
   local s="$1" out="" i c
   for ((i=0; i<${#s}; i++)); do
@@ -1018,8 +1129,8 @@ generate_subscription() {
   : >"$raw"
 
   if protocol_enabled 1; then
-    [[ -n "${PUBLIC_IPV4:-}" ]] && add_vless_xhttp_reality_link "v4.${BASE_DOMAIN}" "${NODE_NAME:-node}-v4-XHTTP-REALITY" "$raw"
-    [[ -n "${PUBLIC_IPV6:-}" ]] && add_vless_xhttp_reality_link "v6.${BASE_DOMAIN}" "${NODE_NAME:-node}-v6-XHTTP-REALITY" "$raw"
+    [[ -n "${PUBLIC_IPV4:-}" && ( "${IPV4_STRATEGY:-3}" == "1" || "${IPV4_STRATEGY:-3}" == "3" ) ]] && add_vless_xhttp_reality_link "v4.${BASE_DOMAIN}" "${NODE_NAME:-node}-v4-XHTTP-REALITY" "$raw"
+    [[ -n "${PUBLIC_IPV6:-}" && ( "${IPV6_STRATEGY:-3}" == "1" || "${IPV6_STRATEGY:-3}" == "3" ) ]] && add_vless_xhttp_reality_link "v6.${BASE_DOMAIN}" "${NODE_NAME:-node}-v6-XHTTP-REALITY" "$raw"
   fi
 
   if protocol_enabled 2; then
@@ -1239,6 +1350,7 @@ install_full() {
   prepare_base_domain_for_install
   setup_cloudflare
   asn_report
+  select_ip_stack_strategy
   select_protocols
   create_dns_records
   issue_certificate
@@ -1515,7 +1627,7 @@ main_menu() {
     echo "6. Cloudflare 域名 / DNS / 小云朵管理"
     echo "7. 证书申请 / 续签 / 自动部署"
     echo "8. 查询 IPv4 / IPv6 / ASN 辅助报告"
-    echo "9. 选择协议组合并生成 Xray 配置"
+    echo "9. IPv4 / IPv6 分栈策略 + 协议组合并生成 Xray 配置"
     echo "10. 配置 CDN / Nginx / 伪装站"
     echo "11. BestCF 优选域名管理，默认关闭"
     echo "12. 配置 Hysteria2 端口跳跃"
@@ -1538,7 +1650,7 @@ main_menu() {
       6) setup_cloudflare; create_dns_records; pause ;;
       7) issue_certificate; pause ;;
       8) asn_report; pause ;;
-      9) select_protocols; choose_reality_target; generate_xray_config; pause ;;
+      9) asn_report; select_ip_stack_strategy; select_protocols; choose_reality_target; generate_xray_config; pause ;;
       10) configure_nginx; pause ;;
       11) bestcf_menu ;;
       12) configure_hy2_hopping_prompt; pause ;;
