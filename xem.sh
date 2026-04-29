@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Xray Edge Manager / Xray Anti-Block Manager
-# Alpha R4 single-file installer
+# Alpha R5 single-file installer
 #
 # Features:
 # - Xray-core only, no Docker, no sing-box
@@ -14,7 +14,7 @@
 #   2 = VLESS + XHTTP + TLS + CDN via Nginx
 #   3 = Xray Hysteria2 UDP, experimental
 #   4 = VLESS + REALITY + Vision backup direct
-#   5 = reserved / placeholder
+#   5 = VLESS + XHTTP + TLS + CDN split-entry nodes using the same CDN inbound
 # - NAT-aware: PUBLIC IP is used for DNS; BIND IP is used for Xray listen.
 # - Public subscription is copied to /var/www, not read from /root by Nginx.
 #
@@ -33,6 +33,10 @@ XRAY_CONFIG="/usr/local/etc/xray/config.json"
 NGINX_SITE="/etc/nginx/conf.d/xray-edge-manager.conf"
 WEB_ROOT="/var/www/xray-edge-manager"
 SYSCTL_FILE="/etc/sysctl.d/99-xray-edge-manager.conf"
+LEGACY_APP_DIR="/root/.xray-anti-block"
+LEGACY_NGINX_SITE="/etc/nginx/conf.d/xray-anti-block.conf"
+LEGACY_WEB_ROOT="/var/www/xray-anti-block"
+FODDER_BASE_URL="https://raw.githubusercontent.com/mack-a/v2ray-agent/master/fodder/blog/unable"
 
 CF_HTTPS_PORTS="443 2053 2083 2087 2096 8443"
 DEFAULT_HY2_HOP_RANGE="20000:20100"
@@ -51,12 +55,8 @@ pause(){ read -r -p "按回车继续..." _ || true; }
 need_root(){ [[ "${EUID:-$(id -u)}" -eq 0 ]] || die "请使用 root 运行。"; }
 
 load_state(){
-  if [[ -f "$STATE_FILE" ]]; then
-    source "$STATE_FILE"
-  fi
-  if [[ -f "$CF_ENV" ]]; then
-    source "$CF_ENV"
-  fi
+  if [[ -f "$STATE_FILE" ]]; then source "$STATE_FILE"; fi
+  if [[ -f "$CF_ENV" ]]; then source "$CF_ENV"; fi
   return 0
 }
 
@@ -305,7 +305,7 @@ cf_upsert_record(){
 
 stack_protocols_has(){ [[ "$1" == *"$2"* ]]; }
 stack_has_xhttp_reality(){ [[ "$1" == *"1"* ]]; }
-stack_has_cdn(){ [[ "$1" == *"2"* ]]; }
+stack_has_cdn(){ [[ "$1" == *"2"* || "$1" == *"5"* ]]; }
 stack_has_hy2(){ [[ "$1" == *"3"* ]]; }
 stack_has_vision(){ [[ "$1" == *"4"* ]]; }
 stack_has_direct_protocol(){ [[ "$1" == *"1"* || "$1" == *"3"* || "$1" == *"4"* ]]; }
@@ -332,7 +332,7 @@ select_one_stack_protocols(){
   echo "2. ${label} VLESS + XHTTP + TLS + CDN，CDN 隐藏，使用母域名" >&2
   echo "3. ${label} Xray Hysteria2，UDP 高速备用，实验" >&2
   echo "4. ${label} VLESS + REALITY + Vision，可选直连备用" >&2
-  echo "5. ${label} XHTTP CDN + REALITY 分离，实验占位" >&2
+  echo "5. ${label} XHTTP + TLS + CDN 分离入口，复用 CDN 入站，可配合 BestCF/域名前置" >&2
   echo "可以输入组合，例如：123、13、23、1234。" >&2
   mode=$(ask "请选择 ${label} 协议组合" "${current:-$default_mode}")
   normalized=$(normalize_stack_protocols "$mode")
@@ -396,7 +396,7 @@ select_protocols(){
   echo "IPv6: ${IPV6_PROTOCOLS:-0}"
   echo "实际需要: $p"
 
-  if [[ "$p" == *2* ]]; then
+  if [[ "$p" == *2* || "$p" == *5* ]]; then
     save_kv "$STATE_FILE" ENABLE_CDN "1"
     port=$(ask "CDN 公网端口，只能是 443/2053/2083/2087/2096/8443" "${CDN_PORT:-443}")
     valid_port "$port" || die "端口无效。"
@@ -528,6 +528,7 @@ generate_keys_if_needed(){
 }
 
 backup_configs(){
+  mkdir -p "$APP_DIR" "$SUB_DIR" "$BESTCF_DIR" "$BACKUP_DIR"
   local ts; ts=$(date +%F-%H%M%S)
   [[ -f "$XRAY_CONFIG" ]] && cp -a "$XRAY_CONFIG" "$BACKUP_DIR/config.json.$ts.bak" && save_kv "$STATE_FILE" LAST_XRAY_BACKUP "$BACKUP_DIR/config.json.$ts.bak" || true
   [[ -f "$NGINX_SITE" ]] && cp -a "$NGINX_SITE" "$BACKUP_DIR/nginx.$ts.bak" && save_kv "$STATE_FILE" LAST_NGINX_BACKUP "$BACKUP_DIR/nginx.$ts.bak" || true
@@ -635,7 +636,7 @@ EOF2
     fi
   fi
 
-  if protocol_enabled 2; then
+  if protocol_enabled 2 || protocol_enabled 5; then
     append_json_obj "$in_tmp" first_in <<EOF2
     {"tag":"in-xhttp-cdn-local","listen":"127.0.0.1","port":${XHTTP_CDN_LOCAL_PORT},"protocol":"vless","settings":{"clients":[{"id":"${UUID}","email":"xhttp-cdn"}],"decryption":"none"},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"path":"${XHTTP_CDN_PATH}","mode":"auto"}}}
 EOF2
@@ -699,6 +700,45 @@ EOF2
   log "Xray 配置生成并测试通过。"
 }
 
+
+cleanup_legacy_nginx_conf(){
+  mkdir -p "$BACKUP_DIR"
+  if [[ -f "$LEGACY_NGINX_SITE" ]]; then
+    cp -a "$LEGACY_NGINX_SITE" "$BACKUP_DIR/xray-anti-block.conf.legacy.$(date +%F-%H%M%S).bak" 2>/dev/null || true
+    rm -f "$LEGACY_NGINX_SITE"
+    warn "检测到旧版 Nginx 配置，已备份并移除：$LEGACY_NGINX_SITE"
+  fi
+}
+
+install_random_camouflage(){
+  mkdir -p "$WEB_ROOT"
+  local n zip tmp
+  n=$((RANDOM % 9 + 1))
+  zip="html${n}.zip"
+  tmp=$(mktemp -d)
+  info "随机下载伪装站模板：v2ray-agent/fodder/blog/unable/${zip}"
+  if curl -fsSL --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time 60 -o "$tmp/$zip" "$FODDER_BASE_URL/$zip" && unzip -q "$tmp/$zip" -d "$tmp/site"; then
+    rm -rf "$WEB_ROOT"/*
+    shopt -s dotglob nullglob
+    local entries=("$tmp/site"/*)
+    if [[ ${#entries[@]} -eq 1 && -d "${entries[0]}" ]]; then
+      cp -a "${entries[0]}"/* "$WEB_ROOT"/
+    else
+      cp -a "$tmp/site"/* "$WEB_ROOT"/
+    fi
+    shopt -u dotglob nullglob
+    [[ -f "$WEB_ROOT/index.html" ]] || echo '<!doctype html><html><body><h1>Welcome</h1><p>It works.</p></body></html>' > "$WEB_ROOT/index.html"
+    log "伪装站模板已安装：${zip}"
+  else
+    warn "伪装站模板下载或解压失败，使用内置默认页面。"
+    cat > "$WEB_ROOT/index.html" <<'EOF2'
+<!doctype html><html><head><meta charset="utf-8"><title>Welcome</title></head><body><h1>Welcome</h1><p>It works.</p></body></html>
+EOF2
+  fi
+  rm -rf "$tmp"
+  chmod -R a+rX "$WEB_ROOT" 2>/dev/null || true
+}
+
 configure_nginx(){
   need_root
   load_state
@@ -706,6 +746,8 @@ configure_nginx(){
   [[ -f "/etc/letsencrypt/live/${BASE_DOMAIN}/fullchain.pem" ]] || issue_certificate
   generate_keys_if_needed
   load_state
+  mkdir -p "$APP_DIR" "$SUB_DIR" "$BESTCF_DIR" "$BACKUP_DIR"
+  cleanup_legacy_nginx_conf
   mkdir -p "$WEB_ROOT" "$WEB_ROOT/sub" "$SUB_DIR"
   chmod 755 "$WEB_ROOT" "$WEB_ROOT/sub" 2>/dev/null || true
   touch "$WEB_ROOT/sub/${SUB_TOKEN}"
@@ -717,9 +759,7 @@ configure_nginx(){
     nginx_https_v6_listen="    listen [::]:${CDN_PORT:-443} ssl;"
   fi
 
-  cat > "$WEB_ROOT/index.html" <<EOF2
-<!doctype html><html><head><meta charset="utf-8"><title>Welcome</title></head><body><h1>Welcome</h1><p>It works.</p></body></html>
-EOF2
+  install_random_camouflage
 
   cat > "$NGINX_SITE" <<EOF2
 server {
@@ -882,6 +922,28 @@ EOF2
 EOF2
   fi
 
+  if protocol_enabled 5; then
+    cat >> "$f" <<EOF2
+  - name: ${NODE_NAME:-node}-CDN-XHTTP-Split-Origin
+    type: vless
+    server: ${BASE_DOMAIN}
+    port: ${CDN_PORT:-443}
+    uuid: ${UUID}
+    udp: true
+    tls: true
+    servername: ${BASE_DOMAIN}
+    client-fingerprint: chrome
+    alpn:
+      - h2
+    encryption: ""
+    network: xhttp
+    xhttp-opts:
+      host: ${BASE_DOMAIN}
+      mode: auto
+      path: ${XHTTP_CDN_PATH}
+EOF2
+  fi
+
   if protocol_enabled 3; then
     if [[ -n "${PUBLIC_IPV4:-}" && "${IPV4_PROTOCOLS:-0}" == *3* ]]; then
       cat >> "$f" <<EOF2
@@ -936,6 +998,19 @@ generate_subscription(){
   fi
   if protocol_enabled 2; then
     add_vless_xhttp_cdn_link "$BASE_DOMAIN" "${NODE_NAME:-node}-CDN-XHTTP-Origin" "$raw" "${CDN_PORT:-443}"
+  fi
+
+  if protocol_enabled 5; then
+    add_vless_xhttp_cdn_link "$BASE_DOMAIN" "${NODE_NAME:-node}-CDN-XHTTP-Split-Origin" "$raw" "${CDN_PORT:-443}"
+    if [[ "${BESTCF_ENABLED:-0}" == "1" && -s "$BESTCF_DIR/bestcf-domain.txt" ]]; then
+      n=1
+      while read -r d; do
+        [[ -z "$d" || "$d" =~ ^# ]] && continue
+        add_vless_xhttp_cdn_link "$d" "${NODE_NAME:-node}-CDN-Split-BestCF-${n}" "$raw" "${CDN_PORT:-443}"
+        n=$((n+1)); [[ "$n" -gt "${BESTCF_NODE_LIMIT:-10}" ]] && break
+      done < "$BESTCF_DIR/bestcf-domain.txt"
+    fi
+  elif protocol_enabled 2; then
     if [[ "${BESTCF_ENABLED:-0}" == "1" && -s "$BESTCF_DIR/bestcf-domain.txt" ]]; then
       n=1
       while read -r d; do
@@ -1011,7 +1086,7 @@ configure_hy2_hopping_prompt(){
 handle_firewall_ports(){
   load_state
   local tcp_ports=() udp_ports=()
-  [[ "${PROTOCOLS:-0}" == *2* ]] && tcp_ports+=("${CDN_PORT:-443}")
+  [[ "${PROTOCOLS:-0}" == *2* || "${PROTOCOLS:-0}" == *5* ]] && tcp_ports+=("${CDN_PORT:-443}")
   [[ "${PROTOCOLS:-0}" == *1* ]] && tcp_ports+=("${XHTTP_REALITY_PORT:-2443}")
   [[ "${PROTOCOLS:-0}" == *4* ]] && tcp_ports+=("${REALITY_VISION_PORT:-3443}")
   [[ "${PROTOCOLS:-0}" == *3* ]] && udp_ports+=("${HY2_PORT:-443}")
@@ -1130,6 +1205,7 @@ deployment_summary(){
   protocol_enabled 2 && echo "  XHTTP+TLS+CDN: TCP ${CDN_PORT:-443} -> 127.0.0.1:${XHTTP_CDN_LOCAL_PORT:-31301}"
   protocol_enabled 3 && echo "  Xray Hysteria2: UDP ${HY2_PORT:-443}，ALPN h3"
   protocol_enabled 4 && echo "  REALITY+Vision: TCP ${REALITY_VISION_PORT:-3443}"
+  protocol_enabled 5 && echo "  XHTTP CDN split-entry: TCP ${CDN_PORT:-443} -> 127.0.0.1:${XHTTP_CDN_LOCAL_PORT:-31301}"
   [[ -n "${HY2_HOP_RANGE:-}" ]] && echo "  HY2 端口跳跃: UDP ${HY2_HOP_RANGE/:/-} -> ${HY2_PORT:-443}"
   echo "订阅: https://${BASE_DOMAIN:-BASE}/sub/${SUB_TOKEN:-TOKEN}"
 }
@@ -1148,7 +1224,7 @@ install_full(){
   issue_certificate
   choose_reality_target
   generate_xray_config
-  protocol_enabled 2 && configure_nginx
+  (protocol_enabled 2 || protocol_enabled 5) && configure_nginx
   configure_hy2_hopping_prompt
   handle_firewall_ports
   restart_services
@@ -1217,6 +1293,135 @@ remove_hy2_hopping_rules(){
   log "已尝试删除端口跳跃规则：UDP $start-$end -> $to_port。"
 }
 
+cf_get_record_json(){
+  local name="$1" type="$2"
+  load_state
+  [[ -n "${CF_API_TOKEN:-}" && -n "${CF_ZONE_ID:-}" ]] || return 1
+  curl -fsS --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time "$CURL_MAX_TIME" -G \
+    "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/dns_records" \
+    -H "Authorization: Bearer $CF_API_TOKEN" \
+    --data-urlencode "type=$type" \
+    --data-urlencode "name=$name"
+}
+
+cf_delete_record_by_id(){
+  local rec_id="$1"
+  [[ -n "$rec_id" ]] || return 1
+  cf_api DELETE "/zones/$CF_ZONE_ID/dns_records/$rec_id" >/dev/null
+}
+
+cf_delete_record(){
+  local name="$1" type="$2" expected="${3:-}" mode="${4:-owned}" resp count i rec_id content
+  resp=$(cf_get_record_json "$name" "$type") || { warn "无法读取 $type $name，跳过。"; return 0; }
+  count=$(echo "$resp" | jq -r '.result | length')
+  [[ "$count" -gt 0 ]] || { info "Cloudflare 中不存在 $type $name，跳过。"; return 0; }
+  for ((i=0;i<count;i++)); do
+    rec_id=$(echo "$resp" | jq -r ".result[$i].id // empty")
+    content=$(echo "$resp" | jq -r ".result[$i].content // empty")
+    [[ -n "$rec_id" ]] || continue
+    if [[ "$mode" == "owned" && -n "$expected" && "$content" != "$expected" ]]; then
+      warn "跳过 $type $name：当前指向 $content，不等于本机 IP $expected。"
+      continue
+    fi
+    if cf_delete_record_by_id "$rec_id"; then
+      log "已删除 Cloudflare DNS：$type $name -> $content"
+    else
+      warn "删除失败：$type $name -> $content"
+    fi
+  done
+}
+
+delete_cloudflare_records_menu(){
+  load_state
+  [[ -n "${BASE_DOMAIN:-}" ]] || { warn "BASE_DOMAIN 未设置，无法清理 DNS。"; return 0; }
+  [[ -n "${CF_API_TOKEN:-}" && -n "${CF_ZONE_ID:-}" ]] || { warn "Cloudflare API 未配置，无法清理 DNS。"; return 0; }
+  local ip4 ip6 mode
+  ip4="${PUBLIC_IPV4:-$(public_ipv4)}"; ip6="${PUBLIC_IPV6:-$(public_ipv6)}"
+  echo "将处理这些记录："
+  echo "  $BASE_DOMAIN A/AAAA"
+  echo "  v4.$BASE_DOMAIN A"
+  echo "  v6.$BASE_DOMAIN AAAA"
+  echo "1. 只删除仍指向本机 IP 的记录，推荐"
+  echo "2. 强制删除这些域名记录，不检查 IP，危险但可彻底清理"
+  echo "0. 不删除 DNS"
+  mode=$(ask "请选择 DNS 删除模式" "0")
+  case "$mode" in
+    1)
+      cf_delete_record "$BASE_DOMAIN" A "$ip4" owned
+      cf_delete_record "v4.$BASE_DOMAIN" A "$ip4" owned
+      cf_delete_record "$BASE_DOMAIN" AAAA "$ip6" owned
+      cf_delete_record "v6.$BASE_DOMAIN" AAAA "$ip6" owned
+      ;;
+    2)
+      if confirm "最后确认强制删除 Cloudflare 上 BASE/v4/v6 相关 DNS？" "N"; then
+        cf_delete_record "$BASE_DOMAIN" A "" force
+        cf_delete_record "v4.$BASE_DOMAIN" A "" force
+        cf_delete_record "$BASE_DOMAIN" AAAA "" force
+        cf_delete_record "v6.$BASE_DOMAIN" AAAA "" force
+      fi
+      ;;
+    *) warn "跳过 DNS 删除。" ;;
+  esac
+}
+
+full_uninstall_xem(){
+  need_root
+  load_state
+  warn "完整卸载将停止服务、删除 Xray 配置、Nginx 站点、订阅目录、脚本状态、旧版残留和端口跳跃规则。"
+  warn "适合纯节点机器。如果还有其他网站业务，不要继续。"
+  confirm "确认完整卸载？" "N" || { warn "已取消。"; return 0; }
+  confirm "再次确认：允许清理 Nginx/Xray/证书/状态文件？" "N" || { warn "已取消。"; return 0; }
+
+  mkdir -p "$BACKUP_DIR" 2>/dev/null || true
+  local ts; ts=$(date +%F-%H%M%S)
+  [[ -f "$XRAY_CONFIG" ]] && cp -a "$XRAY_CONFIG" "$BACKUP_DIR/config.json.before-uninstall.$ts.bak" 2>/dev/null || true
+  [[ -f "$NGINX_SITE" ]] && cp -a "$NGINX_SITE" "$BACKUP_DIR/nginx.before-uninstall.$ts.bak" 2>/dev/null || true
+  [[ -f "$STATE_FILE" ]] && cp -a "$STATE_FILE" "$BACKUP_DIR/state.env.before-uninstall.$ts.bak" 2>/dev/null || true
+
+  if confirm "是否删除 Cloudflare DNS？默认不删" "N"; then
+    delete_cloudflare_records_menu || true
+  fi
+
+  systemctl stop xray 2>/dev/null || true
+  systemctl disable xray 2>/dev/null || true
+  systemctl stop nginx 2>/dev/null || true
+  remove_hy2_hopping_rules || true
+
+  bash -c "$(curl -fsSL --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time "$CURL_MAX_TIME" https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ remove || true
+
+  rm -rf /usr/local/etc/xray /usr/local/share/xray /var/log/xray \
+    /etc/systemd/system/xray.service /etc/systemd/system/xray@.service \
+    /etc/systemd/system/xray.service.d /etc/systemd/system/xray@.service.d 2>/dev/null || true
+
+  rm -f "$NGINX_SITE" "$LEGACY_NGINX_SITE" 2>/dev/null || true
+  rm -rf "$WEB_ROOT" "$LEGACY_WEB_ROOT" 2>/dev/null || true
+
+  if [[ -n "${BASE_DOMAIN:-}" ]] && command -v certbot >/dev/null 2>&1; then
+    if confirm "是否删除 Certbot 证书 ${BASE_DOMAIN}？" "Y"; then
+      certbot delete --cert-name "$BASE_DOMAIN" --non-interactive 2>/dev/null || warn "Certbot 删除证书失败或证书不存在。"
+    fi
+  fi
+
+  if confirm "是否移除 Nginx / Certbot 软件包？纯节点机器可选 Y" "N"; then
+    echo "1. apt remove，保留部分全局配置"
+    echo "2. apt purge，彻底删除软件包配置"
+    local mode; mode=$(ask "请选择" "1")
+    if command -v apt-get >/dev/null 2>&1; then
+      if [[ "$mode" == "2" ]]; then
+        confirm "最后确认 apt purge Nginx/Certbot？" "N" && apt-get purge -y nginx nginx-common nginx-core certbot python3-certbot-dns-cloudflare 2>/dev/null || true
+      else
+        apt-get remove -y nginx nginx-common nginx-core certbot python3-certbot-dns-cloudflare 2>/dev/null || true
+      fi
+      apt-get autoremove -y 2>/dev/null || true
+    fi
+  fi
+
+  rm -rf "$APP_DIR" "$LEGACY_APP_DIR" 2>/dev/null || true
+  systemctl daemon-reload 2>/dev/null || true
+  systemctl reset-failed 2>/dev/null || true
+  log "完整卸载完成。"
+}
+
 uninstall_menu(){
   while true; do
     echo; echo "===== 卸载 / 清理 ====="
@@ -1224,23 +1429,15 @@ uninstall_menu(){
     echo "2. 仅停止并禁用 Xray"
     echo "3. 仅删除 HY2 端口跳跃规则"
     echo "4. 仅清理脚本状态目录"
+    echo "5. 删除 Cloudflare DNS 记录，可选择归属权校验或强制删除"
     echo "0. 返回"
     local c; c=$(ask "请选择" "0")
     case "$c" in
-      1)
-        if confirm "确认完整卸载？" "N"; then
-          systemctl stop xray 2>/dev/null || true; systemctl disable xray 2>/dev/null || true
-          systemctl stop nginx 2>/dev/null || true
-          remove_hy2_hopping_rules || true
-          bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ remove || true
-          rm -rf /usr/local/etc/xray /usr/local/share/xray /var/log/xray /etc/systemd/system/xray.service /etc/systemd/system/xray.service.d
-          rm -f "$NGINX_SITE"; rm -rf "$WEB_ROOT" "$APP_DIR"
-          systemctl daemon-reload || true
-          log "完整卸载完成。Cloudflare DNS 不会自动删除。"
-        fi; pause ;;
+      1) full_uninstall_xem; pause ;;
       2) systemctl stop xray 2>/dev/null || true; systemctl disable xray 2>/dev/null || true; pause ;;
       3) remove_hy2_hopping_rules; pause ;;
-      4) if confirm "确认删除 $APP_DIR？" "N"; then rm -rf "$APP_DIR"; fi; pause ;;
+      4) if confirm "确认删除 $APP_DIR 和旧目录 $LEGACY_APP_DIR？" "N"; then rm -rf "$APP_DIR" "$LEGACY_APP_DIR"; fi; pause ;;
+      5) delete_cloudflare_records_menu; pause ;;
       0) break ;;
       *) warn "无效选择。" ;;
     esac
@@ -1252,7 +1449,7 @@ main_menu(){
   load_state
   while true; do
     echo
-    echo "===== Xray Edge Manager Alpha R4 ====="
+    echo "===== Xray Edge Manager Alpha R5 ====="
     echo "1. 首次部署向导，推荐"
     echo "2. 安装/升级基础依赖"
     echo "3. 安装/升级 Xray-core"
