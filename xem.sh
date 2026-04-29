@@ -65,11 +65,26 @@ save_kv() {
 
 ask() {
   local prompt="$1" default="${2:-}" ans
+  local msg
   if [[ -n "$default" ]]; then
-    read -r -p "$prompt [$default]: " ans || true
+    msg="$prompt [$default]: "
+  else
+    msg="$prompt: "
+  fi
+
+  # Use /dev/tty for interactive input when possible. This prevents command
+  # substitution or piped execution from swallowing menu prompts or breaking input.
+  if [[ -r /dev/tty && -w /dev/tty ]]; then
+    printf '%s' "$msg" > /dev/tty
+    IFS= read -r ans < /dev/tty || true
+  else
+    printf '%s' "$msg" >&2
+    IFS= read -r ans || true
+  fi
+
+  if [[ -n "$default" ]]; then
     echo "${ans:-$default}"
   else
-    read -r -p "$prompt: " ans || true
     echo "$ans"
   fi
 }
@@ -944,16 +959,16 @@ mode_has_cdn() {
 
 select_one_stack_strategy() {
   local label="$1" current="$2" default_mode="$3" mode
-  echo
-  echo "===== ${label} 部署策略 ====="
-  echo "1. 直连优先：生成 ${label} XHTTP + REALITY"
-  echo "2. CDN 优先：不生成 ${label} 直连，只使用母域名 CDN 节点"
-  echo "3. 双保险：同时生成 ${label} 直连 + CDN 节点"
-  echo "4. 跳过：不生成 ${label} 相关直连节点"
+  echo >&2
+  echo "===== ${label} 部署策略 =====" >&2
+  echo "1. 直连优先：生成 ${label} XHTTP + REALITY" >&2
+  echo "2. CDN 优先：不生成 ${label} 直连，只使用母域名 CDN 节点" >&2
+  echo "3. 双保险：同时生成 ${label} 直连 + CDN 节点" >&2
+  echo "4. 跳过：不生成 ${label} 相关直连节点" >&2
   mode=$(ask "请选择 ${label} 策略" "${current:-$default_mode}")
   case "$mode" in
     1|2|3|4) echo "$mode" ;;
-    *) warn "无效选择，使用默认策略 $default_mode"; echo "$default_mode" ;;
+    *) warn "无效选择，使用默认策略 $default_mode" >&2; echo "$default_mode" ;;
   esac
 }
 
