@@ -51,8 +51,13 @@ pause(){ read -r -p "按回车继续..." _ || true; }
 need_root(){ [[ "${EUID:-$(id -u)}" -eq 0 ]] || die "请使用 root 运行。"; }
 
 load_state(){
-  [[ -f "$STATE_FILE" ]] && source "$STATE_FILE"
-  [[ -f "$CF_ENV" ]] && source "$CF_ENV"
+  if [[ -f "$STATE_FILE" ]]; then
+    source "$STATE_FILE"
+  fi
+  if [[ -f "$CF_ENV" ]]; then
+    source "$CF_ENV"
+  fi
+  return 0
 }
 
 save_kv(){
