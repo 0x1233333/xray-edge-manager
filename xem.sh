@@ -1020,7 +1020,7 @@ configure_nginx() {
   [[ -f "/etc/letsencrypt/live/${BASE_DOMAIN}/fullchain.pem" ]] || issue_certificate
   generate_keys_if_needed
   load_state
-  mkdir -p "$WEB_ROOT" "$SUB_DIR"
+  mkdir -p "$WEB_ROOT" "$WEB_ROOT/sub" "$SUB_DIR"
   local nginx_http_v6_listen="" nginx_https_v6_listen=""
   if [[ -n "${PUBLIC_IPV6:-}" && "${IPV6_PROTOCOLS:-0}" == *2* ]]; then
     nginx_http_v6_listen="    listen [::]:80;"
@@ -1030,6 +1030,9 @@ configure_nginx() {
 <!doctype html><html><head><meta charset="utf-8"><title>Welcome</title></head><body><h1>Welcome</h1><p>It works.</p></body></html>
 EOF
   touch "$SUB_DIR/local.b64"
+  touch "$WEB_ROOT/sub/$SUB_TOKEN"
+  chmod 755 "$WEB_ROOT" "$WEB_ROOT/sub" 2>/dev/null || true
+  chmod 644 "$WEB_ROOT/sub/$SUB_TOKEN" 2>/dev/null || true
   cat >"$NGINX_SITE" <<EOF
 server {
     listen 80;
@@ -1062,7 +1065,7 @@ ${nginx_https_v6_listen}
 
     location = /sub/${SUB_TOKEN} {
         default_type text/plain;
-        alias ${SUB_DIR}/local.b64;
+        alias ${WEB_ROOT}/sub/${SUB_TOKEN};
     }
 
     location / {
@@ -1360,6 +1363,14 @@ generate_subscription() {
 
   sed -i '/^$/d' "$raw"
   base64 -w0 "$raw" >"$b64"
+
+  # Do not let Nginx read subscription files from /root. Copy the public b64
+  # subscription into the web root with safe read permissions.
+  mkdir -p "$WEB_ROOT/sub"
+  cp -f "$b64" "$WEB_ROOT/sub/$SUB_TOKEN"
+  chmod 755 "$WEB_ROOT" "$WEB_ROOT/sub" 2>/dev/null || true
+  chmod 644 "$WEB_ROOT/sub/$SUB_TOKEN" 2>/dev/null || true
+
   generate_mihomo_reference
   log "本机 b64 订阅已生成：$b64"
   echo "订阅链接： https://${BASE_DOMAIN}/sub/${SUB_TOKEN}"
