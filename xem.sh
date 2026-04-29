@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Xray Edge Manager / Xray Anti-Block Manager
-# v0.0.9 security-hardened single-file installer
+# v0.0.14 safe state writer, HY2 mport, BestCF fallback single-file installer
 #
 # Features:
 # - Xray-core only, no Docker, no sing-box
@@ -38,6 +38,8 @@ LEGACY_APP_DIR="/root/.xray-anti-block"
 LEGACY_NGINX_SITE="/etc/nginx/conf.d/xray-anti-block.conf"
 LEGACY_WEB_ROOT="/var/www/xray-anti-block"
 FODDER_BASE_URL="https://raw.githubusercontent.com/mack-a/v2ray-agent/master/fodder/blog/unable"
+CERT_DEPLOY_HOOK="/usr/local/etc/xray/xem-cert-hook.sh"
+LOCK_FILE="/run/xray-edge-manager.lock"
 
 CF_HTTPS_PORTS="443 2053 2083 2087 2096 8443"
 DEFAULT_HY2_HOP_RANGE="20000:20100"
@@ -46,7 +48,6 @@ BESTCF_RELEASE_API="https://api.github.com/repos/DustinWin/BestCF/releases/tags/
 BESTCF_ASSETS="cmcc-ip.txt cucc-ip.txt ctcc-ip.txt bestcf-ip.txt proxy-ip.txt bestcf-domain.txt"
 CURL_CONNECT_TIMEOUT=5
 CURL_MAX_TIME=20
-LOCK_FILE="/run/xray-edge-manager.lock"
 
 mkdir -p "$APP_DIR" "$SUB_DIR" "$BESTCF_DIR" "$BACKUP_DIR"
 
@@ -59,10 +60,9 @@ pause(){ read -r -p "按回车继续..." _ || true; }
 need_root(){ [[ "${EUID:-$(id -u)}" -eq 0 ]] || die "请使用 root 运行。"; }
 
 acquire_lock(){
-  mkdir -p "$(dirname "$LOCK_FILE")"
   exec 9>"$LOCK_FILE"
   if ! flock -n 9; then
-    echo "[ERR] 检测到另一个 xray-edge-manager 实例正在运行，请稍后再试。" >&2
+    err "检测到另一个 xray-edge-manager 实例正在运行，请稍后再试。"
     exit 1
   fi
 }
@@ -74,16 +74,28 @@ load_state(){
 }
 
 save_kv(){
-  local file="$1" key="$2" value="$3" q
+  local file="$1" key="$2" value="$3" q tmp
+  [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "非法配置键名：$key"
   mkdir -p "$(dirname "$file")"
   touch "$file"
   chmod 600 "$file" 2>/dev/null || true
   printf -v q '%q' "$value"
-  if grep -qE "^${key}=" "$file"; then
-    sed -i "s|^${key}=.*|${key}=${q}|" "$file"
-  else
-    echo "${key}=${q}" >> "$file"
-  fi
+
+  tmp="$(mktemp "${file}.tmp.XXXXXX")" || die "无法创建临时状态文件：${file}.tmp"
+  awk -v k="$key" -v v="$q" '
+    BEGIN { found = 0 }
+    index($0, k "=") == 1 {
+      print k "=" v
+      found = 1
+      next
+    }
+    { print }
+    END {
+      if (!found) print k "=" v
+    }
+  ' "$file" > "$tmp" || { rm -f "$tmp"; die "写入临时状态文件失败：$tmp"; }
+  chmod 600 "$tmp" 2>/dev/null || true
+  mv -f "$tmp" "$file"
 }
 
 ask(){
@@ -181,7 +193,7 @@ install_deps(){
   apt-get install -y \
     curl wget jq openssl ca-certificates gnupg lsb-release \
     nginx certbot python3-certbot-dns-cloudflare \
-    whois iproute2 iputils-ping iptables nftables tcpdump unzip tar sed grep coreutils \
+    whois iproute2 iputils-ping iptables nftables tcpdump unzip tar sed grep coreutils perl \
     cron socat util-linux
   log "基础依赖安装完成。"
 }
@@ -231,44 +243,94 @@ install_or_upgrade_xray(){
 }
 
 update_geodata(){
-  update_geodata_safe
-}
-
-update_geodata_safe(){
   need_root
-  local tmp geoip_url geosite_url
+  local tmp status geoip_url geosite_url
   tmp="$(mktemp -d)"
+  status=0
   geoip_url="https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat"
   geosite_url="https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat"
 
   info "安全更新 geoip.dat / geosite.dat：只下载数据文件和 sha256，不执行远程脚本。"
 
-  if (
+  (
+    trap 'rm -rf "$tmp"' EXIT INT TERM
     cd "$tmp" &&
     curl -fL --retry 3 --retry-delay 2 --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time 120 -o geoip.dat "$geoip_url" &&
     curl -fL --retry 3 --retry-delay 2 --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time 120 -o geoip.dat.sha256sum "$geoip_url.sha256sum" &&
     curl -fL --retry 3 --retry-delay 2 --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time 120 -o geosite.dat "$geosite_url" &&
     curl -fL --retry 3 --retry-delay 2 --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time 120 -o geosite.dat.sha256sum "$geosite_url.sha256sum" &&
     sha256sum -c geoip.dat.sha256sum &&
-    sha256sum -c geosite.dat.sha256sum
-  ); then
-    install -d /usr/local/share/xray
-    install -m 644 "$tmp/geoip.dat" /usr/local/share/xray/geoip.dat.new
-    install -m 644 "$tmp/geosite.dat" /usr/local/share/xray/geosite.dat.new
-
-    mv -f /usr/local/share/xray/geoip.dat.new /usr/local/share/xray/geoip.dat
+    sha256sum -c geosite.dat.sha256sum &&
+    install -d /usr/local/share/xray &&
+    install -m 644 geoip.dat /usr/local/share/xray/geoip.dat.new &&
+    install -m 644 geosite.dat /usr/local/share/xray/geosite.dat.new &&
+    mv -f /usr/local/share/xray/geoip.dat.new /usr/local/share/xray/geoip.dat &&
     mv -f /usr/local/share/xray/geosite.dat.new /usr/local/share/xray/geosite.dat
+  ) || status=$?
 
-    rm -rf "$tmp"
+  if [[ "$status" -eq 0 ]]; then
     log "geodata 已安全更新。"
-    return 0
   else
-    rm -rf "$tmp"
     warn "geodata 下载或 sha256 校验失败，已保留原文件。"
-    return 0
   fi
+  return 0
 }
 
+install_self_to_local_bin(){
+  need_root
+  mkdir -p /usr/local/bin
+  if [[ -f "${BASH_SOURCE[0]:-}" && "${BASH_SOURCE[0]}" != /dev/fd/* && "${BASH_SOURCE[0]}" != /proc/* ]]; then
+    install -m 755 "${BASH_SOURCE[0]}" /usr/local/bin/xem
+    log "已安装本地命令：/usr/local/bin/xem"
+    return 0
+  fi
+  warn "当前可能是 bash <(curl ...) 方式运行，无法可靠复制自身；将从仓库下载一次用于固化本地命令。"
+  curl -fsSL --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time 60 "$SCRIPT_RAW_URL" -o /usr/local/bin/xem.tmp || die "下载本地命令失败。"
+  if command -v perl >/dev/null 2>&1; then
+    perl -C -pi -e 's/\x{00A0}/ /g' /usr/local/bin/xem.tmp 2>/dev/null || true
+  fi
+  bash -n /usr/local/bin/xem.tmp || die "下载的脚本语法检查失败，拒绝安装。"
+  mv -f /usr/local/bin/xem.tmp /usr/local/bin/xem
+  chmod +x /usr/local/bin/xem
+  log "已安装本地命令：/usr/local/bin/xem"
+}
+
+enable_geodata_timer(){
+  install_self_to_local_bin
+  cat >/etc/systemd/system/xem-geodata-update.service <<'EOF2'
+[Unit]
+Description=Safely update Xray geodata via local Xray Edge Manager
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/xem --geodata-update
+EOF2
+  cat >/etc/systemd/system/xem-geodata-update.timer <<'EOF2'
+[Unit]
+Description=Run safe Xray geodata update every 3 days
+
+[Timer]
+OnBootSec=20min
+OnUnitActiveSec=3d
+RandomizedDelaySec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF2
+  systemctl daemon-reload
+  systemctl enable --now xem-geodata-update.timer
+  log "geodata 安全自动更新已启用：每 3 天一次。"
+}
+
+disable_geodata_timer(){
+  systemctl disable --now xem-geodata-update.timer 2>/dev/null || true
+  rm -f /etc/systemd/system/xem-geodata-update.service /etc/systemd/system/xem-geodata-update.timer
+  systemctl daemon-reload 2>/dev/null || true
+  log "geodata 自动更新已关闭。"
+}
 
 configure_base_domain(){
   load_state
@@ -565,10 +627,26 @@ create_dns_records(){
   log "DNS 记录处理完成。最多 3 个域名：BASE、v4.BASE、v6.BASE。"
 }
 
+install_cert_deploy_hook(){
+  need_root
+  mkdir -p "$(dirname "$CERT_DEPLOY_HOOK")"
+  cat > "$CERT_DEPLOY_HOOK" <<'EOF2'
+#!/usr/bin/env bash
+# Generated by Xray Edge Manager.
+set -u
+systemctl reload nginx >/dev/null 2>&1 || systemctl restart nginx >/dev/null 2>&1 || true
+systemctl restart xray >/dev/null 2>&1 || true
+exit 0
+EOF2
+  chmod 755 "$CERT_DEPLOY_HOOK"
+}
+
 issue_certificate(){
   load_state
   [[ -n "${BASE_DOMAIN:-}" ]] || configure_base_domain
   [[ -n "${CF_API_TOKEN:-}" ]] || setup_cloudflare
+  mkdir -p "$APP_DIR"
+  install_cert_deploy_hook
   cat > "$CF_CRED" <<EOF2
 dns_cloudflare_api_token = $CF_API_TOKEN
 EOF2
@@ -580,11 +658,13 @@ EOF2
   if [[ -n "$email" ]]; then
     certbot certonly --dns-cloudflare --dns-cloudflare-credentials "$CF_CRED" \
       --dns-cloudflare-propagation-seconds 60 -d "$BASE_DOMAIN" -d "*.$BASE_DOMAIN" \
-      --agree-tos --non-interactive --email "$email" || die "证书申请失败。"
+      --agree-tos --non-interactive --email "$email" \
+      --deploy-hook "$CERT_DEPLOY_HOOK" || die "证书申请失败。"
   else
     certbot certonly --dns-cloudflare --dns-cloudflare-credentials "$CF_CRED" \
       --dns-cloudflare-propagation-seconds 60 -d "$BASE_DOMAIN" -d "*.$BASE_DOMAIN" \
-      --agree-tos --non-interactive --register-unsafely-without-email || die "证书申请失败。"
+      --agree-tos --non-interactive --register-unsafely-without-email \
+      --deploy-hook "$CERT_DEPLOY_HOOK" || die "证书申请失败。"
   fi
   log "证书申请完成：/etc/letsencrypt/live/$BASE_DOMAIN/"
 }
@@ -726,12 +806,9 @@ EOF2
     {"tag":"out-v6","protocol":"freedom","settings":{"domainStrategy":"UseIPv6"}}
 EOF2
 
-  # Zero-trust default: block access to private/local networks before any per-inbound routing rule.
+  # Zero-trust default: block access to private/local networks before per-inbound routing rules.
   append_json_obj "$route_tmp" first_route <<'EOF2'
     {"type":"field","ip":["geoip:private","127.0.0.0/8","10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","169.254.0.0/16","::1/128","fc00::/7","fe80::/10"],"outboundTag":"block"}
-EOF2
-  append_json_obj "$route_tmp" first_route <<'EOF2'
-    {"type":"field","domain":["geosite:private"],"outboundTag":"block"}
 EOF2
 
   if protocol_enabled 1; then
@@ -969,9 +1046,12 @@ add_reality_vision_link(){
 }
 
 add_hy2_link(){
-  local server="$1" name="$2" raw="$3" server_uri
+  local server="$1" name="$2" raw="$3" server_uri mport_param=""
   server_uri=$(format_uri_host "$server")
-  echo "hysteria2://${HY2_AUTH}@${server_uri}:${HY2_PORT:-443}?sni=${BASE_DOMAIN}&insecure=0&alpn=h3#$(uri_encode "$name")" >> "$raw"
+  if [[ -n "${HY2_HOP_RANGE:-}" ]]; then
+    mport_param="&mport=${HY2_HOP_RANGE/:/-}"
+  fi
+  echo "hysteria2://${HY2_AUTH}@${server_uri}:${HY2_PORT:-443}?sni=${BASE_DOMAIN}&insecure=0&alpn=h3${mport_param}#$(uri_encode "$name")" >> "$raw"
 }
 
 generate_mihomo_reference(){
@@ -1116,28 +1196,16 @@ EOF2
 
 ensure_bestcf_data_if_needed(){
   load_state
-  # 协议 5 本质是 CDN/BestCF 入口扩展。只要启用了 5，或 BestCF 已开启，
-  # 生成订阅前就必须确保 BestCF 数据已拉取，否则只会生成一个普通母域名 Entry。
+  # Protocol 5 is a BestCF/CDN entry extension.
+  # On every subscription generation, try to fetch the newest remote BestCF data.
+  # If upstream data is unavailable, do not use any hardcoded third-party fallback;
+  # protocol 5 will fall back to the user's own BASE_DOMAIN CDN entry.
   if ! protocol_enabled 5 && [[ "${BESTCF_ENABLED:-0}" != "1" ]]; then
     return 0
   fi
 
-  local mode="${BESTCF_MODE:-domain}"
-  local need_fetch=0
-
-  if [[ "$mode" == "isp_domain" ]]; then
-    [[ -s "$BESTCF_DIR/cmcc-ip.txt" ]] || need_fetch=1
-    [[ -s "$BESTCF_DIR/cucc-ip.txt" ]] || need_fetch=1
-    [[ -s "$BESTCF_DIR/ctcc-ip.txt" ]] || need_fetch=1
-    [[ -s "$BESTCF_DIR/bestcf-domain.txt" ]] || need_fetch=1
-  else
-    [[ -s "$BESTCF_DIR/bestcf-domain.txt" ]] || need_fetch=1
-  fi
-
-  if [[ "$need_fetch" == "1" ]]; then
-    info "BestCF 数据不存在或不完整，正在自动拉取。"
-    fetch_bestcf_all || warn "BestCF 自动拉取失败，将仅生成普通 CDN Entry 兜底。"
-  fi
+  info "正在拉取最新 BestCF 数据。若远端不可用，协议 5 将退回普通 CDN Entry。"
+  fetch_bestcf_all || true
 }
 
 generate_subscription(){
@@ -1168,7 +1236,7 @@ generate_subscription(){
     after_count=$(wc -l < "$raw" 2>/dev/null || echo 0)
     if [[ "$after_count" -eq "$before_count" ]]; then
       add_vless_xhttp_cdn_link "$BASE_DOMAIN" "${NODE_NAME:-node}-CDN-XHTTP-Entry" "$raw" "${CDN_PORT:-443}"
-      warn "协议 5 未找到可用 BestCF 数据，已临时生成母域名 CDN Entry。请稍后菜单 11 更新 BestCF，或检查 GitHub Release 数据源。"
+      warn "协议 5 未找到可用 BestCF 数据，已自动退回母域名 CDN Entry。"
     fi
   elif protocol_enabled 2; then
     generate_bestcf_subscription_nodes "$raw"
@@ -1215,38 +1283,38 @@ ensure_iptables(){
   fi
 }
 
-apply_hy2_hopping_rules(){
+enable_hy2_hopping(){
   load_state
   ensure_iptables
-  local range="${1:-${HY2_HOP_RANGE:-$DEFAULT_HY2_HOP_RANGE}}" start end to_port
+  local range="$1" start end to_port
   to_port="${HY2_PORT:-443}"
   start="${range%%:*}"; end="${range##*:}"
   [[ "$start" =~ ^[0-9]+$ && "$end" =~ ^[0-9]+$ && "$start" -le "$end" ]] || die "端口范围格式错误。"
-  info "应用 HY2 UDP 端口跳跃规则：$start-$end -> $to_port"
-
+  info "设置 HY2 UDP 端口跳跃：$start-$end -> $to_port"
   while iptables -t nat -D PREROUTING -p udp --dport "$start:$end" -j REDIRECT --to-ports "$to_port" 2>/dev/null; do :; done
   iptables -t nat -A PREROUTING -p udp --dport "$start:$end" -j REDIRECT --to-ports "$to_port" || die "iptables 端口跳跃规则添加失败。"
-  iptables -t nat -C PREROUTING -p udp --dport "$start:$end" -j REDIRECT --to-ports "$to_port" 2>/dev/null || die "iptables 端口跳跃规则验证失败。"
-
   if command -v ip6tables >/dev/null 2>&1; then
     while ip6tables -t nat -D PREROUTING -p udp --dport "$start:$end" -j REDIRECT --to-ports "$to_port" 2>/dev/null; do :; done
     ip6tables -t nat -A PREROUTING -p udp --dport "$start:$end" -j REDIRECT --to-ports "$to_port" 2>/dev/null || warn "ip6tables 规则添加失败，IPv6 跳跃可能不可用。"
   fi
-
   if command -v netfilter-persistent >/dev/null 2>&1; then
     netfilter-persistent save || warn "netfilter-persistent save 失败。"
+  elif confirm "是否安装 netfilter-persistent 持久化规则？" "Y"; then
+    apt-get install -y iptables-persistent netfilter-persistent || true
+    netfilter-persistent save || true
   fi
+  save_kv "$STATE_FILE" HY2_HOP_RANGE "$range"
+  if [[ "${XEM_INTERNAL_APPLY_HY2:-0}" != "1" ]]; then
+    install_hy2_hopping_service
+  fi
+  log "端口跳跃规则已设置。请确认云安全组放行 UDP $start-$end。"
 }
 
-enable_hy2_hopping(){
-  load_state
-  local range="$1"
-  save_kv "$STATE_FILE" HY2_HOP_RANGE "$range"
-  apply_hy2_hopping_rules "$range"
+install_hy2_hopping_service(){
   install_self_to_local_bin
   cat >/etc/systemd/system/xem-hy2-hopping.service <<'EOF2'
 [Unit]
-Description=Apply Xray Edge Manager HY2 port hopping rules
+Description=Apply Xray Edge Manager Hysteria2 port hopping rules
 After=network-online.target
 Wants=network-online.target
 
@@ -1260,7 +1328,6 @@ WantedBy=multi-user.target
 EOF2
   systemctl daemon-reload
   systemctl enable xem-hy2-hopping.service >/dev/null 2>&1 || true
-  log "端口跳跃规则已设置，并已安装启动恢复服务。请确认云安全组放行 UDP ${range/:/-}。"
 }
 
 configure_hy2_hopping_prompt(){
@@ -1446,6 +1513,13 @@ parse_bestcf_domain_file(){
 download_bestcf_asset(){
   local asset="$1" output="$2" kind="${3:-auto}" url tmp raw
   mkdir -p "$BESTCF_DIR"
+
+  # Safety guard: BestCF downloader must never write outside BESTCF_DIR.
+  case "$output" in
+    "$BESTCF_DIR"/*) ;;
+    *) warn "BestCF 输出路径不安全，已拒绝：$output"; return 1 ;;
+  esac
+
   tmp="${output}.tmp"
   raw="${output}.raw"
   url=$(bestcf_asset_url "$asset")
@@ -1483,28 +1557,40 @@ download_bestcf_asset(){
 fetch_bestcf_all(){
   mkdir -p "$BESTCF_DIR"
 
-  download_bestcf_asset "cmcc-ip.txt" "$BESTCF_DIR/cmcc-ip.txt" "ip" || true
-  download_bestcf_asset "cucc-ip.txt" "$BESTCF_DIR/cucc-ip.txt" "ip" || true
-  download_bestcf_asset "ctcc-ip.txt" "$BESTCF_DIR/ctcc-ip.txt" "ip" || true
-  download_bestcf_asset "bestcf-ip.txt" "$BESTCF_DIR/bestcf-ip.txt" "ip" || true
-  download_bestcf_asset "proxy-ip.txt" "$BESTCF_DIR/proxy-ip.txt" "ip" || true
-  download_bestcf_asset "bestcf-domain.txt" "$BESTCF_DIR/bestcf-domain.txt" "domain" || true
+  # BestCF is only a CDN acceleration entry, not a basic connectivity dependency.
+  # Success: use this round's fresh remote data for CFDomain / ISP IP nodes.
+  # Failure: do not use any third-party fallback; clear local BestCF cache so
+  # protocol 5 falls back to the user's own BASE_DOMAIN CDN entry.
+  local asset ok=0 tmp_dir
+  tmp_dir="$(mktemp -d "$BESTCF_DIR/.fetch.XXXXXX")" || { warn "无法创建 BestCF 临时目录，跳过更新。"; return 0; }
 
-  if [[ ! -s "$BESTCF_DIR/bestcf-domain.txt" ]]; then
-    warn "优选域名文件不可用，写入内置兜底域名。"
-    cat > "$BESTCF_DIR/bestcf-domain.txt" <<'EOF2'
-cf.090227.xyz|443|CFDomain_fallback_1
-cloudflare-dl.byoip.top|443|CFDomain_fallback_2
-cf.877774.xyz|443|CFDomain_fallback_3
-saas.sin.fan|443|CFDomain_fallback_4
-bestcf.030101.xyz|443|CFDomain_fallback_5
-www.visa.cn|443|CFDomain_fallback_6
-mfa.gov.ua|443|CFDomain_fallback_7
-www.shopify.com|443|CFDomain_fallback_8
-EOF2
+  for asset in $BESTCF_ASSETS; do
+    rm -f "$tmp_dir/$asset" "$tmp_dir/$asset.tmp" "$tmp_dir/$asset.raw"
+  done
+
+  download_bestcf_asset "cmcc-ip.txt" "$tmp_dir/cmcc-ip.txt" "ip" && ok=1 || true
+  download_bestcf_asset "cucc-ip.txt" "$tmp_dir/cucc-ip.txt" "ip" && ok=1 || true
+  download_bestcf_asset "ctcc-ip.txt" "$tmp_dir/ctcc-ip.txt" "ip" && ok=1 || true
+  download_bestcf_asset "bestcf-ip.txt" "$tmp_dir/bestcf-ip.txt" "ip" && ok=1 || true
+  download_bestcf_asset "proxy-ip.txt" "$tmp_dir/proxy-ip.txt" "ip" && ok=1 || true
+  download_bestcf_asset "bestcf-domain.txt" "$tmp_dir/bestcf-domain.txt" "domain" && ok=1 || true
+
+  for asset in $BESTCF_ASSETS; do
+    rm -f "$BESTCF_DIR/$asset" "$BESTCF_DIR/$asset.tmp" "$BESTCF_DIR/$asset.raw"
+    if [[ -s "$tmp_dir/$asset" ]]; then
+      mv -f "$tmp_dir/$asset" "$BESTCF_DIR/$asset"
+    fi
+  done
+  rm -rf "$tmp_dir"
+
+  if [[ "$ok" != "1" ]]; then
+    warn "BestCF 远端数据不可用，已清空本地 BestCF 缓存。本次订阅会退回普通母域名 CDN Entry。"
+  else
+    log "BestCF 已使用本轮远端最新数据刷新。"
   fi
 
   show_bestcf_count
+  return 0
 }
 
 fetch_bestcf_domains(){ fetch_bestcf_all; }
@@ -1634,28 +1720,9 @@ generate_bestcf_subscription_nodes(){
   fi
 }
 
-install_self_to_local_bin(){
-  need_root
-  mkdir -p /usr/local/bin
-
-  local src="${BASH_SOURCE[0]:-$0}"
-  if [[ -f "$src" && -s "$src" && "$src" != "/dev/fd/"* && "$src" != "bash" ]]; then
-    install -m 755 "$src" /usr/local/bin/xem
-    log "已安装本地命令：/usr/local/bin/xem"
-    return 0
-  fi
-
-  warn "当前可能是 bash <(curl ...) 方式运行，无法可靠复制自身。"
-  warn "将按用户主动操作从固定仓库地址安装一次本地命令；定时器以后只调用本地 /usr/local/bin/xem。"
-  curl -fsSL --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time 60 "$SCRIPT_RAW_URL" -o /usr/local/bin/xem
-  chmod +x /usr/local/bin/xem
-  bash -n /usr/local/bin/xem
-  log "已安装本地命令：/usr/local/bin/xem"
-}
-
 enable_bestcf_timer(){
   install_self_to_local_bin
-  cat >/etc/systemd/system/xem-bestcf-update.service <<EOF2
+  cat >/etc/systemd/system/xem-bestcf-update.service <<'EOF2'
 [Unit]
 Description=Update BestCF data and regenerate Xray Edge Manager subscription
 After=network-online.target
@@ -1665,7 +1732,7 @@ Wants=network-online.target
 Type=oneshot
 ExecStart=/usr/local/bin/xem --bestcf-update
 EOF2
-  cat >/etc/systemd/system/xem-bestcf-update.timer <<EOF2
+  cat >/etc/systemd/system/xem-bestcf-update.timer <<'EOF2'
 [Unit]
 Description=Run BestCF update every 12 hours
 
@@ -1680,7 +1747,7 @@ WantedBy=timers.target
 EOF2
   systemctl daemon-reload
   systemctl enable --now xem-bestcf-update.timer
-  log "BestCF 12 小时自动更新已启用。"
+  log "BestCF 12 小时安全自动更新已启用。"
 }
 
 disable_bestcf_timer(){
@@ -2027,6 +2094,12 @@ full_uninstall_xem(){
   systemctl stop xray 2>/dev/null || true
   systemctl disable xray 2>/dev/null || true
   systemctl stop nginx 2>/dev/null || true
+  systemctl disable --now xem-bestcf-update.timer xem-geodata-update.timer 2>/dev/null || true
+  systemctl disable --now xem-hy2-hopping.service 2>/dev/null || true
+  rm -f /etc/systemd/system/xem-bestcf-update.service /etc/systemd/system/xem-bestcf-update.timer
+  rm -f /etc/systemd/system/xem-geodata-update.service /etc/systemd/system/xem-geodata-update.timer
+  rm -f /etc/systemd/system/xem-hy2-hopping.service
+  rm -f "$CERT_DEPLOY_HOOK" 2>/dev/null || true
   remove_hy2_hopping_rules || true
 
   bash -c "$(curl -fsSL --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time "$CURL_MAX_TIME" https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ remove || true
@@ -2059,10 +2132,6 @@ full_uninstall_xem(){
   fi
 
   rm -rf "$APP_DIR" "$LEGACY_APP_DIR" 2>/dev/null || true
-  systemctl disable --now xem-bestcf-update.timer xem-geodata-update.timer xem-hy2-hopping.service 2>/dev/null || true
-  rm -f /etc/systemd/system/xem-bestcf-update.service /etc/systemd/system/xem-bestcf-update.timer \
-        /etc/systemd/system/xem-geodata-update.service /etc/systemd/system/xem-geodata-update.timer \
-        /etc/systemd/system/xem-hy2-hopping.service 2>/dev/null || true
   systemctl daemon-reload 2>/dev/null || true
   systemctl reset-failed 2>/dev/null || true
   log "完整卸载完成。"
@@ -2090,49 +2159,12 @@ uninstall_menu(){
   done
 }
 
-enable_geodata_timer(){
-  install_self_to_local_bin
-  cat >/etc/systemd/system/xem-geodata-update.service <<'EOF2'
-[Unit]
-Description=Safely update Xray geodata
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/bin/xem --geodata-update
-EOF2
-  cat >/etc/systemd/system/xem-geodata-update.timer <<'EOF2'
-[Unit]
-Description=Run safe Xray geodata update every 3 days
-
-[Timer]
-OnBootSec=20min
-OnUnitActiveSec=3d
-RandomizedDelaySec=1h
-Persistent=true
-
-[Install]
-WantedBy=timers.target
-EOF2
-  systemctl daemon-reload
-  systemctl enable --now xem-geodata-update.timer
-  log "已启用 geodata 每 3 天安全自动更新。"
-}
-
-disable_geodata_timer(){
-  systemctl disable --now xem-geodata-update.timer 2>/dev/null || true
-  rm -f /etc/systemd/system/xem-geodata-update.service /etc/systemd/system/xem-geodata-update.timer
-  systemctl daemon-reload 2>/dev/null || true
-  log "geodata 自动更新已关闭。"
-}
-
 main_menu(){
   need_root
   load_state
   while true; do
     echo
-    echo "===== Xray Edge Manager v0.0.9 ====="
+    echo "===== Xray Edge Manager v0.0.12 ====="
     echo "1. 首次部署向导，推荐"
     echo "2. 安装/升级基础依赖"
     echo "3. 安装/升级 Xray-core"
@@ -2194,8 +2226,8 @@ case "${1:-}" in
   --geodata-update)
     need_root
     acquire_lock
-    update_geodata_safe
-    systemctl restart xray || true
+    update_geodata
+    systemctl restart xray 2>/dev/null || true
     exit 0
     ;;
   --apply-hy2-hopping)
@@ -2203,9 +2235,7 @@ case "${1:-}" in
     acquire_lock
     load_state
     if [[ -n "${HY2_HOP_RANGE:-}" ]]; then
-      apply_hy2_hopping_rules "$HY2_HOP_RANGE"
-    else
-      warn "HY2_HOP_RANGE 未设置，跳过端口跳跃恢复。"
+      XEM_INTERNAL_APPLY_HY2=1 enable_hy2_hopping "$HY2_HOP_RANGE"
     fi
     exit 0
     ;;
