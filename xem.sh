@@ -181,7 +181,7 @@ install_deps() {
   apt-get install -y \
     curl wget jq openssl ca-certificates gnupg lsb-release \
     nginx certbot python3-certbot-dns-cloudflare \
-    whois iproute2 iputils-ping unzip tar sed grep coreutils \
+    whois iproute2 iputils-ping iptables nftables unzip tar sed grep coreutils \
     cron socat
   log "依赖安装完成。"
 }
@@ -664,7 +664,7 @@ select_protocols() {
     if confirm "是否启用 v4/v6 出口绑定？v4 入站走 IPv4 出口，v6 入站走 IPv6 出口" "Y"; then
       save_kv "$STATE_FILE" ENABLE_IP_STACK_BINDING "1"
     else
-      warn "未启用出口绑定时，直连入站会使用 0.0.0.0 通用监听，v4/v6 精细分流能力会降低。"
+      warn "未启用出口绑定时，仅不强制 v4 入站走 IPv4 出口、v6 入站走 IPv6 出口；监听仍会按 v4/v6 精确绑定。"
       save_kv "$STATE_FILE" ENABLE_IP_STACK_BINDING "0"
     fi
   fi
@@ -1023,7 +1023,8 @@ configure_nginx() {
   local nginx_http_v6_listen="" nginx_https_v6_listen=""
   if [[ -n "${PUBLIC_IPV6:-}" && "${IPV6_PROTOCOLS:-0}" == *2* ]]; then
     nginx_http_v6_listen="    listen [::]:80;"
-    nginx_https_v6_listen="    listen [::]:${CDN_PORT:-443} ssl http2;"
+    nginx_https_v6_listen="    listen [::]:${CDN_PORT:-443} ssl;
+    http2 on;"
   fi
   cat >"$WEB_ROOT/index.html" <<EOF
 <!doctype html><html><head><meta charset="utf-8"><title>Welcome</title></head><body><h1>Welcome</h1><p>It works.</p></body></html>
@@ -1038,7 +1039,8 @@ ${nginx_http_v6_listen}
 }
 
 server {
-    listen ${CDN_PORT:-443} ssl http2;
+    listen ${CDN_PORT:-443} ssl;
+    http2 on;
 ${nginx_https_v6_listen}
     server_name ${BASE_DOMAIN};
 
@@ -1390,8 +1392,27 @@ disable_bestcf() {
   log "BestCF 已关闭。重新生成订阅后生效。"
 }
 
+ensure_iptables() {
+  if command -v iptables >/dev/null 2>&1; then
+    return 0
+  fi
+  warn "未检测到 iptables，Hysteria2 端口跳跃需要它来写 UDP REDIRECT 规则。"
+  if command -v apt-get >/dev/null 2>&1; then
+    if confirm "是否现在安装 iptables？" "Y"; then
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update
+      apt-get install -y iptables || die "iptables 安装失败，无法配置端口跳跃。"
+    else
+      die "缺少 iptables，已取消端口跳跃配置。"
+    fi
+  else
+    die "缺少 iptables，且当前系统没有 apt-get，请手动安装 iptables 后重试。"
+  fi
+}
+
 enable_hy2_hopping() {
   load_state
+  ensure_iptables
   local range="$1" start end to_port
   to_port="${HY2_PORT:-443}"
   start="${range%%:*}"; end="${range##*:}"
