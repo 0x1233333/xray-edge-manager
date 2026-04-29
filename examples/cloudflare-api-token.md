@@ -1,8 +1,3 @@
-可以把下面这份保存为：
-
-```text
-examples/cloudflare-api-token.md
-```
 
 Cloudflare 官方文档说明 API Token 可以从 Dashboard 的 **My Profile > API Tokens > Create Token** 创建，并且 Token 权限可以按 Zone / Account / User 分类限制；Certbot 的 Cloudflare DNS 插件也推荐使用受限 API Token，并要求对应 Zone 的 DNS Edit 权限。([Cloudflare Docs][1])
 
