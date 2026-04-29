@@ -218,13 +218,13 @@ configure_base_domain() {
   load_state
   local d
   while true; do
-    d=$(ask "请输入母域名，必须三段式或以上，例如 jp1.0x0000.top" "${BASE_DOMAIN:-}")
+    d=$(ask "请输入母域名，必须三段式或以上，例如 node.example.com" "${BASE_DOMAIN:-}")
     if validate_base_domain "$d"; then
       save_kv "$STATE_FILE" BASE_DOMAIN "$d"
       log "母域名已设置：$d"
       break
     else
-      warn "域名不合格。必须类似 jp1.0x0000.top，不能是 0x0000.top 这种二段根域。"
+      warn "域名不合格。必须类似 node.example.com，不能是 example.com 这种二段根域。"
     fi
   done
 }
@@ -276,7 +276,7 @@ setup_cloudflare() {
   save_kv "$CF_ENV" CF_API_TOKEN "$token"
   source "$CF_ENV"
 
-  zone_name=$(ask "请输入 Cloudflare Zone Name，例如 0x0000.top" "${CF_ZONE_NAME:-}")
+  zone_name=$(ask "请输入 Cloudflare Zone Name，例如 example.com" "${CF_ZONE_NAME:-}")
   [[ -n "$zone_name" ]] || die "Zone Name 不能为空。"
   save_kv "$CF_ENV" CF_ZONE_NAME "$zone_name"
 
@@ -477,9 +477,45 @@ protocol_enabled() { [[ "${PROTOCOLS:-123}" == *"$1"* ]]; }
 
 backup_configs() {
   local ts="$(date +%F-%H%M%S)"
-  [[ -f "$XRAY_CONFIG" ]] && cp -a "$XRAY_CONFIG" "$BACKUP_DIR/config.json.$ts.bak"
-  [[ -f "$NGINX_SITE" ]] && cp -a "$NGINX_SITE" "$BACKUP_DIR/nginx.$ts.bak"
+  if [[ -f "$XRAY_CONFIG" ]]; then
+    cp -a "$XRAY_CONFIG" "$BACKUP_DIR/config.json.$ts.bak"
+    save_kv "$STATE_FILE" LAST_XRAY_BACKUP "$BACKUP_DIR/config.json.$ts.bak"
+  fi
+  if [[ -f "$NGINX_SITE" ]]; then
+    cp -a "$NGINX_SITE" "$BACKUP_DIR/nginx.$ts.bak"
+    save_kv "$STATE_FILE" LAST_NGINX_BACKUP "$BACKUP_DIR/nginx.$ts.bak"
+  fi
   [[ -f "$STATE_FILE" ]] && cp -a "$STATE_FILE" "$BACKUP_DIR/state.env.$ts.bak"
+}
+
+restore_latest_xray_config() {
+  load_state
+  local bak="${LAST_XRAY_BACKUP:-}"
+  if [[ -z "$bak" || ! -f "$bak" ]]; then
+    bak=$(ls -1t "$BACKUP_DIR"/config.json.*.bak 2>/dev/null | head -n1 || true)
+  fi
+  if [[ -n "$bak" && -f "$bak" ]]; then
+    cp -a "$bak" "$XRAY_CONFIG"
+    warn "已自动回滚 Xray 配置：$bak -> $XRAY_CONFIG"
+    return 0
+  fi
+  warn "未找到可回滚的 Xray 配置备份。"
+  return 1
+}
+
+restore_latest_nginx_config() {
+  load_state
+  local bak="${LAST_NGINX_BACKUP:-}"
+  if [[ -z "$bak" || ! -f "$bak" ]]; then
+    bak=$(ls -1t "$BACKUP_DIR"/nginx.*.bak 2>/dev/null | head -n1 || true)
+  fi
+  if [[ -n "$bak" && -f "$bak" ]]; then
+    cp -a "$bak" "$NGINX_SITE"
+    warn "已自动回滚 Nginx 配置：$bak -> $NGINX_SITE"
+    return 0
+  fi
+  warn "未找到可回滚的 Nginx 配置备份。"
+  return 1
 }
 
 preflight_ports() {
@@ -685,8 +721,14 @@ $(cat "$route_tmp")
 }
 EOF
   rm -f "$in_tmp" "$out_tmp" "$route_tmp"
-  jq empty "$XRAY_CONFIG" || die "生成的 Xray JSON 不是合法 JSON，已保留备份。"
-  xray run -test -config "$XRAY_CONFIG" || die "Xray 配置测试失败，已保留备份。"
+  if ! jq empty "$XRAY_CONFIG" >/dev/null 2>&1; then
+    restore_latest_xray_config || true
+    die "生成的 Xray JSON 不是合法 JSON，已自动尝试回滚上一版本配置。"
+  fi
+  if ! xray run -test -config "$XRAY_CONFIG" >/dev/null 2>&1; then
+    restore_latest_xray_config || true
+    die "Xray 配置测试失败，已自动尝试回滚上一版本配置。"
+  fi
   log "Xray 配置生成并测试通过。"
 }
 
@@ -739,9 +781,16 @@ server {
     }
 }
 EOF
-  nginx -t || die "Nginx 配置测试失败。"
+  if ! nginx -t; then
+    restore_latest_nginx_config || true
+    die "Nginx 配置测试失败，已自动尝试回滚上一版本配置。"
+  fi
   systemctl enable nginx >/dev/null 2>&1 || true
-  systemctl reload nginx || systemctl restart nginx
+  if ! systemctl reload nginx && ! systemctl restart nginx; then
+    restore_latest_nginx_config || true
+    nginx -t >/dev/null 2>&1 && (systemctl reload nginx || systemctl restart nginx) || true
+    die "Nginx reload/restart 失败，已自动尝试回滚上一版本配置。"
+  fi
   log "Nginx / 伪装站 / 订阅路径配置完成。"
 }
 
@@ -1010,9 +1059,29 @@ handle_firewall_ports() {
 }
 
 restart_services() {
-  xray run -test -config "$XRAY_CONFIG" || die "Xray 配置测试失败。"
-  systemctl restart xray || die "Xray 重启失败。"
-  [[ -f "$NGINX_SITE" ]] && nginx -t && (systemctl reload nginx || systemctl restart nginx)
+  if ! xray run -test -config "$XRAY_CONFIG" >/dev/null 2>&1; then
+    restore_latest_xray_config || true
+    die "Xray 配置测试失败，已自动尝试回滚。"
+  fi
+  if ! systemctl restart xray; then
+    restore_latest_xray_config || true
+    if xray run -test -config "$XRAY_CONFIG" >/dev/null 2>&1; then
+      systemctl restart xray || true
+    fi
+    die "Xray 重启失败，已自动尝试回滚上一版本配置。"
+  fi
+
+  if [[ -f "$NGINX_SITE" ]]; then
+    if ! nginx -t >/dev/null 2>&1; then
+      restore_latest_nginx_config || true
+      die "Nginx 配置测试失败，已自动尝试回滚。"
+    fi
+    if ! systemctl reload nginx && ! systemctl restart nginx; then
+      restore_latest_nginx_config || true
+      nginx -t >/dev/null 2>&1 && (systemctl reload nginx || systemctl restart nginx) || true
+      die "Nginx reload/restart 失败，已自动尝试回滚上一版本配置。"
+    fi
+  fi
   log "服务已重启。"
 }
 
