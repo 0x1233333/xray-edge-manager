@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Xray Edge Manager / Xray Anti-Block Manager
-# v0.0.23 Xray temp config suffix fix
+# v0.0.28 — protocol-5 / Nginx hardening patch
 #
 # Features:
 # - Xray-core only, no Docker, no sing-box
@@ -56,12 +56,20 @@ LOCK_FILE="/run/xray-edge-manager.lock"
 CF_HTTPS_PORTS="443 2053 2083 2087 2096 8443"
 DEFAULT_HY2_HOP_RANGE="20000:20100"
 SCRIPT_RAW_URL="https://raw.githubusercontent.com/0x1233333/xray-edge-manager/main/xem.sh"
+XRAY_CORE_RELEASE_API="https://api.github.com/repos/XTLS/Xray-core/releases"
+XRAY_INSTALL_SCRIPT_URL="https://github.com/XTLS/Xray-install/raw/main/install-release.sh"
 BESTCF_RELEASE_API="https://api.github.com/repos/DustinWin/BestCF/releases/tags/bestcf"
 BESTCF_ASSETS="cmcc-ip.txt cucc-ip.txt ctcc-ip.txt bestcf-ip.txt proxy-ip.txt bestcf-domain.txt"
 CURL_CONNECT_TIMEOUT=5
 CURL_MAX_TIME=20
+REMOTE_SUB_MAX_BYTES="${XEM_REMOTE_SUB_MAX_BYTES:-2097152}"
+# Sanitize: must be a positive integer >= 1024, otherwise reset to default.
+[[ "$REMOTE_SUB_MAX_BYTES" =~ ^[0-9]+$ ]] && [[ "$REMOTE_SUB_MAX_BYTES" -ge 1024 ]] || REMOTE_SUB_MAX_BYTES=2097152
 
-mkdir -p "$APP_DIR" "$SUB_DIR" "$BESTCF_DIR" "$BACKUP_DIR" "$DEBUG_DIR"
+mkdir -p "$APP_DIR" "$APP_DIR/tmp" "$SUB_DIR" "$BESTCF_DIR" "$BACKUP_DIR" "$DEBUG_DIR"
+# SECURITY FIX: ensure APP_DIR and its tmp subdir are only accessible by root,
+# even if the parent directory permissions are more permissive.
+chmod 700 "$APP_DIR" "$APP_DIR/tmp" 2>/dev/null || true
 
 log()  { echo -e "\033[32m[OK]\033[0m $*"; }
 info() { echo -e "\033[36m[INFO]\033[0m $*"; }
@@ -99,16 +107,17 @@ acquire_lock(){
 }
 
 safe_source_env_file(){
-  local file="$1" line key n=0
+  local file="$1" line key val n=0
   [[ -f "$file" ]] || return 0
 
-  # Do not source symlinks. State files contain credentials and are expected to
+  # Do not read symlinks. State files contain credentials and are expected to
   # be regular files under APP_DIR.
   [[ ! -L "$file" ]] || die "拒绝读取符号链接状态文件：$file"
   chmod 600 "$file" 2>/dev/null || true
 
-  # Keep compatibility with save_kv bash %q format, but reject lines that can
-  # perform shell execution when sourced. This avoids a risky state migration.
+  # SECURITY FIX: do NOT source the file. Instead parse key=value lines and
+  # assign them via declare. This eliminates any possibility of shell injection
+  # through crafted state file values (ANSI-C quoting, $'...' escapes, etc.).
   while IFS= read -r line || [[ -n "$line" ]]; do
     n=$((n + 1))
     [[ "$line" =~ ^[[:space:]]*$ ]] && continue
@@ -117,15 +126,30 @@ safe_source_env_file(){
     key="${line%%=*}"
     [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "状态文件键名非法：$file:$n"
 
-    case "$line" in
+    # Extract value: strip the key= prefix
+    val="${line#*=}"
+    # Remove surrounding single quotes if present (from bash %q output)
+    if [[ "$val" =~ ^\$?\'.*\'$ ]]; then
+      # $'...' or '...' quoted value — strip to literal content.
+      # For safety we reject $'...' (ANSI-C) which can encode arbitrary bytes.
+      if [[ "$val" == \$\'* ]]; then
+        die "状态文件包含 ANSI-C 引号，拒绝加载：$file:$n"
+      fi
+      val="${val#\'}"  # remove leading '
+      val="${val%\'}"
+      # remove trailing '
+    fi
+
+    # Final safety check: reject values with shell metacharacters
+    case "$val" in
       *'$('*|*'`'*|*';'*|*'&'*|*'|'*|*'<'*|*'>'*)
-        die "状态文件包含不安全字符，拒绝 source：$file:$n"
+        die "状态文件包含不安全字符，拒绝加载：$file:$n"
         ;;
     esac
-  done < "$file"
 
-  # shellcheck disable=SC1090
-  source "$file"
+    # Safely assign to global scope via declare -g (bash 4.2+)
+    declare -g "$key=$val"
+  done < "$file"
 }
 
 load_state(){
@@ -143,9 +167,12 @@ save_kv(){
   printf -v q '%q' "$value"
 
   tmp="$(mktemp_file "${file}.tmp.XXXXXX")"
+  # SECURITY FIX: use exact key match to prevent FOO matching FOOBAR=xxx.
+  # Match only lines where key= starts at position 1 AND the next char after
+  # the key name is '=' (not another alphanumeric/underscore).
   awk -v k="$key" -v v="$q" '
-    BEGIN { found = 0 }
-    index($0, k "=") == 1 {
+    BEGIN { found = 0; pat = k "=" }
+    substr($0, 1, length(pat)) == pat {
       print k "=" v
       found = 1
       next
@@ -182,6 +209,20 @@ rand_hex(){ openssl rand -hex "${1:-8}"; }
 rand_token(){ openssl rand -hex 16; }
 rand_path(){ echo "/$(openssl rand -hex 6)/xhttp"; }
 
+# SECURITY FIX: validate that subscription tokens are safe 32-char hex strings,
+# preventing path traversal if the state file is tampered with.
+# If invalid, auto-regenerate instead of dying — better UX for existing installs.
+validate_or_regen_token(){
+  local key="$1" current="${!1:-}"
+  if [[ ! "$current" =~ ^[a-f0-9]{32}$ ]]; then
+    if [[ -n "$current" ]]; then
+      warn "${key} 格式非法（应为32位十六进制），已自动重新生成。旧值：$current"
+    fi
+    save_kv "$STATE_FILE" "$key" "$(rand_token)"
+    load_state
+  fi
+}
+
 valid_port(){
   local p="$1"
   [[ "$p" =~ ^[0-9]+$ ]] && [[ "$p" -ge 1 ]] && [[ "$p" -le 65535 ]]
@@ -212,6 +253,13 @@ validate_base_domain(){
   local d="$1"
   [[ "$d" == *.*.* ]] || return 1
   [[ "$d" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.){2,}[A-Za-z]{2,}$ ]] || return 1
+}
+
+validate_hostname(){
+  local d="$1"
+  [[ -n "$d" && ${#d} -le 253 ]] || return 1
+  [[ "$d" != *..* ]] || return 1
+  [[ "$d" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,}$ ]] || return 1
 }
 
 public_ipv4(){
@@ -269,7 +317,7 @@ install_deps(){
   apt-get install -y \
     curl wget jq openssl ca-certificates gnupg lsb-release \
     nginx certbot python3-certbot-dns-cloudflare \
-    whois iproute2 iputils-ping iptables nftables tcpdump unzip tar sed grep coreutils perl \
+    whois iproute2 iputils-ping iptables nftables tcpdump unzip tar sed grep coreutils perl xxd \
     cron socat util-linux conntrack logrotate
   log "基础依赖安装完成。"
 }
@@ -349,39 +397,159 @@ EOF2
   systemctl enable xray >/dev/null 2>&1 || true
 }
 
-install_or_upgrade_xray(){
-  need_root
-  local installer installer_url
-  installer_url="https://github.com/XTLS/Xray-install/raw/main/install-release.sh"
+xray_release_asset_name(){
+  case "$(uname -m)" in
+    x86_64|amd64) echo "Xray-linux-64.zip" ;;
+    i386|i686) echo "Xray-linux-32.zip" ;;
+    aarch64|arm64|armv8*) echo "Xray-linux-arm64-v8a.zip" ;;
+    armv7l|armv7*) echo "Xray-linux-arm32-v7a.zip" ;;
+    armv6l|armv6*) echo "Xray-linux-arm32-v6.zip" ;;
+    armv5tel|armv5*) echo "Xray-linux-arm32-v5.zip" ;;
+    mips64le) echo "Xray-linux-mips64le.zip" ;;
+    mips64) echo "Xray-linux-mips64.zip" ;;
+    mipsle) echo "Xray-linux-mips32le.zip" ;;
+    mips) echo "Xray-linux-mips32.zip" ;;
+    ppc64le) echo "Xray-linux-ppc64le.zip" ;;
+    ppc64) echo "Xray-linux-ppc64.zip" ;;
+    riscv64) echo "Xray-linux-riscv64.zip" ;;
+    s390x) echo "Xray-linux-s390x.zip" ;;
+    *) return 1 ;;
+  esac
+}
 
+extract_sha256_from_dgst(){
+  local dgst="$1"
+  grep -iE 'SHA2-256|SHA256|sha256' "$dgst" 2>/dev/null | grep -Eio '[a-f0-9]{64}' | head -n1
+}
+
+install_or_upgrade_xray_release_verified(){
+  need_root
+  local asset release_json tag asset_url dgst_url tmp zip dgst expected actual extract_dir xray_bin dat f
+
+  asset="$(xray_release_asset_name)" || die "当前架构暂不支持自动匹配 Xray 官方 Release：$(uname -m)"
+  # SECURITY FIX: use APP_DIR instead of /tmp to avoid symlink race in multi-user systems.
+  tmp="$(mktemp_dir "$APP_DIR/tmp/xray-release.XXXXXX")"
+  zip="$tmp/$asset"
+  dgst="$tmp/$asset.dgst"
+  extract_dir="$tmp/extract"
+
+  info "从 XTLS/Xray-core 官方 Release 获取资产列表。"
+  release_json="$tmp/releases.json"
+  curl -fL --retry 3 --retry-delay 2 --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time 60 \
+    -H "Accept: application/vnd.github+json" \
+    -o "$release_json" "$XRAY_CORE_RELEASE_API?per_page=50" || die "获取 Xray-core 官方 Release 列表失败。"
+
+  tag=$(jq -r --arg asset "$asset" '
+    map(select((.draft|not) and (.prerelease|not))) |
+    map(select(any(.assets[]?; .name == $asset))) |
+    .[0].tag_name // empty
+  ' "$release_json")
+  asset_url=$(jq -r --arg asset "$asset" '
+    map(select((.draft|not) and (.prerelease|not)))[] |
+    .assets[]? |
+    select(.name == $asset) |
+    .browser_download_url
+  ' "$release_json" | head -n1)
+  dgst_url=$(jq -r --arg asset "$asset" '
+    map(select((.draft|not) and (.prerelease|not)))[] |
+    .assets[]? |
+    select(.name == ($asset + ".dgst")) |
+    .browser_download_url
+  ' "$release_json" | head -n1)
+
+  [[ -n "$tag" && -n "$asset_url" && -n "$dgst_url" ]] || die "未在 Xray-core 官方 Release 中找到 $asset 及其 .dgst 校验文件。"
+
+  info "准备安装 Xray-core $tag：$asset"
+  info "下载官方 ZIP 与同 Release digest 文件。"
+  curl -fL --retry 3 --retry-delay 2 --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time 180 -o "$zip" "$asset_url" || die "下载 Xray 官方 ZIP 失败。"
+  curl -fL --retry 3 --retry-delay 2 --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time 60 -o "$dgst" "$dgst_url" || die "下载 Xray 官方 digest 失败。"
+
+  expected="$(extract_sha256_from_dgst "$dgst")"
+  [[ -n "$expected" ]] || die "无法从官方 digest 文件提取 SHA256。"
+  actual="$(sha256sum "$zip" | awk '{print $1}')"
+  if [[ "${actual,,}" != "${expected,,}" ]]; then
+    err "Xray 官方 ZIP SHA256 校验失败。"
+    err "expected=$expected"
+    err "actual=$actual"
+    die "拒绝安装，可能是下载损坏或链路被替换。"
+  fi
+  log "Xray 官方 ZIP SHA256 校验通过。"
+
+  mkdir -p "$extract_dir"
+  unzip -oq "$zip" -d "$extract_dir" || die "解压 Xray ZIP 失败。"
+  xray_bin="$(find "$extract_dir" -type f -name xray | head -n1)"
+  [[ -n "$xray_bin" && -f "$xray_bin" ]] || die "Xray ZIP 中未找到 xray 二进制。"
+
+  install -d /usr/local/bin /usr/local/etc/xray /usr/local/share/xray /var/log/xray
+  install -m 755 "$xray_bin" /usr/local/bin/xray
+  for dat in geoip.dat geosite.dat; do
+    f="$(find "$extract_dir" -type f -name "$dat" | head -n1 || true)"
+    [[ -n "$f" && -f "$f" ]] && install -m 644 "$f" "/usr/local/share/xray/$dat"
+  done
+
+  ensure_xray_service
+  log "Xray-core $tag 已从官方 Release 安装/升级完成。"
+  xray version || true
+}
+
+install_or_upgrade_xray_script_fallback(){
+  need_root
+  local installer expected actual
   warn "即将从 XTLS/Xray-install 官方仓库下载并执行 Xray 安装脚本。"
-  warn "这仍然属于远程脚本信任模型；脚本会先下载到临时文件并做 bash -n 语法检查，不再使用 curl | bash 直通执行。"
+  warn "这是官方脚本备用模式；如需强校验脚本本身，可设置 XEM_XRAY_INSTALL_SHA256。"
   if [[ "${XEM_TRUST_REMOTE_XRAY_INSTALL:-0}" != "1" ]]; then
-    confirm "是否继续安装/升级 Xray-core？" "N" || die "已取消远程安装。你也可以先手动安装 xray，再回到脚本生成配置。"
+    confirm "是否继续执行官方 Xray-install 脚本？" "N" || die "已取消远程安装。"
   fi
 
-  info "安装/升级 Xray-core..."
-  installer="$(mktemp_file /tmp/xray-install.XXXXXX.sh)"
-  curl -fL --retry 3 --retry-delay 2 --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time 120 -o "$installer" "$installer_url" || die "下载 Xray 官方安装脚本失败。"
+  # SECURITY FIX: use APP_DIR instead of /tmp to avoid symlink race.
+  installer="$(mktemp_file "$APP_DIR/tmp/xray-install.XXXXXX.sh")"
+  curl -fL --retry 3 --retry-delay 2 --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time 120 -o "$installer" "$XRAY_INSTALL_SCRIPT_URL" || die "下载 Xray 官方安装脚本失败。"
   bash -n "$installer" || die "下载的 Xray 安装脚本语法检查失败，拒绝执行。"
+
+  if [[ -n "${XEM_XRAY_INSTALL_SHA256:-}" ]]; then
+    expected="${XEM_XRAY_INSTALL_SHA256,,}"
+    actual="$(sha256sum "$installer" | awk '{print tolower($1)}')"
+    [[ "$actual" == "$expected" ]] || die "Xray-install 脚本 SHA256 不匹配，拒绝执行。"
+    log "Xray-install 脚本 SHA256 pin 校验通过。"
+  fi
+
   bash "$installer" install -u root
   ensure_xray_service
-  log "Xray 安装/升级完成。"
+  log "Xray 官方安装脚本执行完成。"
   xray version || true
+}
+
+install_or_upgrade_xray(){
+  need_root
+  local mode
+  mode="${XEM_XRAY_INSTALL_MODE:-}"
+  if [[ -z "$mode" ]]; then
+    echo "===== Xray-core 安装方式 ====="
+    echo "1. 官方 Xray-core Release ZIP + 官方 .dgst SHA256 校验，推荐"
+    echo "2. 官方 Xray-install 脚本，备用；可用 XEM_XRAY_INSTALL_SHA256 做脚本 hash pin"
+    mode=$(ask "请选择" "1")
+  fi
+
+  case "$mode" in
+    1|release|zip) install_or_upgrade_xray_release_verified ;;
+    2|script) install_or_upgrade_xray_script_fallback ;;
+    *) die "未知 Xray 安装方式：$mode" ;;
+  esac
 }
 
 update_geodata(){
   need_root
   local tmp status geoip_url geosite_url
-  tmp="$(mktemp_dir)"
+  tmp="$(mktemp_dir "$APP_DIR/tmp/geodata.XXXXXX")"
   status=0
   geoip_url="https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat"
   geosite_url="https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat"
 
   info "安全更新 geoip.dat / geosite.dat：只下载数据文件和 sha256，不执行远程脚本。"
 
+  # Use a subshell for cd isolation but rely on global GLOBAL_TEMP_FILES for cleanup.
+  # No internal trap needed — mktemp_dir already registered $tmp for cleanup on exit.
   (
-    trap 'rm -rf "$tmp"' EXIT INT TERM
     cd "$tmp" &&
     curl -fL --retry 3 --retry-delay 2 --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time 120 -o geoip.dat "$geoip_url" &&
     curl -fL --retry 3 --retry-delay 2 --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time 120 -o geoip.dat.sha256sum "$geoip_url.sha256sum" &&
@@ -412,13 +580,30 @@ install_self_to_local_bin(){
     log "已安装本地命令：/usr/local/bin/xem"
     return 0
   fi
-  warn "当前可能是 bash <(curl ...) 方式运行，无法可靠复制自身；将从仓库下载一次用于固化本地命令。"
-  curl -fsSL --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time 60 "$SCRIPT_RAW_URL" -o /usr/local/bin/xem.tmp || die "下载本地命令失败。"
-  if command -v perl >/dev/null 2>&1; then
-    perl -C -pi -e 's/\x{00A0}/ /g' /usr/local/bin/xem.tmp 2>/dev/null || true
+  # SECURITY FIX: do not silently download and install self from remote.
+  # Require explicit user confirmation, and support SHA256 pin verification.
+  warn "当前可能是 bash <(curl ...) 方式运行，无法可靠复制自身。"
+  warn "将从仓库下载一次用于固化本地命令：$SCRIPT_RAW_URL"
+  warn "这意味着你信任该远程地址提供的脚本内容。可设置 XEM_SELF_SHA256 进行强校验。"
+  if [[ "${XEM_TRUST_REMOTE_SELF:-0}" != "1" ]]; then
+    confirm "是否继续从远程下载并安装本脚本？" "N" || die "已取消远程安装。请手动下载脚本后执行 install -m 755 xem.sh /usr/local/bin/xem"
   fi
-  bash -n /usr/local/bin/xem.tmp || die "下载的脚本语法检查失败，拒绝安装。"
-  mv -f /usr/local/bin/xem.tmp /usr/local/bin/xem
+  local tmp_script
+  tmp_script="$(mktemp_file "$APP_DIR/tmp/xem-self.XXXXXX.sh")"
+  curl -fsSL --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time 60 "$SCRIPT_RAW_URL" -o "$tmp_script" || die "下载本地命令失败。"
+  if command -v perl >/dev/null 2>&1; then
+    perl -C -pi -e 's/\x{00A0}/ /g' "$tmp_script" 2>/dev/null || true
+  fi
+  bash -n "$tmp_script" || die "下载的脚本语法检查失败，拒绝安装。"
+  # SHA256 pin verification if configured
+  if [[ -n "${XEM_SELF_SHA256:-}" ]]; then
+    local expected_self actual_self
+    expected_self="${XEM_SELF_SHA256,,}"
+    actual_self="$(sha256sum "$tmp_script" | awk '{print tolower($1)}')"
+    [[ "$actual_self" == "$expected_self" ]] || die "脚本 SHA256 校验失败，拒绝安装。expected=$expected_self actual=$actual_self"
+    log "脚本 SHA256 pin 校验通过。"
+  fi
+  mv -f "$tmp_script" /usr/local/bin/xem
   chmod +x /usr/local/bin/xem
   log "已安装本地命令：/usr/local/bin/xem"
 }
@@ -572,21 +757,36 @@ setup_cloudflare(){
 }
 
 cf_upsert_record(){
-  local name="$1" type="$2" content="$3" proxied="$4" list rec_id payload
+  local name="$1" type="$2" content="$3" proxied="$4" list rec_id payload id
+  local ids=()
   load_state
   [[ -n "${CF_ZONE_ID:-}" ]] || die "未配置 CF_ZONE_ID。"
   [[ -n "$content" ]] || { warn "$name $type 内容为空，跳过。"; return 0; }
   info "Upsert DNS: $type $name -> $content proxied=$proxied"
   list=$(curl -fsS --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time "$CURL_MAX_TIME" -G "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/dns_records" \
-    -H "Authorization: Bearer $CF_API_TOKEN" --data-urlencode "type=$type" --data-urlencode "name=$name") || return 1
-  rec_id=$(echo "$list" | jq -r '.result[0].id // empty')
+    -H "Authorization: Bearer $CF_API_TOKEN" \
+    --data-urlencode "type=$type" --data-urlencode "name=$name" --data-urlencode "per_page=100") || return 1
+
+  mapfile -t ids < <(echo "$list" | jq -r '.result[]?.id // empty')
+  rec_id=$(echo "$list" | jq -r --arg content "$content" '.result[]? | select(.content == $content) | .id' | head -n1)
+  [[ -z "$rec_id" && "${#ids[@]}" -gt 0 ]] && rec_id="${ids[0]}"
+
   payload=$(jq -nc --arg type "$type" --arg name "$name" --arg content "$content" --argjson proxied "$proxied" \
     '{type:$type,name:$name,content:$content,ttl:1,proxied:$proxied}')
+
   if [[ -n "$rec_id" ]]; then
     cf_api PATCH "/zones/$CF_ZONE_ID/dns_records/$rec_id" "$payload" >/dev/null
   else
     cf_api POST "/zones/$CF_ZONE_ID/dns_records" "$payload" >/dev/null
   fi
+
+  # This manager owns one record per name/type. Remove duplicates to avoid old
+  # IPs staying in Cloudflare and causing direct-domain drift.
+  for id in "${ids[@]}"; do
+    [[ -n "$id" && "$id" != "$rec_id" ]] || continue
+    warn "删除重复 DNS 记录：$type $name id=$id"
+    cf_api DELETE "/zones/$CF_ZONE_ID/dns_records/$id" >/dev/null || warn "删除重复 DNS 记录失败：$id"
+  done
 }
 
 stack_protocols_has(){ [[ "$1" == *"$2"* ]]; }
@@ -785,10 +985,12 @@ issue_certificate(){
   [[ -n "${CF_API_TOKEN:-}" ]] || setup_cloudflare
   mkdir -p "$APP_DIR"
   install_cert_deploy_hook
-  cat > "$CF_CRED" <<EOF2
-dns_cloudflare_api_token = $CF_API_TOKEN
-EOF2
+  # SECURITY FIX: set restrictive permissions BEFORE writing sensitive content,
+  # eliminating the brief window where the file was world-readable.
+  # Also use printf instead of unquoted heredoc to avoid $-expansion bugs.
+  touch "$CF_CRED"
   chmod 600 "$CF_CRED"
+  printf '%s\n' "dns_cloudflare_api_token = $CF_API_TOKEN" > "$CF_CRED"
   local email
   email=$(ask "请输入证书邮箱，留空则不绑定邮箱" "${CERT_EMAIL:-}")
   email=$(printf '%s' "$email" | tr -d '[:space:]')
@@ -823,6 +1025,16 @@ choose_reality_target(){
     *) target=$(ask "请输入 REALITY target 域名" "${REALITY_TARGET:-www.microsoft.com}") ;;
   esac
   target=$(printf '%s' "$target" | tr -d '[:space:]')
+
+  # HARDENING: REALITY target is later embedded into generated JSON and
+  # subscription links. Keep it as a normal hostname to avoid broken configs
+  # from quotes, slashes, ports, spaces, or other accidental characters.
+  while ! validate_hostname "$target"; do
+    warn "REALITY target 域名格式不合格：$target"
+    target=$(ask "请重新输入 REALITY target 域名，例如 www.microsoft.com" "www.microsoft.com")
+    target=$(printf '%s' "$target" | tr -d '[:space:]')
+  done
+
   save_kv "$STATE_FILE" REALITY_TARGET "$target"
   log "REALITY target: $target"
 }
@@ -868,6 +1080,10 @@ generate_keys_if_needed(){
   [[ -n "${MERGED_SUB_TOKEN:-}" ]] || save_kv "$STATE_FILE" MERGED_SUB_TOKEN "$(rand_token)"
   [[ -n "${XHTTP_CDN_LOCAL_PORT:-}" ]] || save_kv "$STATE_FILE" XHTTP_CDN_LOCAL_PORT "31301"
   load_state
+  # SECURITY FIX: validate tokens; auto-regenerate if format is invalid
+  # (strict 32-char hex, matching rand_token output).
+  validate_or_regen_token SUB_TOKEN
+  validate_or_regen_token MERGED_SUB_TOKEN
 }
 
 backup_configs(){
@@ -876,6 +1092,14 @@ backup_configs(){
   [[ -f "$XRAY_CONFIG" ]] && cp -a "$XRAY_CONFIG" "$BACKUP_DIR/config.json.$ts.bak" && save_kv "$STATE_FILE" LAST_XRAY_BACKUP "$BACKUP_DIR/config.json.$ts.bak" || true
   [[ -f "$NGINX_SITE" ]] && cp -a "$NGINX_SITE" "$BACKUP_DIR/nginx.$ts.bak" && save_kv "$STATE_FILE" LAST_NGINX_BACKUP "$BACKUP_DIR/nginx.$ts.bak" || true
   [[ -f "$STATE_FILE" ]] && cp -a "$STATE_FILE" "$BACKUP_DIR/state.env.$ts.bak" || true
+  # IMPROVEMENT: rotate old backups, keeping only the most recent 10 of each type.
+  local pattern count
+  for pattern in "config.json.*.bak" "nginx.*.bak" "state.env.*.bak"; do
+    count=$(find "$BACKUP_DIR" -maxdepth 1 -name "$pattern" 2>/dev/null | wc -l)
+    if [[ "$count" -gt 10 ]]; then
+      ls -1t "$BACKUP_DIR"/$pattern 2>/dev/null | tail -n +11 | xargs rm -f -- 2>/dev/null || true
+    fi
+  done
 }
 
 atomic_copy_into_place(){
@@ -926,7 +1150,7 @@ preflight_ports(){
   load_state
   info "端口预检..."
   local p proc
-  if protocol_enabled 2; then
+  if protocol_enabled 2 || protocol_enabled 5; then
     p="${CDN_PORT:-443}"; proc=$(get_proc_tcp "$p")
     [[ -z "$proc" || "$proc" == *nginx* ]] || die "TCP $p 被非 Nginx 进程占用：$proc"
   fi
@@ -964,7 +1188,7 @@ generate_xray_config(){
   mkdir -p /usr/local/etc/xray /var/log/xray
 
   local in_tmp out_tmp route_tmp xray_target_tmp first_in=1 first_out=1 first_route=1 ip4 ip6 bind_ip4="" bind_ip6="" bind
-  in_tmp=$(mktemp_file); out_tmp=$(mktemp_file); route_tmp=$(mktemp_file)
+  in_tmp=$(mktemp_file "$APP_DIR/tmp/xray-in.XXXXXX"); out_tmp=$(mktemp_file "$APP_DIR/tmp/xray-out.XXXXXX"); route_tmp=$(mktemp_file "$APP_DIR/tmp/xray-route.XXXXXX")
   ip4="${PUBLIC_IPV4:-$(public_ipv4)}"; ip6="${PUBLIC_IPV6:-$(public_ipv6)}"
   [[ -n "$ip4" ]] && save_kv "$STATE_FILE" PUBLIC_IPV4 "$ip4" && bind_ip4=$(local_ipv4_for_bind "$ip4") && save_kv "$STATE_FILE" BIND_IPV4 "$bind_ip4"
   [[ -n "$ip6" ]] && save_kv "$STATE_FILE" PUBLIC_IPV6 "$ip6" && bind_ip6=$(local_ipv6_for_bind "$ip6") && save_kv "$STATE_FILE" BIND_IPV6 "$bind_ip6"
@@ -1105,6 +1329,22 @@ EOF2
 }
 
 
+disable_nginx_packaged_default_site(){
+  mkdir -p "$BACKUP_DIR"
+  local f ts backup
+  # Debian/Ubuntu nginx packages commonly ship /etc/nginx/sites-enabled/default
+  # with "listen 80 default_server". Our generated sinkhole also needs to own
+  # the default_server slot; otherwise nginx -t fails with duplicate default.
+  for f in /etc/nginx/sites-enabled/default; do
+    [[ -e "$f" || -L "$f" ]] || continue
+    ts=$(date +%F-%H%M%S)
+    backup="$BACKUP_DIR/nginx-packaged-default.$ts.bak"
+    cp -a "$f" "$backup" 2>/dev/null || true
+    rm -f "$f"
+    warn "已备份并禁用 Nginx 包默认站点，避免 default_server 冲突：$f -> $backup"
+  done
+}
+
 cleanup_legacy_nginx_conf(){
   mkdir -p "$BACKUP_DIR"
   if [[ -f "$LEGACY_NGINX_SITE" ]]; then
@@ -1119,7 +1359,7 @@ install_random_camouflage(){
   local n zip tmp
   n=$((RANDOM % 9 + 1))
   zip="html${n}.zip"
-  tmp=$(mktemp_dir)
+  tmp=$(mktemp_dir "$APP_DIR/tmp/camouflage.XXXXXX")
   info "随机下载伪装站模板：v2ray-agent/fodder/blog/unable/${zip}"
   if curl -fsSL --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time 60 -o "$tmp/$zip" "$FODDER_BASE_URL/$zip" && unzip -q "$tmp/$zip" -d "$tmp/site"; then
     rm -rf "$WEB_ROOT"/*
@@ -1152,17 +1392,28 @@ configure_nginx(){
   load_state
   mkdir -p "$APP_DIR" "$SUB_DIR" "$BESTCF_DIR" "$BACKUP_DIR"
   cleanup_legacy_nginx_conf
+  disable_nginx_packaged_default_site
   mkdir -p "$WEB_ROOT" "$WEB_ROOT/sub" "$SUB_DIR"
   chmod 755 "$WEB_ROOT" "$WEB_ROOT/sub" 2>/dev/null || true
   touch "$WEB_ROOT/sub/${SUB_TOKEN}"
   chmod 644 "$WEB_ROOT/sub/${SUB_TOKEN}" 2>/dev/null || true
 
   local nginx_http_v6_listen="" nginx_https_v6_listen="" nginx_https_listen="" nginx_http2_directive="" nginx_version="" nginx_target_tmp=""
+  local nginx_default_http_v6_listen="" nginx_default_https_v6_listen="" nginx_default_https_block=""
+  local cdn_ipv6_enabled=0
+
+  if [[ -n "${PUBLIC_IPV6:-}" ]] && stack_has_cdn "${IPV6_PROTOCOLS:-0}"; then
+    cdn_ipv6_enabled=1
+    nginx_http_v6_listen="    listen [::]:80;"
+    nginx_default_http_v6_listen="    listen [::]:80 default_server;"
+  fi
+
   nginx_version=$(nginx -v 2>&1 | sed -nE 's#.*nginx/([0-9.]+).*#\1#p' | head -n1 || true)
   if version_ge "$nginx_version" "1.25.1"; then
     nginx_https_listen="    listen ${CDN_PORT:-443} ssl;"
     nginx_http2_directive="    http2 on;"
-    [[ -n "${PUBLIC_IPV6:-}" && "${IPV6_PROTOCOLS:-0}" == *2* ]] && nginx_https_v6_listen="    listen [::]:${CDN_PORT:-443} ssl;"
+    [[ "$cdn_ipv6_enabled" == "1" ]] && nginx_https_v6_listen="    listen [::]:${CDN_PORT:-443} ssl;"
+    [[ "$cdn_ipv6_enabled" == "1" ]] && nginx_default_https_v6_listen="    listen [::]:${CDN_PORT:-443} ssl default_server;"
     info "Nginx ${nginx_version:-unknown}：使用新版 HTTP/2 写法。"
   else
     # Older Nginx does not understand the standalone "http2 on;" directive.
@@ -1170,11 +1421,33 @@ configure_nginx(){
     # use the older syntax and let nginx -t be the final gatekeeper.
     nginx_https_listen="    listen ${CDN_PORT:-443} ssl http2;"
     nginx_http2_directive=""
-    [[ -n "${PUBLIC_IPV6:-}" && "${IPV6_PROTOCOLS:-0}" == *2* ]] && nginx_https_v6_listen="    listen [::]:${CDN_PORT:-443} ssl http2;"
+    [[ "$cdn_ipv6_enabled" == "1" ]] && nginx_https_v6_listen="    listen [::]:${CDN_PORT:-443} ssl http2;"
+    [[ "$cdn_ipv6_enabled" == "1" ]] && nginx_default_https_v6_listen="    listen [::]:${CDN_PORT:-443} ssl default_server;"
     info "Nginx ${nginx_version:-unknown}：使用兼容旧版的 HTTP/2 写法。"
   fi
-  if [[ -n "${PUBLIC_IPV6:-}" && "${IPV6_PROTOCOLS:-0}" == *2* ]]; then
-    nginx_http_v6_listen="    listen [::]:80;"
+
+  # HARDENING: sinkhole unexpected Host/SNI and direct-IP scans before the real
+  # camouflage/server block. On Nginx >= 1.19.4, reject TLS handshakes without
+  # presenting the real certificate. Older Nginx falls back to 444 after TLS.
+  if version_ge "$nginx_version" "1.19.4"; then
+    nginx_default_https_block="server {
+    listen ${CDN_PORT:-443} ssl default_server;
+${nginx_default_https_v6_listen}
+    server_name _;
+    ssl_reject_handshake on;
+}
+"
+  else
+    nginx_default_https_block="server {
+    listen ${CDN_PORT:-443} ssl default_server;
+${nginx_default_https_v6_listen}
+    server_name _;
+    ssl_certificate /etc/letsencrypt/live/${BASE_DOMAIN}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${BASE_DOMAIN}/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    return 444;
+}
+"
   fi
 
   backup_configs
@@ -1182,6 +1455,14 @@ configure_nginx(){
 
   nginx_target_tmp=$(mktemp_file "$(dirname "$NGINX_SITE")/.xray-edge-manager.conf.XXXXXX")
   cat > "$nginx_target_tmp" <<EOF2
+server {
+    listen 80 default_server;
+${nginx_default_http_v6_listen}
+    server_name _;
+    return 444;
+}
+
+${nginx_default_https_block}
 server {
     listen 80;
 ${nginx_http_v6_listen}
@@ -1230,6 +1511,7 @@ EOF2
   [[ -s "$nginx_target_tmp" ]] || die "生成的 Nginx 临时配置为空，已阻断更新。"
   grep -q "server_name ${BASE_DOMAIN};" "$nginx_target_tmp" || die "Nginx 临时配置缺少 server_name，已阻断更新。"
   grep -q "proxy_pass http://127.0.0.1:${XHTTP_CDN_LOCAL_PORT};" "$nginx_target_tmp" || die "Nginx 临时配置缺少 XHTTP proxy_pass，已阻断更新。"
+  grep -q "ssl_reject_handshake on;\|return 444;" "$nginx_target_tmp" || die "Nginx 临时配置缺少默认黑洞，已阻断更新。"
 
   # Nginx cannot safely test a non-included *.tmp site file in the live include tree.
   # Apply the fully-written candidate atomically, then immediately run nginx -t and
@@ -1242,15 +1524,29 @@ EOF2
   fi
   systemctl enable nginx >/dev/null 2>&1 || true
   if ! systemctl reload nginx && ! systemctl restart nginx; then restore_latest_nginx_config || true; die "Nginx reload/restart 失败，已回滚。"; fi
-  log "Nginx / 伪装站 / 订阅路径配置完成。"
+  log "Nginx / 伪装站 / 订阅路径 / 默认黑洞配置完成。"
 }
 
 uri_encode(){
-  local s="$1" out="" i c
-  for ((i=0;i<${#s};i++)); do
-    c=${s:i:1}
-    case "$c" in [a-zA-Z0-9.~_-]) out+="$c" ;; *) printf -v out '%s%%%02X' "$out" "'${c}" ;; esac
-  done
+  # SECURITY FIX: use byte-level hex encoding via xxd to correctly handle
+  # multi-byte UTF-8 characters (e.g. Chinese node names). The old approach
+  # used bash '${c} ASCII trick which only works for single-byte chars.
+  local s="$1" out="" byte hex
+  while IFS= read -r -d '' -n1 byte || [[ -n "$byte" ]]; do
+    case "$byte" in
+      [a-zA-Z0-9.~_-]) out+="$byte" ;;
+      *)
+        # Convert each byte to %XX hex encoding
+        hex=$(printf '%s' "$byte" | xxd -p -c1 | tr -d '\n')
+        local j
+        for ((j=0; j<${#hex}; j+=2)); do
+          out+="%${hex:j:2}"
+        done
+        ;;
+    esac
+  done <<< "$s"
+  # Remove trailing newline percent-encoding added by <<<
+  out="${out%"%0a"}"
   echo "$out"
 }
 
@@ -1490,8 +1786,10 @@ generate_subscription(){
     [[ -n "${PUBLIC_IPV6:-}" && "${IPV6_PROTOCOLS:-0}" == *4* ]] && add_reality_vision_link "v6.${BASE_DOMAIN}" "${NODE_NAME:-node}-v6-REALITY-Vision" "$raw"
   fi
 
-  sed -i '/^$/d' "$raw"
-  base64 -w0 "$raw" > "$b64"
+  # COMPATIBILITY FIX: avoid GNU-specific sed -i and base64 -w0.
+  local raw_cleaned; raw_cleaned=$(mktemp_file "${raw}.clean.XXXXXX")
+  sed '/^$/d' "$raw" > "$raw_cleaned" && mv -f "$raw_cleaned" "$raw"
+  base64 "$raw" | tr -d '\n' > "$b64"
   cp -f "$b64" "$WEB_ROOT/sub/$SUB_TOKEN"
   chmod 755 "$WEB_ROOT" "$WEB_ROOT/sub" 2>/dev/null || true
   chmod 644 "$WEB_ROOT/sub/$SUB_TOKEN" 2>/dev/null || true
@@ -1815,10 +2113,15 @@ download_bestcf_asset(){
   local asset="$1" output="$2" kind="${3:-auto}" url tmp raw
   mkdir -p "$BESTCF_DIR"
 
-  # Safety guard: BestCF downloader must never write outside BESTCF_DIR.
-  case "$output" in
-    "$BESTCF_DIR"/*) ;;
-    *) warn "BestCF 输出路径不安全，已拒绝：$output"; return 1 ;;
+  # SECURITY FIX: use realpath to resolve symlinks and '..' before checking
+  # that the output stays within BESTCF_DIR. The old simple prefix check could
+  # be bypassed with '/../' path components.
+  local resolved_output resolved_dir
+  resolved_dir="$(realpath -m "$BESTCF_DIR" 2>/dev/null || echo "$BESTCF_DIR")"
+  resolved_output="$(realpath -m "$output" 2>/dev/null || echo "$output")"
+  case "$resolved_output" in
+    "$resolved_dir"/*) ;;
+    *) warn "BestCF 输出路径不安全，已拒绝：$output (resolved: $resolved_output)"; return 1 ;;
   esac
 
   tmp="${output}.tmp"
@@ -2065,10 +2368,32 @@ network_status(){
   sysctl net.core.default_qdisc 2>/dev/null || true
 }
 
+backup_sysctl_config(){
+  mkdir -p "$BACKUP_DIR"
+  local ts; ts=$(date +%F-%H%M%S)
+  if [[ -f "$SYSCTL_FILE" ]]; then
+    cp -a "$SYSCTL_FILE" "$BACKUP_DIR/sysctl.$ts.bak" 2>/dev/null || true
+    save_kv "$STATE_FILE" LAST_SYSCTL_BACKUP "$BACKUP_DIR/sysctl.$ts.bak"
+  fi
+}
+
 apply_stable_network_tuning(){
-  cat > "$SYSCTL_FILE" <<'EOF2'
+  local tmp cc available current
+  backup_sysctl_config
+
+  available="$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)"
+  current="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)"
+  cc="bbr"
+  if [[ "$available" != *bbr* ]]; then
+    cc="${current:-cubic}"
+    warn "当前内核未显示支持 BBR：${available:-unknown}，将保持拥塞控制为 $cc。"
+  fi
+
+  mkdir -p "$(dirname "$SYSCTL_FILE")"
+  tmp="$(mktemp_file "${SYSCTL_FILE}.tmp.XXXXXX")"
+  cat > "$tmp" <<EOF2
 net.core.default_qdisc=fq
-net.ipv4.tcp_congestion_control=bbr
+net.ipv4.tcp_congestion_control=$cc
 net.ipv4.tcp_fastopen=3
 net.ipv4.tcp_mtu_probing=1
 net.ipv4.tcp_slow_start_after_idle=0
@@ -2080,8 +2405,25 @@ net.core.wmem_max=67108864
 net.ipv4.tcp_rmem=4096 87380 67108864
 net.ipv4.tcp_wmem=4096 65536 67108864
 EOF2
-  sysctl --system >/dev/null || true
+  chmod 644 "$tmp" 2>/dev/null || true
+  mv -f "$tmp" "$SYSCTL_FILE"
+  sysctl --system >/dev/null || warn "sysctl --system 返回非零；请用菜单 5 查看当前状态。"
   log "已应用稳定型网络优化。"
+}
+
+restore_network_tuning(){
+  load_state
+  local bak="${LAST_SYSCTL_BACKUP:-}"
+  [[ -n "$bak" && -f "$bak" ]] || bak=$(ls -1t "$BACKUP_DIR"/sysctl.*.bak 2>/dev/null | head -n1 || true)
+  if [[ -n "$bak" && -f "$bak" ]]; then
+    install -m 644 "$bak" "$SYSCTL_FILE"
+    sysctl --system >/dev/null || true
+    warn "已恢复 sysctl 优化配置备份：$bak"
+  else
+    rm -f "$SYSCTL_FILE"
+    sysctl --system >/dev/null || true
+    warn "未找到 sysctl 备份，已删除 $SYSCTL_FILE 并重新加载 sysctl。"
+  fi
 }
 
 show_status(){
@@ -2178,7 +2520,7 @@ delete_remote_subscription(){
   local n tmp
   n=$(ask "请输入要删除的编号" "")
   [[ "$n" =~ ^[0-9]+$ ]] || { warn "编号无效。"; return 0; }
-  tmp=$(mktemp_file)
+  tmp=$(mktemp_file "$SUB_DIR/.remote-del.XXXXXX")
   awk -v n="$n" 'NR!=n' "$REMOTES_FILE" > "$tmp"
   mv "$tmp" "$REMOTES_FILE"
   log "已删除编号：$n"
@@ -2199,21 +2541,51 @@ merge_remote_subscriptions(){
   [[ -f "$SUB_DIR/local.raw" ]] || generate_subscription
   touch "$REMOTES_FILE"
   local remote_raw="$SUB_DIR/remote.raw" merged="$SUB_DIR/merged.raw" merged_b64="$SUB_DIR/merged.b64"
-  local name url data
+  local name url fetch_file decoded_file size decoded_size max_bytes
+  max_bytes="${REMOTE_SUB_MAX_BYTES:-2097152}"
   : > "$remote_raw"
+
   while IFS='|' read -r name url; do
     [[ -z "${url:-}" || "$name" =~ ^# ]] && continue
+    case "$url" in
+      http://*|https://*) ;;
+      *) warn "远程订阅 URL 不是 http/https，已跳过：$name"; continue ;;
+    esac
+
     info "拉取远程订阅：$name"
-    data=$(curl -fsSL --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time 30 "$url" 2>/dev/null || true)
-    [[ -z "$data" ]] && { warn "拉取失败：$name"; continue; }
-    if printf '%s' "$data" | base64 -d >> "$remote_raw" 2>/dev/null; then
-      echo >> "$remote_raw"
-    else
-      warn "解码失败：$name"
+    fetch_file="$(mktemp_file "$SUB_DIR/remote-fetch.XXXXXX")"
+    decoded_file="$(mktemp_file "$SUB_DIR/remote-decoded.XXXXXX")"
+
+    if ! curl -fL --retry 2 --retry-delay 1 --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time 30 \
+      --max-filesize "$max_bytes" -o "$fetch_file" "$url" 2>/dev/null; then
+      warn "拉取失败或超过大小限制：$name"
+      continue
     fi
+
+    size=$(wc -c < "$fetch_file" | tr -d '[:space:]')
+    if [[ "$size" -gt "$max_bytes" ]]; then
+      warn "远程订阅过大，已跳过：$name size=${size} limit=${max_bytes}"
+      continue
+    fi
+
+    if ! base64 -d "$fetch_file" > "$decoded_file" 2>/dev/null; then
+      warn "解码失败：$name"
+      continue
+    fi
+
+    decoded_size=$(wc -c < "$decoded_file" | tr -d '[:space:]')
+    if [[ "$decoded_size" -gt "$max_bytes" ]]; then
+      warn "远程订阅解码后过大，已跳过：$name size=${decoded_size} limit=${max_bytes}"
+      continue
+    fi
+
+    sed '/^$/d' "$decoded_file" >> "$remote_raw"
+    echo >> "$remote_raw"
   done < "$REMOTES_FILE"
+
   cat "$SUB_DIR/local.raw" "$remote_raw" 2>/dev/null | sed '/^$/d' | awk '!seen[$0]++' > "$merged"
-  base64 -w0 "$merged" > "$merged_b64"
+  # COMPATIBILITY FIX: avoid GNU-specific base64 -w0.
+  base64 "$merged" | tr -d '\n' > "$merged_b64"
   cp -f "$merged_b64" "$WEB_ROOT/sub/$MERGED_SUB_TOKEN"
   chmod 755 "$WEB_ROOT" "$WEB_ROOT/sub" 2>/dev/null || true
   chmod 644 "$WEB_ROOT/sub/$MERGED_SUB_TOKEN" 2>/dev/null || true
@@ -2426,7 +2798,7 @@ full_uninstall_xem(){
     /etc/systemd/system/xray.service /etc/systemd/system/xray@.service \
     /etc/systemd/system/xray.service.d /etc/systemd/system/xray@.service.d 2>/dev/null || true
 
-  rm -f "$NGINX_SITE" "$LEGACY_NGINX_SITE" 2>/dev/null || true
+  rm -f "$NGINX_SITE" "$LEGACY_NGINX_SITE" "$SYSCTL_FILE" 2>/dev/null || true
   rm -rf "$WEB_ROOT" "$LEGACY_WEB_ROOT" 2>/dev/null || true
 
   if [[ -n "${BASE_DOMAIN:-}" ]] && command -v certbot >/dev/null 2>&1; then
@@ -2482,7 +2854,7 @@ main_menu(){
   load_state
   while true; do
     echo
-    echo "===== Xray Edge Manager v0.0.23 ====="
+    echo "===== Xray Edge Manager v0.0.28 ====="
     echo "1. 首次部署向导，推荐"
     echo "2. 安装/升级基础依赖"
     echo "3. 安装/升级 Xray-core"
@@ -2510,7 +2882,19 @@ main_menu(){
       2) install_deps; pause ;;
       3) install_or_upgrade_xray; pause ;;
       4) update_geodata; if confirm "是否启用每周一凌晨 4-5 点安全自动更新 geodata？" "N"; then enable_geodata_timer; fi; pause ;;
-      5) network_status; if confirm "是否应用稳定型网络优化？" "N"; then apply_stable_network_tuning; fi; pause ;;
+      5)
+        network_status
+        echo "1. 应用稳定型网络优化"
+        echo "2. 恢复/删除本脚本 sysctl 优化配置"
+        echo "0. 返回"
+        nc=$(ask "请选择" "0")
+        case "$nc" in
+          1) apply_stable_network_tuning ;;
+          2) restore_network_tuning ;;
+          *) ;;
+        esac
+        pause
+        ;;
       6) setup_cloudflare; create_dns_records; pause ;;
       7) issue_certificate; pause ;;
       8) asn_report; pause ;;
@@ -2545,7 +2929,12 @@ case "${1:-}" in
     need_root
     acquire_lock
     update_geodata
-    systemctl restart xray 2>/dev/null || true
+    # SAFETY FIX: verify config before restarting, for consistency.
+    if [[ -f "$XRAY_CONFIG" ]] && xray run -test -config "$XRAY_CONFIG" >/dev/null 2>&1; then
+      systemctl restart xray 2>/dev/null || true
+    else
+      warn "Xray 配置测试未通过或配置文件不存在，跳过重启。"
+    fi
     exit 0
     ;;
   --apply-hy2-hopping)
