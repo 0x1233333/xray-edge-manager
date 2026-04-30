@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Xray Edge Manager / Xray Anti-Block Manager
-# v0.0.32-rc6-subscription-merge-fix — subscription merge reachability + origin hardening
+# v0.0.32-rc7-nginx-user-permission-fix — subscription permission + merge reachability
 #
 # Features:
 # - Xray-core only, no Docker, no sing-box
@@ -420,6 +420,82 @@ get_proc_by_port(){
   local proto="$1" port="$2"
   ss -H -lpn "$proto" "sport = :$port" 2>/dev/null | awk '{print $NF}' | head -n1
 }
+
+nginx_conf_user_field(){
+  local field="$1"
+  awk -v f="$field" '
+    $1 == "user" {
+      gsub(";", "", $2)
+      gsub(";", "", $3)
+      if (f == "user") print $2
+      else if (f == "group") print $3
+      exit
+    }
+  ' /etc/nginx/nginx.conf 2>/dev/null || true
+}
+
+detect_nginx_user(){
+  local u
+  u="$(nginx_conf_user_field user)"
+  if [[ -n "$u" ]] && id -u "$u" >/dev/null 2>&1; then
+    echo "$u"
+    return 0
+  fi
+
+  u="$(ps -eo user=,comm= 2>/dev/null | awk '$2 == "nginx" && $1 != "root" {print $1; exit}' || true)"
+  if [[ -n "$u" ]] && id -u "$u" >/dev/null 2>&1; then
+    echo "$u"
+    return 0
+  fi
+
+  if id -u www-data >/dev/null 2>&1; then
+    echo "www-data"
+  elif id -u nginx >/dev/null 2>&1; then
+    echo "nginx"
+  else
+    echo "root"
+  fi
+}
+
+detect_nginx_group(){
+  local g u
+  g="$(nginx_conf_user_field group)"
+  if [[ -n "$g" ]] && getent group "$g" >/dev/null 2>&1; then
+    echo "$g"
+    return 0
+  fi
+
+  u="$(detect_nginx_user)"
+  g="$(id -gn "$u" 2>/dev/null || true)"
+  if [[ -n "$g" ]] && getent group "$g" >/dev/null 2>&1; then
+    echo "$g"
+    return 0
+  fi
+
+  if getent group www-data >/dev/null 2>&1; then
+    echo "www-data"
+  elif getent group nginx >/dev/null 2>&1; then
+    echo "nginx"
+  else
+    echo "root"
+  fi
+}
+
+ensure_web_subscription_permissions(){
+  local ng ngx_user
+  ngx_user="$(detect_nginx_user)"
+  ng="$(detect_nginx_group)"
+  mkdir -p "$WEB_ROOT" "$WEB_ROOT/sub"
+  chmod 755 "$WEB_ROOT" 2>/dev/null || true
+  chmod 750 "$WEB_ROOT/sub" 2>/dev/null || true
+  chown root:"$ng" "$WEB_ROOT/sub" 2>/dev/null || true
+  if find "$WEB_ROOT/sub" -mindepth 1 -maxdepth 1 -type f -print -quit 2>/dev/null | grep -q .; then
+    find "$WEB_ROOT/sub" -mindepth 1 -maxdepth 1 -type f -exec chown root:"$ng" {} + 2>/dev/null || true
+    find "$WEB_ROOT/sub" -mindepth 1 -maxdepth 1 -type f -exec chmod 640 {} + 2>/dev/null || true
+  fi
+  info "订阅目录权限使用 Nginx worker：user=${ngx_user} group=${ng}"
+}
+
 
 install_deps(){
   need_root
@@ -1640,12 +1716,8 @@ configure_nginx(){
   cleanup_legacy_nginx_conf
   disable_nginx_packaged_default_site
   mkdir -p "$WEB_ROOT" "$WEB_ROOT/sub" "$SUB_DIR"
-  chmod 755 "$WEB_ROOT" 2>/dev/null || true
-  chmod 750 "$WEB_ROOT/sub" 2>/dev/null || true
-  chown root:www-data "$WEB_ROOT/sub" 2>/dev/null || true
   touch "$WEB_ROOT/sub/${SUB_TOKEN}"
-  chmod 640 "$WEB_ROOT/sub/${SUB_TOKEN}" 2>/dev/null || true
-  chown root:www-data "$WEB_ROOT/sub/${SUB_TOKEN}" 2>/dev/null || true
+  ensure_web_subscription_permissions
 
   local nginx_http_v6_listen="" nginx_https_v6_listen="" nginx_https_listen="" nginx_http2_directive="" nginx_version="" nginx_target_tmp=""
   local nginx_default_http_v6_listen="" nginx_default_https_v6_listen="" nginx_default_https_block=""
@@ -2088,10 +2160,10 @@ generate_subscription(){
   local raw_cleaned; raw_cleaned=$(mktemp_file "${raw}.clean.XXXXXX")
   sed '/^$/d' "$raw" > "$raw_cleaned" && mv -f "$raw_cleaned" "$raw"
   base64 "$raw" | tr -d '\n' > "$b64"
-  chmod 755 "$WEB_ROOT" 2>/dev/null || true
-  chmod 750 "$WEB_ROOT/sub" 2>/dev/null || true
-  chown root:www-data "$WEB_ROOT/sub" 2>/dev/null || true
-  install -m 640 -o root -g www-data "$b64" "$WEB_ROOT/sub/$SUB_TOKEN"
+  local nginx_group
+  nginx_group="$(detect_nginx_group)"
+  ensure_web_subscription_permissions
+  install -m 640 -o root -g "$nginx_group" "$b64" "$WEB_ROOT/sub/$SUB_TOKEN"
   generate_mihomo_reference
   log "本机 b64 订阅已生成：$b64"
   echo "订阅链接： $(sub_url "$SUB_TOKEN")"
@@ -3184,10 +3256,10 @@ merge_remote_subscriptions(){
   cat "$SUB_DIR/local.raw" "$remote_raw" 2>/dev/null | sed '/^$/d' | awk '!seen[$0]++' > "$merged"
   # COMPATIBILITY FIX: avoid GNU-specific base64 -w0.
   base64 "$merged" | tr -d '\n' > "$merged_b64"
-  chmod 755 "$WEB_ROOT" 2>/dev/null || true
-  chmod 750 "$WEB_ROOT/sub" 2>/dev/null || true
-  chown root:www-data "$WEB_ROOT/sub" 2>/dev/null || true
-  install -m 640 -o root -g www-data "$merged_b64" "$WEB_ROOT/sub/$MERGED_SUB_TOKEN"
+  local nginx_group
+  nginx_group="$(detect_nginx_group)"
+  ensure_web_subscription_permissions
+  install -m 640 -o root -g "$nginx_group" "$merged_b64" "$WEB_ROOT/sub/$MERGED_SUB_TOKEN"
   log "合并订阅已生成：$merged_b64"
   echo "合并订阅链接： $(sub_url "$MERGED_SUB_TOKEN")"
 }
@@ -3461,7 +3533,7 @@ main_menu(){
   load_state
   while true; do
     echo
-    echo "===== Xray Edge Manager v0.0.32-rc6-subscription-merge-fix ====="
+    echo "===== Xray Edge Manager v0.0.32-rc7-nginx-user-permission-fix ====="
     echo "1. 首次部署向导，推荐"
     echo "2. 安装/升级基础依赖"
     echo "3. 安装/升级 Xray-core"
