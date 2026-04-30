@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Xray Edge Manager / Xray Anti-Block Manager
-# v0.0.32-rc7-nginx-user-permission-fix — subscription permission + merge reachability
+# v0.0.32-rc10-permission-hardening — rc9 + web/remotes/credential permission fixes
 #
 # Features:
 # - Xray-core only, no Docker, no sing-box
@@ -21,6 +21,7 @@
 # No personal domains, emails, IPs, or tokens are embedded in this script.
 
 set -Eeuo pipefail
+umask 077
 
 # Global temp cleanup registry. Any temp file/dir registered here will be
 # removed on normal exit or interruption. Missing paths are ignored.
@@ -87,10 +88,10 @@ mkdir -p "$APP_DIR" "$APP_DIR/tmp" "$SUB_DIR" "$BESTCF_DIR" "$BACKUP_DIR" "$DEBU
 # even if the parent directory permissions are more permissive.
 chmod 700 "$APP_DIR" "$APP_DIR/tmp" 2>/dev/null || true
 
-log()  { echo -e "\033[32m[OK]\033[0m $*"; }
-info() { echo -e "\033[36m[INFO]\033[0m $*"; }
-warn() { echo -e "\033[33m[WARN]\033[0m $*"; }
-err()  { echo -e "\033[31m[ERR]\033[0m $*"; }
+log()  { echo -e "\033[32m[OK]\033[0m $*" >&2; }
+info() { echo -e "\033[36m[INFO]\033[0m $*" >&2; }
+warn() { echo -e "\033[33m[WARN]\033[0m $*" >&2; }
+err()  { echo -e "\033[31m[ERR]\033[0m $*" >&2; }
 die()  { err "$*"; exit 1; }
 pause(){ read -r -p "按回车继续..." _ || true; }
 need_root(){ [[ "${EUID:-$(id -u)}" -eq 0 ]] || die "请使用 root 运行。"; }
@@ -251,29 +252,35 @@ load_state(){
 }
 
 save_kv(){
-  local file="$1" key="$2" value="$3" q tmp
+  local file="$1" key="$2" value="$3" tmp
   [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "非法配置键名：$key"
+
+  # SECURITY/HARDENING: state.env is parsed by our strict loader, not sourced.
+  # Keep values single-line and free of control characters / shell metacharacters.
+  # This also prevents accidental capture of colored warn/info output into state
+  # values from corrupting state.env as ANSI-C quoted multi-line strings.
+  if printf '%s' "$value" | LC_ALL=C grep -q '[[:cntrl:]]'; then
+    die "配置值包含控制字符，拒绝写入状态文件：$key"
+  fi
+  case "$value" in
+    *'$('|*'`'*|*';'*|*'&'*|*'|'*|*'<'*|*'>'*)
+      die "配置值包含不安全字符，拒绝写入状态文件：$key"
+      ;;
+  esac
+
   mkdir -p "$(dirname "$file")"
   touch "$file"
   chmod 600 "$file" 2>/dev/null || true
-  printf -v q '%q' "$value"
 
   tmp="$(mktemp_file "${file}.tmp.XXXXXX")"
-  # SECURITY FIX: use exact key match to prevent FOO matching FOOBAR=xxx.
-  # Match only lines where key= starts at position 1 AND the next char after
-  # the key name is '=' (not another alphanumeric/underscore).
-  awk -v k="$key" -v v="$q" '
-    BEGIN { found = 0; pat = k "=" }
-    substr($0, 1, length(pat)) == pat {
-      print k "=" v
-      found = 1
-      next
-    }
-    { print }
-    END {
-      if (!found) print k "=" v
-    }
+  # Remove the existing exact key line via awk, then append the new value using
+  # printf. Do not pass the value through awk -v; awk interprets backslash
+  # escapes such as \E, which can corrupt ANSI/control-containing values.
+  awk -v k="$key" '
+    BEGIN { pat = k "=" }
+    substr($0, 1, length(pat)) != pat { print }
   ' "$file" > "$tmp" || { rm -f "$tmp"; die "写入临时状态文件失败：$tmp"; }
+  printf '%s=%s\n' "$key" "$value" >> "$tmp" || { rm -f "$tmp"; die "追加状态文件失败：$tmp"; }
   chmod 600 "$tmp" 2>/dev/null || true
   mv -f "$tmp" "$file"
 }
@@ -485,8 +492,15 @@ ensure_web_subscription_permissions(){
   local ng ngx_user
   ngx_user="$(detect_nginx_user)"
   ng="$(detect_nginx_group)"
-  mkdir -p "$WEB_ROOT" "$WEB_ROOT/sub"
+
+  # RC10 HARDENING: umask 077 is correct for secrets, but web path parents
+  # must remain searchable by the Nginx worker. If /var/www is first created
+  # by this script, explicitly normalize it to the standard web permission.
+  mkdir -p /var/www "$WEB_ROOT" "$WEB_ROOT/sub"
+  chmod 755 /var/www 2>/dev/null || true
   chmod 755 "$WEB_ROOT" 2>/dev/null || true
+
+  # Keep subscription files non-world-readable. Nginx can read them via group.
   chmod 750 "$WEB_ROOT/sub" 2>/dev/null || true
   chown root:"$ng" "$WEB_ROOT/sub" 2>/dev/null || true
   if find "$WEB_ROOT/sub" -mindepth 1 -maxdepth 1 -type f -print -quit 2>/dev/null | grep -q .; then
@@ -1260,6 +1274,8 @@ issue_certificate(){
   # SECURITY FIX: set restrictive permissions BEFORE writing sensitive content,
   # eliminating the brief window where the file was world-readable.
   # Also use printf instead of unquoted heredoc to avoid $-expansion bugs.
+  # RC10 HARDENING: refuse symlink credential targets before writing secrets.
+  [[ ! -L "$CF_CRED" ]] || die "拒绝写入符号链接凭据文件：$CF_CRED"
   touch "$CF_CRED"
   chmod 600 "$CF_CRED"
   printf '%s\n' "dns_cloudflare_api_token = $CF_API_TOKEN" > "$CF_CRED"
@@ -1667,7 +1683,7 @@ cleanup_legacy_nginx_conf(){
 }
 
 install_random_camouflage(){
-  mkdir -p "$WEB_ROOT"
+  mkdir -p /var/www "$WEB_ROOT"
   local n zip tmp ok=0
   n=$((RANDOM % 9 + 1))
   zip="html${n}.zip"
@@ -1689,7 +1705,7 @@ install_random_camouflage(){
       fi
       shopt -u dotglob nullglob
       # SECURITY: remove any symlinks copied from the zip.
-      find "$WEB_ROOT" -type l -delete 2>/dev/null || true
+      find "$WEB_ROOT" -path "$WEB_ROOT/sub" -prune -o -type l -delete 2>/dev/null || true
       [[ -f "$WEB_ROOT/index.html" ]] || echo '<!doctype html><html><body><h1>Welcome</h1><p>It works.</p></body></html>' > "$WEB_ROOT/index.html"
       log "伪装站模板已安装：${zip}"
       ok=1
@@ -1702,7 +1718,10 @@ install_random_camouflage(){
 EOF2
   fi
   rm -rf "$tmp"
-  chmod -R a+rX "$WEB_ROOT" 2>/dev/null || true
+  # RC10 HARDENING: publish the camouflage site, but never loosen /sub.
+  find "$WEB_ROOT" -path "$WEB_ROOT/sub" -prune -o -type d -exec chmod 755 {} + 2>/dev/null || true
+  find "$WEB_ROOT" -path "$WEB_ROOT/sub/*" -prune -o -type f -exec chmod 644 {} + 2>/dev/null || true
+  ensure_web_subscription_permissions
 }
 
 configure_nginx(){
@@ -3059,8 +3078,15 @@ install_full(){
   log "首次部署流程完成。"
 }
 
-list_remote_subscriptions(){
+ensure_remotes_file(){
+  mkdir -p "$SUB_DIR"
+  [[ ! -L "$REMOTES_FILE" ]] || die "拒绝使用符号链接远程订阅文件：$REMOTES_FILE"
   touch "$REMOTES_FILE"
+  chmod 600 "$REMOTES_FILE" 2>/dev/null || true
+}
+
+list_remote_subscriptions(){
+  ensure_remotes_file
   echo "===== 远程订阅列表 ====="
   if [[ ! -s "$REMOTES_FILE" ]]; then
     warn "暂无远程订阅。"
@@ -3077,13 +3103,13 @@ add_remote_subscription(){
   [[ -n "$name" ]] || name="remote"
   url=$(ask "请输入远程 base64 订阅 URL" "")
   [[ -n "$url" ]] || { warn "URL 为空，取消。"; return 0; }
-  touch "$REMOTES_FILE"
+  ensure_remotes_file
   echo "${name}|${url}" >> "$REMOTES_FILE"
   log "已添加远程订阅：$name"
 }
 
 delete_remote_subscription(){
-  touch "$REMOTES_FILE"
+  ensure_remotes_file
   list_remote_subscriptions
   local n tmp
   n=$(ask "请输入要删除的编号" "")
@@ -3096,6 +3122,7 @@ delete_remote_subscription(){
 
 clear_remote_subscriptions(){
   if confirm "确认清空所有远程订阅？" "N"; then
+    ensure_remotes_file
     : > "$REMOTES_FILE"
     log "已清空远程订阅。"
   fi
@@ -3173,7 +3200,7 @@ merge_remote_subscriptions(){
   load_state
   mkdir -p "$SUB_DIR" "$WEB_ROOT/sub"
   [[ -f "$SUB_DIR/local.raw" ]] || generate_subscription
-  touch "$REMOTES_FILE"
+  ensure_remotes_file
   local remote_raw="$SUB_DIR/remote.raw" merged="$SUB_DIR/merged.raw" merged_b64="$SUB_DIR/merged.b64"
   local name url fetch_file decoded_file size decoded_size max_bytes http_code
   max_bytes="${REMOTE_SUB_MAX_BYTES:-2097152}"
@@ -3533,7 +3560,7 @@ main_menu(){
   load_state
   while true; do
     echo
-    echo "===== Xray Edge Manager v0.0.32-rc7-nginx-user-permission-fix ====="
+    echo "===== Xray Edge Manager v0.0.32-rc8-state-capture-fix ====="
     echo "1. 首次部署向导，推荐"
     echo "2. 安装/升级基础依赖"
     echo "3. 安装/升级 Xray-core"
@@ -3636,5 +3663,6 @@ case "${1:-}" in
     ;;
 esac
 
+need_root
 acquire_lock
 main_menu "$@"
