@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Xray Edge Manager / Xray Anti-Block Manager
-# v0.0.32-rc3-ssrf-redirect-fix — subscription reachability + origin hardening
+# v0.0.32-rc6-subscription-merge-fix — subscription merge reachability + origin hardening
 #
 # Features:
 # - Xray-core only, no Docker, no sing-box
@@ -2103,10 +2103,14 @@ regenerate_subscriptions_after_change(){
     warn "未设置母域名，跳过自动刷新订阅。"
     return 0
   fi
+
+  # Always generate both public files:
+  #   /sub/$SUB_TOKEN         = local-only subscription
+  #   /sub/$MERGED_SUB_TOKEN  = local + remotes; if no remotes exist, it equals local-only
+  # This prevents first-install summaries from printing a merged subscription URL
+  # that does not exist yet and would return 404.
   generate_subscription || { warn "本机订阅自动刷新失败，请稍后手动执行菜单 14 -> 1。"; return 0; }
-  if [[ -s "${REMOTES_FILE:-$SUB_DIR/remotes.conf}" ]]; then
-    merge_remote_subscriptions || warn "合并订阅自动刷新失败，请稍后手动执行菜单 14 -> 8。"
-  fi
+  merge_remote_subscriptions || warn "合并订阅自动刷新失败，请稍后手动执行菜单 14 -> 8。"
 }
 ensure_iptables(){
   command -v iptables >/dev/null 2>&1 && return 0
@@ -2871,22 +2875,39 @@ show_status(){
   echo "===== Listen ====="; ss -tulpen | grep -E ':(443|2053|2083|2087|2096|8443|2443|3443)\b' || true
 }
 
+subscription_web_file_exists(){
+  local token="${1:-}"
+  [[ -n "$token" && -s "$WEB_ROOT/sub/$token" ]]
+}
+
 show_links(){
   load_state
   echo "===== 本机订阅 ====="
   if [[ -n "${BASE_DOMAIN:-}" && -n "${SUB_TOKEN:-}" ]]; then
-    sub_url "$SUB_TOKEN"
+    if subscription_web_file_exists "$SUB_TOKEN"; then
+      sub_url "$SUB_TOKEN"
+    else
+      warn "本机订阅文件尚未发布到 Web 目录；请执行菜单 14 -> 1 或 14 -> 8。"
+      echo "预期链接：$(sub_url "$SUB_TOKEN")"
+    fi
   else
     echo "https://<BASE_DOMAIN>$(sub_port_suffix)/sub/<TOKEN>"
   fi
-  if [[ -n "${MERGED_SUB_TOKEN:-}" ]]; then
-    echo "===== 合并订阅 ====="
-    if [[ -n "${BASE_DOMAIN:-}" ]]; then
+
+  echo "===== 合并订阅 ====="
+  if [[ -n "${BASE_DOMAIN:-}" && -n "${MERGED_SUB_TOKEN:-}" ]]; then
+    if subscription_web_file_exists "$MERGED_SUB_TOKEN"; then
       sub_url "$MERGED_SUB_TOKEN"
     else
-      echo "https://<BASE_DOMAIN>$(sub_port_suffix)/sub/${MERGED_SUB_TOKEN}"
+      warn "合并订阅文件尚未生成；请执行菜单 14 -> 8。"
+      echo "预期链接：$(sub_url "$MERGED_SUB_TOKEN")"
     fi
+  elif [[ -n "${MERGED_SUB_TOKEN:-}" ]]; then
+    echo "https://<BASE_DOMAIN>$(sub_port_suffix)/sub/${MERGED_SUB_TOKEN}"
+  else
+    warn "尚未生成合并订阅 token。"
   fi
+
   echo
   echo "===== local.raw ====="
   [[ -f "$SUB_DIR/local.raw" ]] && cat "$SUB_DIR/local.raw" || warn "尚未生成 local.raw。"
@@ -2927,8 +2948,19 @@ deployment_summary(){
   echo "Xray 运行用户: ${XRAY_USER}"
   echo "Cloudflare 源站限制: ${ENABLE_CF_ORIGIN_FIREWALL:-0}"
   echo "BestCF: ${BESTCF_ENABLED:-0} / ${BESTCF_MODE:-off} / 每类${BESTCF_PER_CATEGORY_LIMIT:-2} / 总上限${BESTCF_TOTAL_LIMIT:-10}"
-  [[ -n "${BASE_DOMAIN:-}" && -n "${SUB_TOKEN:-}" ]] && echo "订阅: $(sub_url "$SUB_TOKEN")" || echo "订阅: 未生成"
-  [[ -n "${MERGED_SUB_TOKEN:-}" ]] && echo "合并订阅: $(sub_url "$MERGED_SUB_TOKEN")"
+  if [[ -n "${BASE_DOMAIN:-}" && -n "${SUB_TOKEN:-}" ]] && subscription_web_file_exists "$SUB_TOKEN"; then
+    echo "订阅: $(sub_url "$SUB_TOKEN")"
+  elif [[ -n "${BASE_DOMAIN:-}" && -n "${SUB_TOKEN:-}" ]]; then
+    echo "订阅: 未发布到 Web 目录（请执行菜单 14 -> 1 或 14 -> 8）"
+  else
+    echo "订阅: 未生成"
+  fi
+
+  if [[ -n "${BASE_DOMAIN:-}" && -n "${MERGED_SUB_TOKEN:-}" ]] && subscription_web_file_exists "$MERGED_SUB_TOKEN"; then
+    echo "合并订阅: $(sub_url "$MERGED_SUB_TOKEN")"
+  elif [[ -n "${BASE_DOMAIN:-}" && -n "${MERGED_SUB_TOKEN:-}" ]]; then
+    echo "合并订阅: 未生成（请执行菜单 14 -> 8）"
+  fi
 }
 
 install_full(){
@@ -2950,7 +2982,7 @@ install_full(){
   configure_hy2_hopping_prompt
   handle_firewall_ports
   restart_services
-  generate_subscription
+  regenerate_subscriptions_after_change
   deployment_summary
   log "首次部署流程完成。"
 }
@@ -3429,7 +3461,7 @@ main_menu(){
   load_state
   while true; do
     echo
-    echo "===== Xray Edge Manager v0.0.32-subscription-path-fix ====="
+    echo "===== Xray Edge Manager v0.0.32-rc6-subscription-merge-fix ====="
     echo "1. 首次部署向导，推荐"
     echo "2. 安装/升级基础依赖"
     echo "3. 安装/升级 Xray-core"
@@ -3534,3 +3566,4 @@ esac
 
 acquire_lock
 main_menu "$@"
+
