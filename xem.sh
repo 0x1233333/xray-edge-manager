@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Xray Edge Manager / Xray Anti-Block Manager
-# v0.0.33-runtime-fixes — preserve subscription path + firewall/DNS/cert hardening
+# v0.0.32-rc7-nginx-user-permission-fix — subscription permission + merge reachability
 #
 # Features:
 # - Xray-core only, no Docker, no sing-box
@@ -75,15 +75,6 @@ BESTCF_RELEASE_API="https://api.github.com/repos/DustinWin/BestCF/releases/tags/
 BESTCF_ASSETS="cmcc-ip.txt cucc-ip.txt ctcc-ip.txt bestcf-ip.txt proxy-ip.txt bestcf-domain.txt"
 CURL_CONNECT_TIMEOUT=5
 CURL_MAX_TIME=20
-XTABLES_WAIT="${XEM_XTABLES_WAIT:-5}"
-
-ipt(){
-  command iptables -w "$XTABLES_WAIT" "$@"
-}
-
-ip6t(){
-  command ip6tables -w "$XTABLES_WAIT" "$@"
-}
 REMOTE_SUB_MAX_BYTES="${XEM_REMOTE_SUB_MAX_BYTES:-2097152}"
 # Sanitize: must be a positive integer >= 1024, otherwise reset to default.
 [[ "$REMOTE_SUB_MAX_BYTES" =~ ^[0-9]+$ ]] && [[ "$REMOTE_SUB_MAX_BYTES" -ge 1024 ]] || REMOTE_SUB_MAX_BYTES=2097152
@@ -395,7 +386,7 @@ detect_public_ips(){
 
 local_ipv4_for_bind(){
   local public_ip="$1" src
-  if [[ -n "$public_ip" ]] && ip -o -4 addr show | awk '{print $4}' | cut -d/ -f1 | grep -Fxq "$public_ip"; then
+  if [[ -n "$public_ip" ]] && ip -4 addr show | grep -qw "$public_ip"; then
     echo "$public_ip"; return 0
   fi
   [[ -n "$public_ip" ]] && warn "公网 IPv4 不在本机网卡上，可能是 NAT 环境：$public_ip"
@@ -411,7 +402,7 @@ local_ipv4_for_bind(){
 
 local_ipv6_for_bind(){
   local public_ip="$1" src
-  if [[ -n "$public_ip" ]] && ip -o -6 addr show scope global | awk '{print $4}' | cut -d/ -f1 | grep -Fxq "$public_ip"; then
+  if [[ -n "$public_ip" ]] && ip -6 addr show scope global | grep -qw "$public_ip"; then
     echo "$public_ip"; return 0
   fi
   [[ -n "$public_ip" ]] && warn "公网 IPv6 不在本机网卡上，可能是 NAT/特殊路由环境：$public_ip"
@@ -429,6 +420,82 @@ get_proc_by_port(){
   local proto="$1" port="$2"
   ss -H -lpn "$proto" "sport = :$port" 2>/dev/null | awk '{print $NF}' | head -n1
 }
+
+nginx_conf_user_field(){
+  local field="$1"
+  awk -v f="$field" '
+    $1 == "user" {
+      gsub(";", "", $2)
+      gsub(";", "", $3)
+      if (f == "user") print $2
+      else if (f == "group") print $3
+      exit
+    }
+  ' /etc/nginx/nginx.conf 2>/dev/null || true
+}
+
+detect_nginx_user(){
+  local u
+  u="$(nginx_conf_user_field user)"
+  if [[ -n "$u" ]] && id -u "$u" >/dev/null 2>&1; then
+    echo "$u"
+    return 0
+  fi
+
+  u="$(ps -eo user=,comm= 2>/dev/null | awk '$2 == "nginx" && $1 != "root" {print $1; exit}' || true)"
+  if [[ -n "$u" ]] && id -u "$u" >/dev/null 2>&1; then
+    echo "$u"
+    return 0
+  fi
+
+  if id -u www-data >/dev/null 2>&1; then
+    echo "www-data"
+  elif id -u nginx >/dev/null 2>&1; then
+    echo "nginx"
+  else
+    echo "root"
+  fi
+}
+
+detect_nginx_group(){
+  local g u
+  g="$(nginx_conf_user_field group)"
+  if [[ -n "$g" ]] && getent group "$g" >/dev/null 2>&1; then
+    echo "$g"
+    return 0
+  fi
+
+  u="$(detect_nginx_user)"
+  g="$(id -gn "$u" 2>/dev/null || true)"
+  if [[ -n "$g" ]] && getent group "$g" >/dev/null 2>&1; then
+    echo "$g"
+    return 0
+  fi
+
+  if getent group www-data >/dev/null 2>&1; then
+    echo "www-data"
+  elif getent group nginx >/dev/null 2>&1; then
+    echo "nginx"
+  else
+    echo "root"
+  fi
+}
+
+ensure_web_subscription_permissions(){
+  local ng ngx_user
+  ngx_user="$(detect_nginx_user)"
+  ng="$(detect_nginx_group)"
+  mkdir -p "$WEB_ROOT" "$WEB_ROOT/sub"
+  chmod 755 "$WEB_ROOT" 2>/dev/null || true
+  chmod 750 "$WEB_ROOT/sub" 2>/dev/null || true
+  chown root:"$ng" "$WEB_ROOT/sub" 2>/dev/null || true
+  if find "$WEB_ROOT/sub" -mindepth 1 -maxdepth 1 -type f -print -quit 2>/dev/null | grep -q .; then
+    find "$WEB_ROOT/sub" -mindepth 1 -maxdepth 1 -type f -exec chown root:"$ng" {} + 2>/dev/null || true
+    find "$WEB_ROOT/sub" -mindepth 1 -maxdepth 1 -type f -exec chmod 640 {} + 2>/dev/null || true
+  fi
+  info "订阅目录权限使用 Nginx worker：user=${ngx_user} group=${ng}"
+}
+
 
 install_deps(){
   need_root
@@ -1137,18 +1204,6 @@ create_dns_records(){
     cf_upsert_record "$BASE_DOMAIN" AAAA "$ip6" true
     if stack_has_direct_protocol "${IPV6_PROTOCOLS:-0}"; then cf_upsert_record "v6.$BASE_DOMAIN" AAAA "$ip6" false; fi
   fi
-
-  # Runtime fix: when a stack no longer has direct protocols, remove its old
-  # direct DNS record to avoid stale v4./v6. exposure after protocol changes.
-  if ! stack_has_direct_protocol "${IPV4_PROTOCOLS:-0}"; then
-    cf_delete_record "v4.$BASE_DOMAIN" A "" force
-  fi
-  if ! stack_has_direct_protocol "${IPV6_PROTOCOLS:-0}"; then
-    cf_delete_record "v6.$BASE_DOMAIN" AAAA "" force
-  fi
-  if [[ -n "$ip4" && -n "$ip6" ]]; then
-    warn "BASE_DOMAIN 作为订阅/伪装站/CDN 公共入口，当前已设置 A + AAAA 双栈回源；v4/v6 直连入口仍由 v4./v6. 子域名单独控制。"
-  fi
   log "DNS 记录处理完成：BASE_DOMAIN 始终用于订阅/伪装站；v4/v6 子域名按直连协议生成。"
 }
 
@@ -1214,17 +1269,13 @@ issue_certificate(){
   [[ -n "$email" ]] && save_kv "$STATE_FILE" CERT_EMAIL "$email"
   if [[ -n "$email" ]]; then
     certbot certonly --dns-cloudflare --dns-cloudflare-credentials "$CF_CRED" \
-      --dns-cloudflare-propagation-seconds 60 \
-      --cert-name "$BASE_DOMAIN" \
-      -d "$BASE_DOMAIN" -d "*.$BASE_DOMAIN" \
-      --agree-tos --non-interactive --keep-until-expiring --email "$email" \
+      --dns-cloudflare-propagation-seconds 60 -d "$BASE_DOMAIN" -d "*.$BASE_DOMAIN" \
+      --agree-tos --non-interactive --email "$email" \
       --deploy-hook "$CERT_DEPLOY_HOOK" || die "证书申请失败。"
   else
     certbot certonly --dns-cloudflare --dns-cloudflare-credentials "$CF_CRED" \
-      --dns-cloudflare-propagation-seconds 60 \
-      --cert-name "$BASE_DOMAIN" \
-      -d "$BASE_DOMAIN" -d "*.$BASE_DOMAIN" \
-      --agree-tos --non-interactive --keep-until-expiring --register-unsafely-without-email \
+      --dns-cloudflare-propagation-seconds 60 -d "$BASE_DOMAIN" -d "*.$BASE_DOMAIN" \
+      --agree-tos --non-interactive --register-unsafely-without-email \
       --deploy-hook "$CERT_DEPLOY_HOOK" || die "证书申请失败。"
   fi
   sync_xray_certificate
@@ -1316,10 +1367,11 @@ backup_configs(){
   [[ -f "$STATE_FILE" ]] && cp -a "$STATE_FILE" "$BACKUP_DIR/state.env.$ts.bak" || true
   # IMPROVEMENT: rotate old backups, keeping only the most recent 10 of each type.
   local pattern count
+  local _bak_files
   for pattern in "config.json.*.bak" "nginx.*.bak" "state.env.*.bak"; do
-    count=$(find "$BACKUP_DIR" -maxdepth 1 -name "$pattern" 2>/dev/null | wc -l)
-    if [[ "$count" -gt 10 ]]; then
-      ls -1t "$BACKUP_DIR"/$pattern 2>/dev/null | tail -n +11 | xargs rm -f -- 2>/dev/null || true
+    mapfile -t _bak_files < <(ls -1t "$BACKUP_DIR"/$pattern 2>/dev/null || true)
+    if [[ "${#_bak_files[@]}" -gt 10 ]]; then
+      rm -f -- "${_bak_files[@]:10}" 2>/dev/null || true
     fi
   done
 }
@@ -1540,7 +1592,8 @@ $(cat "$route_tmp")
   ]}
 }
 EOF2
-  chmod 644 "$xray_target_tmp" 2>/dev/null || true
+  chmod 640 "$xray_target_tmp" 2>/dev/null || true
+  chown root:"$XRAY_GROUP" "$xray_target_tmp" 2>/dev/null || true
   rm -f "$in_tmp" "$out_tmp" "$route_tmp"
 
   # Do not overwrite the live Xray config until the candidate has passed all checks.
@@ -1575,7 +1628,8 @@ EOF2
     err "测试日志已保存：$debug_log"
     die "请优先根据上面的原始报错定位；注意失败配置里含 UUID/REALITY 私钥等敏感信息。"
   fi
-  atomic_move_into_place "$xray_target_tmp" "$XRAY_CONFIG" "644"
+  atomic_move_into_place "$xray_target_tmp" "$XRAY_CONFIG" "640"
+  chown root:"$XRAY_GROUP" "$XRAY_CONFIG" 2>/dev/null || true
   save_kv "$STATE_FILE" V4_XHTTP_REALITY_READY "$v4_xhttp_ready"
   save_kv "$STATE_FILE" V6_XHTTP_REALITY_READY "$v6_xhttp_ready"
   save_kv "$STATE_FILE" V4_HY2_READY "$v4_hy2_ready"
@@ -1593,7 +1647,7 @@ disable_nginx_packaged_default_site(){
   # Debian/Ubuntu nginx packages commonly ship /etc/nginx/sites-enabled/default
   # with "listen 80 default_server". Our generated sinkhole also needs to own
   # the default_server slot; otherwise nginx -t fails with duplicate default.
-  for f in /etc/nginx/sites-enabled/default /etc/nginx/conf.d/default.conf; do
+  for f in /etc/nginx/sites-enabled/default; do
     [[ -e "$f" || -L "$f" ]] || continue
     ts=$(date +%F-%H%M%S)
     backup="$BACKUP_DIR/nginx-packaged-default.$ts.bak"
@@ -1614,30 +1668,34 @@ cleanup_legacy_nginx_conf(){
 
 install_random_camouflage(){
   mkdir -p "$WEB_ROOT"
-  local n zip tmp
+  local n zip tmp ok=0
   n=$((RANDOM % 9 + 1))
   zip="html${n}.zip"
   tmp=$(mktemp_dir "$APP_DIR/tmp/camouflage.XXXXXX")
   info "随机下载伪装站模板：v2ray-agent/fodder/blog/unable/${zip}"
-  if curl -fsSL --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time 60 -o "$tmp/$zip" "$FODDER_BASE_URL/$zip" && unzip -q "$tmp/$zip" -d "$tmp/site"; then
-    # Runtime fix: never delete the public subscription directory while refreshing camouflage content.
-    # Also strip symlinks and special files from the downloaded template before copying.
-    find "$tmp/site" -type l -delete 2>/dev/null || true
-    find "$tmp/site" \( -type b -o -type c -o -type p -o -type s \) -delete 2>/dev/null || true
-    find "$WEB_ROOT" -mindepth 1 -maxdepth 1 ! -name sub -exec rm -rf -- {} +
-    mkdir -p "$WEB_ROOT/sub"
-    chmod 755 "$WEB_ROOT" "$WEB_ROOT/sub" 2>/dev/null || true
-    shopt -s dotglob nullglob
-    local entries=("$tmp/site"/*)
-    if [[ ${#entries[@]} -eq 1 && -d "${entries[0]}" ]]; then
-      cp -a "${entries[0]}"/* "$WEB_ROOT"/
-    else
-      cp -a "$tmp/site"/* "$WEB_ROOT"/
+  if curl -fsSL --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time 60 -o "$tmp/$zip" "$FODDER_BASE_URL/$zip" 2>/dev/null; then
+    # SECURITY: reject zip entries with absolute paths or path traversal.
+    if unzip -Z1 "$tmp/$zip" 2>/dev/null | grep -qE '(^/|(^|/)\.\.(/|$))'; then
+      warn "伪装站 zip 包含危险路径，已拒绝解压：${zip}"
+    elif unzip -q "$tmp/$zip" -d "$tmp/site" 2>/dev/null; then
+      # SECURITY: preserve /sub to avoid breaking live subscription links.
+      find "$WEB_ROOT" -mindepth 1 -maxdepth 1 ! -name sub -exec rm -rf -- {} +
+      shopt -s dotglob nullglob
+      local entries=("$tmp/site"/*)
+      if [[ ${#entries[@]} -eq 1 && -d "${entries[0]}" ]]; then
+        cp -a "${entries[0]}"/* "$WEB_ROOT"/
+      else
+        cp -a "$tmp/site"/* "$WEB_ROOT"/
+      fi
+      shopt -u dotglob nullglob
+      # SECURITY: remove any symlinks copied from the zip.
+      find "$WEB_ROOT" -type l -delete 2>/dev/null || true
+      [[ -f "$WEB_ROOT/index.html" ]] || echo '<!doctype html><html><body><h1>Welcome</h1><p>It works.</p></body></html>' > "$WEB_ROOT/index.html"
+      log "伪装站模板已安装：${zip}"
+      ok=1
     fi
-    shopt -u dotglob nullglob
-    [[ -f "$WEB_ROOT/index.html" ]] || echo '<!doctype html><html><body><h1>Welcome</h1><p>It works.</p></body></html>' > "$WEB_ROOT/index.html"
-    log "伪装站模板已安装：${zip}"
-  else
+  fi
+  if [[ "$ok" -eq 0 ]]; then
     warn "伪装站模板下载或解压失败，使用内置默认页面。"
     cat > "$WEB_ROOT/index.html" <<'EOF2'
 <!doctype html><html><head><meta charset="utf-8"><title>Welcome</title></head><body><h1>Welcome</h1><p>It works.</p></body></html>
@@ -1658,9 +1716,8 @@ configure_nginx(){
   cleanup_legacy_nginx_conf
   disable_nginx_packaged_default_site
   mkdir -p "$WEB_ROOT" "$WEB_ROOT/sub" "$SUB_DIR"
-  chmod 755 "$WEB_ROOT" "$WEB_ROOT/sub" 2>/dev/null || true
   touch "$WEB_ROOT/sub/${SUB_TOKEN}"
-  chmod 644 "$WEB_ROOT/sub/${SUB_TOKEN}" 2>/dev/null || true
+  ensure_web_subscription_permissions
 
   local nginx_http_v6_listen="" nginx_https_v6_listen="" nginx_https_listen="" nginx_http2_directive="" nginx_version="" nginx_target_tmp=""
   local nginx_default_http_v6_listen="" nginx_default_https_v6_listen="" nginx_default_https_block=""
@@ -1798,11 +1855,11 @@ ${xhttp_cdn_location}
 }
 EOF2
   [[ -s "$nginx_target_tmp" ]] || die "生成的 Nginx 临时配置为空，已阻断更新。"
-  grep -q "server_name ${BASE_DOMAIN};" "$nginx_target_tmp" || die "Nginx 临时配置缺少 server_name，已阻断更新。"
+  grep -qF "server_name ${BASE_DOMAIN};" "$nginx_target_tmp" || die "Nginx 临时配置缺少 server_name，已阻断更新。"
   if protocol_enabled 2 || protocol_enabled 5; then
-    grep -q "proxy_pass http://127.0.0.1:${XHTTP_CDN_LOCAL_PORT};" "$nginx_target_tmp" || die "Nginx 临时配置缺少 XHTTP proxy_pass，已阻断更新。"
+    grep -qF "proxy_pass http://127.0.0.1:${XHTTP_CDN_LOCAL_PORT};" "$nginx_target_tmp" || die "Nginx 临时配置缺少 XHTTP proxy_pass，已阻断更新。"
   fi
-  grep -q "ssl_reject_handshake on;\|return 444;" "$nginx_target_tmp" || die "Nginx 临时配置缺少默认黑洞，已阻断更新。"
+  grep -qE "ssl_reject_handshake on;|return 444;" "$nginx_target_tmp" || die "Nginx 临时配置缺少默认黑洞，已阻断更新。"
 
   # Nginx cannot safely test a non-included *.tmp site file in the live include tree.
   # Apply the fully-written candidate atomically, then immediately run nginx -t and
@@ -2046,6 +2103,7 @@ ensure_bestcf_data_if_needed(){
   # On every subscription generation, try to fetch the newest remote BestCF data.
   # If upstream data is unavailable, do not use any hardcoded third-party fallback;
   # protocol 5 will fall back to the user's own BASE_DOMAIN CDN entry.
+  # 协议5必须每次刷新BestCF；协议2只有用户显式开启BESTCF_ENABLED才刷新。
   if ! protocol_enabled 5 && [[ "${BESTCF_ENABLED:-0}" != "1" ]]; then
     return 0
   fi
@@ -2102,9 +2160,10 @@ generate_subscription(){
   local raw_cleaned; raw_cleaned=$(mktemp_file "${raw}.clean.XXXXXX")
   sed '/^$/d' "$raw" > "$raw_cleaned" && mv -f "$raw_cleaned" "$raw"
   base64 "$raw" | tr -d '\n' > "$b64"
-  cp -f "$b64" "$WEB_ROOT/sub/$SUB_TOKEN"
-  chmod 755 "$WEB_ROOT" "$WEB_ROOT/sub" 2>/dev/null || true
-  chmod 644 "$WEB_ROOT/sub/$SUB_TOKEN" 2>/dev/null || true
+  local nginx_group
+  nginx_group="$(detect_nginx_group)"
+  ensure_web_subscription_permissions
+  install -m 640 -o root -g "$nginx_group" "$b64" "$WEB_ROOT/sub/$SUB_TOKEN"
   generate_mihomo_reference
   log "本机 b64 订阅已生成：$b64"
   echo "订阅链接： $(sub_url "$SUB_TOKEN")"
@@ -2116,10 +2175,14 @@ regenerate_subscriptions_after_change(){
     warn "未设置母域名，跳过自动刷新订阅。"
     return 0
   fi
+
+  # Always generate both public files:
+  #   /sub/$SUB_TOKEN         = local-only subscription
+  #   /sub/$MERGED_SUB_TOKEN  = local + remotes; if no remotes exist, it equals local-only
+  # This prevents first-install summaries from printing a merged subscription URL
+  # that does not exist yet and would return 404.
   generate_subscription || { warn "本机订阅自动刷新失败，请稍后手动执行菜单 14 -> 1。"; return 0; }
-  if [[ -s "${REMOTES_FILE:-$SUB_DIR/remotes.conf}" ]]; then
-    merge_remote_subscriptions || warn "合并订阅自动刷新失败，请稍后手动执行菜单 14 -> 8。"
-  fi
+  merge_remote_subscriptions || warn "合并订阅自动刷新失败，请稍后手动执行菜单 14 -> 8。"
 }
 ensure_iptables(){
   command -v iptables >/dev/null 2>&1 && return 0
@@ -2160,6 +2223,7 @@ refresh_udp_conntrack_for_hy2(){
 
 hy2_range_valid(){
   local range="$1" start end
+  [[ -z "$range" ]] && return 1
   start="${range%%:*}"; end="${range##*:}"
   [[ "$start" =~ ^[0-9]+$ && "$end" =~ ^[0-9]+$ && "$start" -ge 1 && "$end" -le 65535 && "$start" -le "$end" ]]
 }
@@ -2171,10 +2235,10 @@ remove_hy2_nat_range(){
   valid_port "$to_port" || { warn "跳过无效 HY2 目标端口：$to_port"; return 0; }
   start="${range%%:*}"; end="${range##*:}"
   if command -v iptables >/dev/null 2>&1; then
-    while ipt -t nat -D PREROUTING -p udp --dport "$start:$end" -j REDIRECT --to-ports "$to_port" 2>/dev/null; do removed=1; done
+    while iptables -t nat -D PREROUTING -p udp --dport "$start:$end" -j REDIRECT --to-ports "$to_port" 2>/dev/null; do removed=1; done
   fi
   if command -v ip6tables >/dev/null 2>&1; then
-    while ip6t -t nat -D PREROUTING -p udp --dport "$start:$end" -j REDIRECT --to-ports "$to_port" 2>/dev/null; do removed=1; done
+    while ip6tables -t nat -D PREROUTING -p udp --dport "$start:$end" -j REDIRECT --to-ports "$to_port" 2>/dev/null; do removed=1; done
   fi
   [[ "$removed" == "1" ]] && info "已清理 HY2 历史 NAT 规则：UDP $start-$end -> $to_port" || true
 }
@@ -2206,9 +2270,9 @@ enable_hy2_hopping(){
   start="${range%%:*}"; end="${range##*:}"
   info "设置 HY2 UDP 端口跳跃：$start-$end -> $to_port"
   remove_hy2_nat_range "$range" "$to_port"
-  ipt -t nat -A PREROUTING -p udp --dport "$start:$end" -j REDIRECT --to-ports "$to_port" || die "iptables 端口跳跃规则添加失败。"
+  iptables -t nat -A PREROUTING -p udp --dport "$start:$end" -j REDIRECT --to-ports "$to_port" || die "iptables 端口跳跃规则添加失败。"
   if command -v ip6tables >/dev/null 2>&1; then
-    ip6t -t nat -A PREROUTING -p udp --dport "$start:$end" -j REDIRECT --to-ports "$to_port" 2>/dev/null || warn "ip6tables 规则添加失败，IPv6 跳跃可能不可用。"
+    ip6tables -t nat -A PREROUTING -p udp --dport "$start:$end" -j REDIRECT --to-ports "$to_port" 2>/dev/null || warn "ip6tables 规则添加失败，IPv6 跳跃可能不可用。"
   fi
   refresh_udp_conntrack_for_hy2 "$start" "$end" "$to_port"
   if command -v netfilter-persistent >/dev/null 2>&1; then
@@ -2291,14 +2355,13 @@ fetch_cf_ip_list(){
 }
 
 remove_cf_origin_firewall_rules_one(){
-  local tool="$1" p runner
+  local tool="$1" p
   command -v "$tool" >/dev/null 2>&1 || return 0
-  if [[ "$tool" == "iptables" ]]; then runner=ipt; else runner=ip6t; fi
   for p in 80 $CF_HTTPS_PORTS; do
-    while "$runner" -D INPUT -p tcp --dport "$p" -j "$CF_ORIGIN_CHAIN" 2>/dev/null; do :; done
+    while "$tool" -D INPUT -p tcp --dport "$p" -j "$CF_ORIGIN_CHAIN" 2>/dev/null; do :; done
   done
-  "$runner" -F "$CF_ORIGIN_CHAIN" 2>/dev/null || true
-  "$runner" -X "$CF_ORIGIN_CHAIN" 2>/dev/null || true
+  "$tool" -F "$CF_ORIGIN_CHAIN" 2>/dev/null || true
+  "$tool" -X "$CF_ORIGIN_CHAIN" 2>/dev/null || true
 }
 
 remove_cf_origin_firewall_rules(){
@@ -2307,18 +2370,17 @@ remove_cf_origin_firewall_rules(){
 }
 
 apply_cf_origin_firewall_one(){
-  local tool="$1" ip_file="$2" port="$3" cidr runner
+  local tool="$1" ip_file="$2" port="$3" cidr
   command -v "$tool" >/dev/null 2>&1 || return 0
-  if [[ "$tool" == "iptables" ]]; then runner=ipt; else runner=ip6t; fi
-  "$runner" -N "$CF_ORIGIN_CHAIN" 2>/dev/null || true
-  "$runner" -F "$CF_ORIGIN_CHAIN"
+  "$tool" -N "$CF_ORIGIN_CHAIN" 2>/dev/null || true
+  "$tool" -F "$CF_ORIGIN_CHAIN"
   while IFS= read -r cidr; do
     [[ -n "$cidr" ]] || continue
-    "$runner" -A "$CF_ORIGIN_CHAIN" -s "$cidr" -j ACCEPT || true
+    "$tool" -A "$CF_ORIGIN_CHAIN" -s "$cidr" -j ACCEPT || true
   done < "$ip_file"
-  "$runner" -A "$CF_ORIGIN_CHAIN" -j DROP
-  "$runner" -I INPUT -p tcp --dport 80 -j "$CF_ORIGIN_CHAIN"
-  [[ "$port" != "80" ]] && "$runner" -I INPUT -p tcp --dport "$port" -j "$CF_ORIGIN_CHAIN"
+  "$tool" -A "$CF_ORIGIN_CHAIN" -j DROP
+  "$tool" -I INPUT -p tcp --dport 80 -j "$CF_ORIGIN_CHAIN"
+  [[ "$port" != "80" ]] && "$tool" -I INPUT -p tcp --dport "$port" -j "$CF_ORIGIN_CHAIN"
 }
 
 apply_cf_origin_firewall(){
@@ -2389,32 +2451,22 @@ configure_cf_origin_firewall_prompt(){
 handle_firewall_ports(){
   load_state
   local tcp_ports=() udp_ports=()
-  local hy2_hop_ufw="" hy2_hop_firewalld=""
-
   tcp_ports+=("${CDN_PORT:-443}")
   [[ "${PROTOCOLS:-0}" == *1* ]] && tcp_ports+=("${XHTTP_REALITY_PORT:-2443}")
   [[ "${PROTOCOLS:-0}" == *4* ]] && tcp_ports+=("${REALITY_VISION_PORT:-3443}")
   [[ "${PROTOCOLS:-0}" == *3* ]] && udp_ports+=("${HY2_PORT:-443}")
-
-  if [[ -n "${HY2_HOP_RANGE:-}" ]]; then
-    hy2_hop_ufw="${HY2_HOP_RANGE}"             # ufw expects 20000:20100
-    hy2_hop_firewalld="${HY2_HOP_RANGE/:/-}"  # firewalld expects 20000-20100
-  fi
-
+  [[ -n "${HY2_HOP_RANGE:-}" ]] && udp_ports+=("${HY2_HOP_RANGE/:/-}")
   if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi active; then
     for p in "${tcp_ports[@]}"; do ufw allow "${p}/tcp" || true; done
     for p in "${udp_ports[@]}"; do ufw allow "${p}/udp" || true; done
-    [[ -n "$hy2_hop_ufw" ]] && ufw allow "${hy2_hop_ufw}/udp" || true
   elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
     for p in "${tcp_ports[@]}"; do firewall-cmd --permanent --add-port="${p}/tcp" || true; done
     for p in "${udp_ports[@]}"; do firewall-cmd --permanent --add-port="${p}/udp" || true; done
-    [[ -n "$hy2_hop_firewalld" ]] && firewall-cmd --permanent --add-port="${hy2_hop_firewalld}/udp" || true
     firewall-cmd --reload || true
   else
     warn "未检测到已启用的 ufw/firewalld，本脚本不主动安装或启用防火墙。"
   fi
-
-  echo "请确认云厂商安全组放行：TCP ${tcp_ports[*]:-无} / UDP ${udp_ports[*]:-无}${hy2_hop_firewalld:+ / HY2跳跃UDP $hy2_hop_firewalld}"
+  echo "请确认云厂商安全组放行：TCP ${tcp_ports[*]:-无} / UDP ${udp_ports[*]:-无}"
   configure_cf_origin_firewall_prompt
 }
 
@@ -2589,6 +2641,7 @@ download_bestcf_asset(){
 
   if ! curl -fL --retry 3 --retry-delay 2 \
     --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time "$CURL_MAX_TIME" \
+    --max-filesize 524288 \
     -A "xray-edge-manager" "$url" -o "$raw" 2>/dev/null; then
     warn "下载失败：$asset"
     rm -f "$raw" "$tmp"
@@ -2649,6 +2702,10 @@ fetch_bestcf_all(){
     warn "BestCF 远端数据不可用，已清空本地 BestCF 缓存。本次订阅会退回普通母域名 CDN Entry。"
   else
     log "BestCF 已使用本轮远端最新数据刷新。"
+  fi
+  # Warn if domain mode requires bestcf-domain.txt but it is missing.
+  if [[ "${BESTCF_ENABLED:-0}" == "1" && "${BESTCF_MODE:-off}" == "domain" ]] && [[ ! -s "$BESTCF_DIR/bestcf-domain.txt" ]]; then
+    warn "当前为 domain 模式，但 bestcf-domain.txt 不可用，将退回母域名 CDN Entry。"
   fi
 
   show_bestcf_count
@@ -2890,22 +2947,39 @@ show_status(){
   echo "===== Listen ====="; ss -tulpen | grep -E ':(443|2053|2083|2087|2096|8443|2443|3443)\b' || true
 }
 
+subscription_web_file_exists(){
+  local token="${1:-}"
+  [[ -n "$token" && -s "$WEB_ROOT/sub/$token" ]]
+}
+
 show_links(){
   load_state
   echo "===== 本机订阅 ====="
   if [[ -n "${BASE_DOMAIN:-}" && -n "${SUB_TOKEN:-}" ]]; then
-    sub_url "$SUB_TOKEN"
+    if subscription_web_file_exists "$SUB_TOKEN"; then
+      sub_url "$SUB_TOKEN"
+    else
+      warn "本机订阅文件尚未发布到 Web 目录；请执行菜单 14 -> 1 或 14 -> 8。"
+      echo "预期链接：$(sub_url "$SUB_TOKEN")"
+    fi
   else
     echo "https://<BASE_DOMAIN>$(sub_port_suffix)/sub/<TOKEN>"
   fi
-  if [[ -n "${MERGED_SUB_TOKEN:-}" ]]; then
-    echo "===== 合并订阅 ====="
-    if [[ -n "${BASE_DOMAIN:-}" ]]; then
+
+  echo "===== 合并订阅 ====="
+  if [[ -n "${BASE_DOMAIN:-}" && -n "${MERGED_SUB_TOKEN:-}" ]]; then
+    if subscription_web_file_exists "$MERGED_SUB_TOKEN"; then
       sub_url "$MERGED_SUB_TOKEN"
     else
-      echo "https://<BASE_DOMAIN>$(sub_port_suffix)/sub/${MERGED_SUB_TOKEN}"
+      warn "合并订阅文件尚未生成；请执行菜单 14 -> 8。"
+      echo "预期链接：$(sub_url "$MERGED_SUB_TOKEN")"
     fi
+  elif [[ -n "${MERGED_SUB_TOKEN:-}" ]]; then
+    echo "https://<BASE_DOMAIN>$(sub_port_suffix)/sub/${MERGED_SUB_TOKEN}"
+  else
+    warn "尚未生成合并订阅 token。"
   fi
+
   echo
   echo "===== local.raw ====="
   [[ -f "$SUB_DIR/local.raw" ]] && cat "$SUB_DIR/local.raw" || warn "尚未生成 local.raw。"
@@ -2946,8 +3020,19 @@ deployment_summary(){
   echo "Xray 运行用户: ${XRAY_USER}"
   echo "Cloudflare 源站限制: ${ENABLE_CF_ORIGIN_FIREWALL:-0}"
   echo "BestCF: ${BESTCF_ENABLED:-0} / ${BESTCF_MODE:-off} / 每类${BESTCF_PER_CATEGORY_LIMIT:-2} / 总上限${BESTCF_TOTAL_LIMIT:-10}"
-  [[ -n "${BASE_DOMAIN:-}" && -n "${SUB_TOKEN:-}" ]] && echo "订阅: $(sub_url "$SUB_TOKEN")" || echo "订阅: 未生成"
-  [[ -n "${MERGED_SUB_TOKEN:-}" ]] && echo "合并订阅: $(sub_url "$MERGED_SUB_TOKEN")"
+  if [[ -n "${BASE_DOMAIN:-}" && -n "${SUB_TOKEN:-}" ]] && subscription_web_file_exists "$SUB_TOKEN"; then
+    echo "订阅: $(sub_url "$SUB_TOKEN")"
+  elif [[ -n "${BASE_DOMAIN:-}" && -n "${SUB_TOKEN:-}" ]]; then
+    echo "订阅: 未发布到 Web 目录（请执行菜单 14 -> 1 或 14 -> 8）"
+  else
+    echo "订阅: 未生成"
+  fi
+
+  if [[ -n "${BASE_DOMAIN:-}" && -n "${MERGED_SUB_TOKEN:-}" ]] && subscription_web_file_exists "$MERGED_SUB_TOKEN"; then
+    echo "合并订阅: $(sub_url "$MERGED_SUB_TOKEN")"
+  elif [[ -n "${BASE_DOMAIN:-}" && -n "${MERGED_SUB_TOKEN:-}" ]]; then
+    echo "合并订阅: 未生成（请执行菜单 14 -> 8）"
+  fi
 }
 
 install_full(){
@@ -2969,7 +3054,7 @@ install_full(){
   configure_hy2_hopping_prompt
   handle_firewall_ports
   restart_services
-  generate_subscription
+  regenerate_subscriptions_after_change
   deployment_summary
   log "首次部署流程完成。"
 }
@@ -3016,6 +3101,72 @@ clear_remote_subscriptions(){
   fi
 }
 
+# SECURITY: extract hostname from http(s) URL for private-address validation.
+extract_url_host(){
+  local url="$1"
+  url="${url#http://}"; url="${url#https://}"
+  url="${url%%/*}"
+  # strip optional port
+  local host
+  if [[ "$url" == \[*\]* ]]; then
+    host="${url#[}"; host="${host%%]*}"
+  else
+    host="${url%:*}"
+    # if no colon at all (no port), host == url
+    [[ "$url" == *:* ]] || host="$url"
+  fi
+  printf '%s' "$host"
+}
+
+# SECURITY: return 0 (true) if the host is a private/loopback/reserved address.
+is_private_host(){
+  local h="${1,,}"  # normalise to lowercase for IPv6/host comparisons
+  case "$h" in
+    localhost|localhost.*|::1|0.0.0.0) return 0 ;;
+    127.*|10.*) return 0 ;;
+    192.168.*) return 0 ;;
+    172.1[6-9].*|172.2[0-9].*|172.3[01].*) return 0 ;;
+    169.254.*) return 0 ;;
+    # CGNAT 100.64/10
+    100.6[4-9].*|100.[7-9][0-9].*|100.1[01][0-9].*|100.12[0-7].*) return 0 ;;
+    198.18.*|198.19.*) return 0 ;;
+    0.*) return 0 ;;
+    # Multicast / reserved
+    22[4-9].*|23[0-9].*|24[0-9].*|25[0-5].*) return 0 ;;
+    # IPv4-mapped IPv6 (::ffff:x.x.x.x)
+    ::ffff:127.*|::ffff:10.*|::ffff:192.168.*) return 0 ;;
+    ::ffff:172.1[6-9].*|::ffff:172.2[0-9].*|::ffff:172.3[01].*) return 0 ;;
+    ::ffff:169.254.*) return 0 ;;
+    ::ffff:100.6[4-9].*|::ffff:100.[7-9][0-9].*|::ffff:100.1[01][0-9].*|::ffff:100.12[0-7].*) return 0 ;;
+    ::ffff:198.18.*|::ffff:198.19.*) return 0 ;;
+    ::ffff:0.*) return 0 ;;
+    ::ffff:22[4-9].*|::ffff:23[0-9].*|::ffff:24[0-9].*|::ffff:25[0-5].*) return 0 ;;
+    # IPv6 ULA / link-local. Match only IPv6-looking literals, not hostnames
+    # such as fc-example.com or fdcdn.example.com.
+    fc[0-9a-f]*:*|fd[0-9a-f]*:*|fe80:*) return 0 ;;
+  esac
+  return 1
+}
+
+# SECURITY: resolve hostname via getent and check all returned IPs.
+# Returns 1 (reject) if any resolved IP is private; 0 if safe.
+resolve_and_check_ssrf(){
+  local hostname="$1"
+  # Bare IP — check directly.
+  if [[ "$hostname" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ || "$hostname" =~ ^[0-9A-Fa-f:]+$ ]]; then
+    is_private_host "$hostname" && return 1
+    return 0
+  fi
+  if command -v getent >/dev/null 2>&1; then
+    local ip
+    while IFS= read -r ip; do
+      [[ -z "$ip" ]] && continue
+      if is_private_host "$ip"; then return 1; fi
+    done < <(getent ahosts "$hostname" 2>/dev/null | awk '!seen[$1]++{print $1}')
+  fi
+  return 0
+}
+
 merge_remote_subscriptions(){
   load_state
   generate_keys_if_needed
@@ -3024,7 +3175,7 @@ merge_remote_subscriptions(){
   [[ -f "$SUB_DIR/local.raw" ]] || generate_subscription
   touch "$REMOTES_FILE"
   local remote_raw="$SUB_DIR/remote.raw" merged="$SUB_DIR/merged.raw" merged_b64="$SUB_DIR/merged.b64"
-  local name url fetch_file decoded_file size decoded_size max_bytes
+  local name url fetch_file decoded_file size decoded_size max_bytes http_code
   max_bytes="${REMOTE_SUB_MAX_BYTES:-2097152}"
   : > "$remote_raw"
 
@@ -3035,13 +3186,49 @@ merge_remote_subscriptions(){
       *) warn "远程订阅 URL 不是 http/https，已跳过：$name"; continue ;;
     esac
 
+    # SECURITY: reject userinfo in URL authority (e.g. http://x@127.0.0.1/).
+    # Only inspect the authority segment, so an @ in the path is not misclassified.
+    local _authority
+    _authority="${url#http://}"; _authority="${_authority#https://}"; _authority="${_authority%%/*}"
+    if [[ "$_authority" == *@* ]]; then
+      warn "远程订阅 URL 包含 userinfo (@)，已拒绝：$name"
+      continue
+    fi
+
+    # SECURITY: reject private/loopback targets (SSRF protection)
+    if [[ ${#url} -gt 2048 ]]; then
+      warn "远程订阅 URL 过长，已跳过：$name"
+      continue
+    fi
+    local _rhost; _rhost=$(extract_url_host "$url")
+    if is_private_host "$_rhost"; then
+      warn "远程订阅 URL 指向私有地址（字面量），已拒绝：$name ($_rhost)"
+      continue
+    fi
+    if ! resolve_and_check_ssrf "$_rhost"; then
+      warn "远程订阅 URL 域名解析到私有地址，已拒绝：$name ($_rhost)"
+      continue
+    fi
+
     info "拉取远程订阅：$name"
     fetch_file="$(mktemp_file "$SUB_DIR/remote-fetch.XXXXXX")"
     decoded_file="$(mktemp_file "$SUB_DIR/remote-decoded.XXXXXX")"
 
-    if ! curl -fL --retry 2 --retry-delay 1 --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time 30 \
-      --max-filesize "$max_bytes" -o "$fetch_file" "$url" 2>/dev/null; then
+    # SECURITY: do not follow redirects for user-controlled remote subscriptions.
+    # --proto/--proto-redir still restrict schemes, but --max-redirs 0 and no -L
+    # prevent HTTP(S) redirects from bypassing the SSRF host checks above.
+    if ! http_code=$(curl -fsS \
+      --max-redirs 0 \
+      --proto '=http,https' --proto-redir '=http,https' \
+      --retry 2 --retry-delay 1 \
+      --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time 30 \
+      --max-filesize "$max_bytes" \
+      -w '%{http_code}' -o "$fetch_file" "$url" 2>/dev/null); then
       warn "拉取失败或超过大小限制：$name"
+      continue
+    fi
+    if [[ ! "$http_code" =~ ^2[0-9][0-9]$ ]]; then
+      warn "远程订阅返回非 2xx 或发生重定向，已跳过：$name http=$http_code"
       continue
     fi
 
@@ -3069,9 +3256,10 @@ merge_remote_subscriptions(){
   cat "$SUB_DIR/local.raw" "$remote_raw" 2>/dev/null | sed '/^$/d' | awk '!seen[$0]++' > "$merged"
   # COMPATIBILITY FIX: avoid GNU-specific base64 -w0.
   base64 "$merged" | tr -d '\n' > "$merged_b64"
-  cp -f "$merged_b64" "$WEB_ROOT/sub/$MERGED_SUB_TOKEN"
-  chmod 755 "$WEB_ROOT" "$WEB_ROOT/sub" 2>/dev/null || true
-  chmod 644 "$WEB_ROOT/sub/$MERGED_SUB_TOKEN" 2>/dev/null || true
+  local nginx_group
+  nginx_group="$(detect_nginx_group)"
+  ensure_web_subscription_permissions
+  install -m 640 -o root -g "$nginx_group" "$merged_b64" "$WEB_ROOT/sub/$MERGED_SUB_TOKEN"
   log "合并订阅已生成：$merged_b64"
   echo "合并订阅链接： $(sub_url "$MERGED_SUB_TOKEN")"
 }
@@ -3345,7 +3533,7 @@ main_menu(){
   load_state
   while true; do
     echo
-    echo "===== Xray Edge Manager v0.0.33-runtime-fixes ====="
+    echo "===== Xray Edge Manager v0.0.32-rc7-nginx-user-permission-fix ====="
     echo "1. 首次部署向导，推荐"
     echo "2. 安装/升级基础依赖"
     echo "3. 安装/升级 Xray-core"
@@ -3390,7 +3578,7 @@ main_menu(){
       7) issue_certificate; pause ;;
       8) asn_report; pause ;;
       9) asn_report; select_ip_stack_strategy; select_protocols; create_dns_records; choose_reality_target; generate_xray_config; configure_nginx; regenerate_subscriptions_after_change; pause ;;
-      10) configure_nginx; regenerate_subscriptions_after_change; pause ;;
+      10) configure_nginx; pause ;;
       11) bestcf_menu ;;
       12) configure_hy2_hopping_prompt; pause ;;
       13) handle_firewall_ports; pause ;;
