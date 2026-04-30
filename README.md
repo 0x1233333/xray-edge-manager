@@ -12,19 +12,19 @@
 ## 一键运行
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/0x1233333/xray-edge-manager/main/xem.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/0x1233333/xray-edge-manager/refs/heads/main/xem.sh)
 ````
 
 如果 `curl` 不可用：
 
 ```bash
-bash <(wget -qO- https://raw.githubusercontent.com/0x1233333/xray-edge-manager/main/xem.sh)
+bash <(wget -qO- https://raw.githubusercontent.com/0x1233333/xray-edge-manager/refs/heads/main/xem.sh)
 ```
 
 更推荐先下载再运行，方便排错：
 
 ```bash
-curl -fsSL -o /root/xem.sh https://raw.githubusercontent.com/0x1233333/xray-edge-manager/main/xem.sh
+curl -fsSL -o /root/xem.sh https://raw.githubusercontent.com/0x1233333/xray-edge-manager/refs/heads/main/xem.sh
 bash -n /root/xem.sh
 bash /root/xem.sh
 ```
@@ -34,7 +34,7 @@ bash /root/xem.sh
 ## 安装成本地命令
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/0x1233333/xray-edge-manager/main/xem.sh -o /usr/local/bin/xem
+curl -fsSL https://raw.githubusercontent.com/0x1233333/xray-edge-manager/refs/heads/main/xem.sh -o /usr/local/bin/xem
 chmod +x /usr/local/bin/xem
 xem
 ```
@@ -48,7 +48,7 @@ xem
 更新本地命令：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/0x1233333/xray-edge-manager/main/xem.sh -o /usr/local/bin/xem
+curl -fsSL https://raw.githubusercontent.com/0x1233333/xray-edge-manager/refs/heads/main/xem.sh -o /usr/local/bin/xem
 chmod +x /usr/local/bin/xem
 ```
 
@@ -373,7 +373,7 @@ Cloudflare DNS 默认不会自动删除，必须用户确认。
 ### 1. 脚本没反应
 
 ```bash
-curl -fsSL -o /root/xem.sh https://raw.githubusercontent.com/0x1233333/xray-edge-manager/main/xem.sh
+curl -fsSL -o /root/xem.sh https://raw.githubusercontent.com/0x1233333/xray-edge-manager/refs/heads/main/xem.sh
 wc -l /root/xem.sh
 head -n 5 /root/xem.sh
 bash -n /root/xem.sh
