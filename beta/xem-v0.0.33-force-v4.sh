@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Xray Edge Manager / Xray Anti-Block Manager
-# v0.0.32-rc7-nginx-user-permission-fix — subscription permission + merge reachability
+# v0.0.33-rc11-force-v4-egress — rc10 + optional IPv4-only egress for dual-stack nodes
 #
 # Features:
 # - Xray-core only, no Docker, no sing-box
@@ -21,6 +21,7 @@
 # No personal domains, emails, IPs, or tokens are embedded in this script.
 
 set -Eeuo pipefail
+umask 077
 
 # Global temp cleanup registry. Any temp file/dir registered here will be
 # removed on normal exit or interruption. Missing paths are ignored.
@@ -87,10 +88,10 @@ mkdir -p "$APP_DIR" "$APP_DIR/tmp" "$SUB_DIR" "$BESTCF_DIR" "$BACKUP_DIR" "$DEBU
 # even if the parent directory permissions are more permissive.
 chmod 700 "$APP_DIR" "$APP_DIR/tmp" 2>/dev/null || true
 
-log()  { echo -e "\033[32m[OK]\033[0m $*"; }
-info() { echo -e "\033[36m[INFO]\033[0m $*"; }
-warn() { echo -e "\033[33m[WARN]\033[0m $*"; }
-err()  { echo -e "\033[31m[ERR]\033[0m $*"; }
+log()  { echo -e "\033[32m[OK]\033[0m $*" >&2; }
+info() { echo -e "\033[36m[INFO]\033[0m $*" >&2; }
+warn() { echo -e "\033[33m[WARN]\033[0m $*" >&2; }
+err()  { echo -e "\033[31m[ERR]\033[0m $*" >&2; }
 die()  { err "$*"; exit 1; }
 pause(){ read -r -p "按回车继续..." _ || true; }
 need_root(){ [[ "${EUID:-$(id -u)}" -eq 0 ]] || die "请使用 root 运行。"; }
@@ -172,7 +173,7 @@ allowed_state_key(){
     UUID|REALITY_PRIVATE_KEY|REALITY_PUBLIC_KEY|SHORT_ID|XHTTP_REALITY_PATH|XHTTP_CDN_PATH|HY2_AUTH)
       return 0
       ;;
-    SUB_TOKEN|MERGED_SUB_TOKEN|CERT_EMAIL|REALITY_TARGET|ENABLE_IP_STACK_BINDING)
+    SUB_TOKEN|MERGED_SUB_TOKEN|CERT_EMAIL|REALITY_TARGET|ENABLE_IP_STACK_BINDING|IP_OUTBOUND_MODE)
       return 0
       ;;
     BESTCF_ENABLED|BESTCF_MODE|BESTCF_PER_CATEGORY_LIMIT|BESTCF_TOTAL_LIMIT)
@@ -251,29 +252,35 @@ load_state(){
 }
 
 save_kv(){
-  local file="$1" key="$2" value="$3" q tmp
+  local file="$1" key="$2" value="$3" tmp
   [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "非法配置键名：$key"
+
+  # SECURITY/HARDENING: state.env is parsed by our strict loader, not sourced.
+  # Keep values single-line and free of control characters / shell metacharacters.
+  # This also prevents accidental capture of colored warn/info output into state
+  # values from corrupting state.env as ANSI-C quoted multi-line strings.
+  if printf '%s' "$value" | LC_ALL=C grep -q '[[:cntrl:]]'; then
+    die "配置值包含控制字符，拒绝写入状态文件：$key"
+  fi
+  case "$value" in
+    *'$('|*'`'*|*';'*|*'&'*|*'|'*|*'<'*|*'>'*)
+      die "配置值包含不安全字符，拒绝写入状态文件：$key"
+      ;;
+  esac
+
   mkdir -p "$(dirname "$file")"
   touch "$file"
   chmod 600 "$file" 2>/dev/null || true
-  printf -v q '%q' "$value"
 
   tmp="$(mktemp_file "${file}.tmp.XXXXXX")"
-  # SECURITY FIX: use exact key match to prevent FOO matching FOOBAR=xxx.
-  # Match only lines where key= starts at position 1 AND the next char after
-  # the key name is '=' (not another alphanumeric/underscore).
-  awk -v k="$key" -v v="$q" '
-    BEGIN { found = 0; pat = k "=" }
-    substr($0, 1, length(pat)) == pat {
-      print k "=" v
-      found = 1
-      next
-    }
-    { print }
-    END {
-      if (!found) print k "=" v
-    }
+  # Remove the existing exact key line via awk, then append the new value using
+  # printf. Do not pass the value through awk -v; awk interprets backslash
+  # escapes such as \E, which can corrupt ANSI/control-containing values.
+  awk -v k="$key" '
+    BEGIN { pat = k "=" }
+    substr($0, 1, length(pat)) != pat { print }
   ' "$file" > "$tmp" || { rm -f "$tmp"; die "写入临时状态文件失败：$tmp"; }
+  printf '%s=%s\n' "$key" "$value" >> "$tmp" || { rm -f "$tmp"; die "追加状态文件失败：$tmp"; }
   chmod 600 "$tmp" 2>/dev/null || true
   mv -f "$tmp" "$file"
 }
@@ -485,8 +492,15 @@ ensure_web_subscription_permissions(){
   local ng ngx_user
   ngx_user="$(detect_nginx_user)"
   ng="$(detect_nginx_group)"
-  mkdir -p "$WEB_ROOT" "$WEB_ROOT/sub"
+
+  # RC10 HARDENING: umask 077 is correct for secrets, but web path parents
+  # must remain searchable by the Nginx worker. If /var/www is first created
+  # by this script, explicitly normalize it to the standard web permission.
+  mkdir -p /var/www "$WEB_ROOT" "$WEB_ROOT/sub"
+  chmod 755 /var/www 2>/dev/null || true
   chmod 755 "$WEB_ROOT" 2>/dev/null || true
+
+  # Keep subscription files non-world-readable. Nginx can read them via group.
   chmod 750 "$WEB_ROOT/sub" 2>/dev/null || true
   chown root:"$ng" "$WEB_ROOT/sub" 2>/dev/null || true
   if find "$WEB_ROOT/sub" -mindepth 1 -maxdepth 1 -type f -print -quit 2>/dev/null | grep -q .; then
@@ -702,7 +716,7 @@ install_or_upgrade_xray_release_verified(){
 
   [[ -n "$tag" && -n "$asset_url" && -n "$dgst_url" ]] || die "未在 Xray-core 官方 Release 中找到 $asset 及其 .dgst 校验文件。"
 
-  info "准备安装 Xray-core $tag：$asset"
+  info "准备安装 Xray-core ${tag}：$asset"
   info "下载官方 ZIP 与同 Release digest 文件。"
   curl -fL --retry 3 --retry-delay 2 --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time 180 -o "$zip" "$asset_url" || die "下载 Xray 官方 ZIP 失败。"
   curl -fL --retry 3 --retry-delay 2 --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time 60 -o "$dgst" "$dgst_url" || die "下载 Xray 官方 digest 失败。"
@@ -1176,13 +1190,45 @@ select_protocols(){
     warn "Xray Hysteria2 是较新功能。如连接失败，优先检查客户端内核、UDP 放行和 Xray 版本。"
   fi
 
-  if [[ "$p" == *1* || "$p" == *3* || "$p" == *4* ]]; then
-    if confirm "是否启用 v4/v6 出口绑定？v4 入站走 IPv4 出口，v6 入站走 IPv6 出口" "Y"; then
-      save_kv "$STATE_FILE" ENABLE_IP_STACK_BINDING "1"
-    else
-      warn "未启用出口绑定时，仅不强制 v4 入站走 IPv4 出口、v6 入站走 IPv6 出口；监听仍会按 v4/v6 精确绑定。"
-      save_kv "$STATE_FILE" ENABLE_IP_STACK_BINDING "0"
+  if [[ "$p" == *1* || "$p" == *2* || "$p" == *3* || "$p" == *4* || "$p" == *5* ]]; then
+    detect_public_ips
+    echo
+    echo "===== 出口策略 ====="
+    echo "1. stack：v4 入站走 IPv4 出口，v6 入站走 IPv6 出口（原逻辑）"
+    echo "2. force-v4：v4/v6/CDN 入站全部强制 IPv4 出口，适合解决目标站 IPv6 兼容性问题"
+    echo "0. none：不写入站到出站路由，交给 Xray 默认 direct"
+    local outbound_choice outbound_default
+    outbound_default="${IP_OUTBOUND_MODE:-}"
+    if [[ -z "$outbound_default" ]]; then
+      if [[ "${ENABLE_IP_STACK_BINDING:-1}" == "1" ]]; then outbound_default="stack"; else outbound_default="none"; fi
     fi
+    outbound_choice=$(ask "请选择出口策略（1/2/0 或 stack/force-v4/none）" "$outbound_default")
+    case "$outbound_choice" in
+      1|stack|normal|same-stack)
+        save_kv "$STATE_FILE" IP_OUTBOUND_MODE "stack"
+        save_kv "$STATE_FILE" ENABLE_IP_STACK_BINDING "1"
+        ;;
+      2|force-v4|v4|ipv4|all-v4)
+        if [[ -n "${PUBLIC_IPV4:-}" ]]; then
+          save_kv "$STATE_FILE" IP_OUTBOUND_MODE "force-v4"
+          save_kv "$STATE_FILE" ENABLE_IP_STACK_BINDING "1"
+        else
+          warn "未检测到 IPv4，不能启用 force-v4；已回退到 stack。"
+          save_kv "$STATE_FILE" IP_OUTBOUND_MODE "stack"
+          save_kv "$STATE_FILE" ENABLE_IP_STACK_BINDING "1"
+        fi
+        ;;
+      0|none|off|no)
+        save_kv "$STATE_FILE" IP_OUTBOUND_MODE "none"
+        save_kv "$STATE_FILE" ENABLE_IP_STACK_BINDING "0"
+        warn "未写入入站到出站路由；监听仍会按 v4/v6 精确绑定。"
+        ;;
+      *)
+        warn "未知出口策略：$outbound_choice，已使用 stack。"
+        save_kv "$STATE_FILE" IP_OUTBOUND_MODE "stack"
+        save_kv "$STATE_FILE" ENABLE_IP_STACK_BINDING "1"
+        ;;
+    esac
   fi
   load_state
   log "协议组合：$p"
@@ -1260,6 +1306,8 @@ issue_certificate(){
   # SECURITY FIX: set restrictive permissions BEFORE writing sensitive content,
   # eliminating the brief window where the file was world-readable.
   # Also use printf instead of unquoted heredoc to avoid $-expansion bugs.
+  # RC10 HARDENING: refuse symlink credential targets before writing secrets.
+  [[ ! -L "$CF_CRED" ]] || die "拒绝写入符号链接凭据文件：$CF_CRED"
   touch "$CF_CRED"
   chmod 600 "$CF_CRED"
   printf '%s\n' "dns_cloudflare_api_token = $CF_API_TOKEN" > "$CF_CRED"
@@ -1454,6 +1502,49 @@ append_json_obj(){
   printf -v "$first_ref" 0
 }
 
+normalize_ip_outbound_mode(){
+  local mode="${1:-}"
+  if [[ -z "$mode" ]]; then
+    if [[ "${ENABLE_IP_STACK_BINDING:-1}" == "1" ]]; then mode="stack"; else mode="none"; fi
+  fi
+  case "$mode" in
+    1|stack|normal|same-stack) echo "stack" ;;
+    2|force-v4|v4|ipv4|all-v4) echo "force-v4" ;;
+    0|none|off|no) echo "none" ;;
+    *) echo "stack" ;;
+  esac
+}
+
+outbound_tag_for_stack(){
+  local stack="$1" mode="$2"
+  case "$mode" in
+    force-v4)
+      echo "out-v4"
+      ;;
+    stack)
+      case "$stack" in
+        v4) echo "out-v4" ;;
+        v6) echo "out-v6" ;;
+        cdn)
+          if [[ -n "${bind_ip4:-}" ]]; then echo "out-v4"; elif [[ -n "${bind_ip6:-}" ]]; then echo "out-v6"; fi
+          ;;
+      esac
+      ;;
+    none)
+      echo ""
+      ;;
+  esac
+}
+
+append_route_for_inbound(){
+  local file="$1" first_ref="$2" inbound="$3" stack="$4" mode="$5" out
+  out="$(outbound_tag_for_stack "$stack" "$mode")"
+  [[ -n "$out" ]] || return 0
+  append_json_obj "$file" "$first_ref" <<EOF2
+    {"type":"field","inboundTag":["${inbound}"],"outboundTag":"${out}"}
+EOF2
+}
+
 generate_xray_config(){
   need_root
   load_state
@@ -1467,19 +1558,35 @@ generate_xray_config(){
   install -d -m 755 /usr/local/etc/xray
   install -d -m 755 -o "$XRAY_USER" -g "$XRAY_GROUP" /var/log/xray
 
-  local in_tmp out_tmp route_tmp xray_target_tmp first_in=1 first_out=1 first_route=1 ip4 ip6 bind_ip4="" bind_ip6="" bind
+  local in_tmp out_tmp route_tmp xray_target_tmp first_in=1 first_out=1 first_route=1 ip4 ip6 bind_ip4="" bind_ip6="" bind outbound_mode
   local v4_xhttp_ready=0 v6_xhttp_ready=0 v4_hy2_ready=0 v6_hy2_ready=0 v4_vision_ready=0 v6_vision_ready=0 cdn_xhttp_ready=0
   in_tmp=$(mktemp_file "$APP_DIR/tmp/xray-in.XXXXXX"); out_tmp=$(mktemp_file "$APP_DIR/tmp/xray-out.XXXXXX"); route_tmp=$(mktemp_file "$APP_DIR/tmp/xray-route.XXXXXX")
   detect_public_ips
   ip4="${PUBLIC_IPV4:-}"; ip6="${PUBLIC_IPV6:-}"
   [[ -n "$ip4" ]] && bind_ip4=$(local_ipv4_for_bind "$ip4") && save_kv "$STATE_FILE" BIND_IPV4 "$bind_ip4"
   [[ -n "$ip6" ]] && bind_ip6=$(local_ipv6_for_bind "$ip6") && save_kv "$STATE_FILE" BIND_IPV6 "$bind_ip6"
+  outbound_mode="$(normalize_ip_outbound_mode "${IP_OUTBOUND_MODE:-}")"
+  if [[ "$outbound_mode" == "force-v4" && -z "$bind_ip4" ]]; then
+    warn "已选择 force-v4，但本机未检测到可用 IPv4，自动回退到 stack。"
+    outbound_mode="stack"
+  fi
   bind="${ENABLE_IP_STACK_BINDING:-1}"
+  [[ "$outbound_mode" != "none" ]] && bind="1"
   protocol_enabled 3 && sync_xray_certificate
 
-  append_json_obj "$out_tmp" first_out <<'EOF2'
+  if [[ "$outbound_mode" == "force-v4" && -n "$bind_ip4" && "$bind_ip4" != "0.0.0.0" ]]; then
+    append_json_obj "$out_tmp" first_out <<EOF2
+    {"tag":"direct","protocol":"freedom","sendThrough":"${bind_ip4}","settings":{"domainStrategy":"UseIPv4"}}
+EOF2
+  elif [[ "$outbound_mode" == "force-v4" ]]; then
+    append_json_obj "$out_tmp" first_out <<'EOF2'
+    {"tag":"direct","protocol":"freedom","settings":{"domainStrategy":"UseIPv4"}}
+EOF2
+  else
+    append_json_obj "$out_tmp" first_out <<'EOF2'
     {"tag":"direct","protocol":"freedom"}
 EOF2
+  fi
   append_json_obj "$out_tmp" first_out <<'EOF2'
     {"tag":"block","protocol":"blackhole"}
 EOF2
@@ -1513,18 +1620,14 @@ EOF2
     {"tag":"in-v4-xhttp-reality","listen":"${bind_ip4}","port":${XHTTP_REALITY_PORT},"protocol":"vless","settings":{"clients":[{"id":"${UUID}","email":"v4-xhttp-reality"}],"decryption":"none"},"streamSettings":{"network":"xhttp","security":"reality","xhttpSettings":{"path":"${XHTTP_REALITY_PATH}","mode":"auto"},"realitySettings":{"show":false,"dest":"${REALITY_TARGET}:443","serverNames":["${REALITY_TARGET}"],"privateKey":"${REALITY_PRIVATE_KEY}","shortIds":["${SHORT_ID}"]}}}
 EOF2
       v4_xhttp_ready=1
-      [[ "$bind" == "1" ]] && append_json_obj "$route_tmp" first_route <<'EOF2'
-    {"type":"field","inboundTag":["in-v4-xhttp-reality"],"outboundTag":"out-v4"}
-EOF2
+      [[ "$bind" == "1" ]] && append_route_for_inbound "$route_tmp" first_route "in-v4-xhttp-reality" "v4" "$outbound_mode"
     fi
     if [[ -n "$bind_ip6" && "${IPV6_PROTOCOLS:-0}" == *1* ]]; then
       append_json_obj "$in_tmp" first_in <<EOF2
     {"tag":"in-v6-xhttp-reality","listen":"${bind_ip6}","port":${XHTTP_REALITY_PORT},"protocol":"vless","settings":{"clients":[{"id":"${UUID}","email":"v6-xhttp-reality"}],"decryption":"none"},"streamSettings":{"network":"xhttp","security":"reality","xhttpSettings":{"path":"${XHTTP_REALITY_PATH}","mode":"auto"},"realitySettings":{"show":false,"dest":"${REALITY_TARGET}:443","serverNames":["${REALITY_TARGET}"],"privateKey":"${REALITY_PRIVATE_KEY}","shortIds":["${SHORT_ID}"]}}}
 EOF2
       v6_xhttp_ready=1
-      [[ "$bind" == "1" ]] && append_json_obj "$route_tmp" first_route <<'EOF2'
-    {"type":"field","inboundTag":["in-v6-xhttp-reality"],"outboundTag":"out-v6"}
-EOF2
+      [[ "$bind" == "1" ]] && append_route_for_inbound "$route_tmp" first_route "in-v6-xhttp-reality" "v6" "$outbound_mode"
     fi
   fi
 
@@ -1533,6 +1636,7 @@ EOF2
     {"tag":"in-xhttp-cdn-local","listen":"127.0.0.1","port":${XHTTP_CDN_LOCAL_PORT},"protocol":"vless","settings":{"clients":[{"id":"${UUID}","email":"xhttp-cdn"}],"decryption":"none"},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"path":"${XHTTP_CDN_PATH}","mode":"auto"}}}
 EOF2
     cdn_xhttp_ready=1
+    [[ "$bind" == "1" ]] && append_route_for_inbound "$route_tmp" first_route "in-xhttp-cdn-local" "cdn" "$outbound_mode"
   fi
 
   if protocol_enabled 3; then
@@ -1541,18 +1645,14 @@ EOF2
     {"tag":"in-v4-hysteria2-udp","listen":"${bind_ip4}","port":${HY2_PORT},"protocol":"hysteria","settings":{"version":2,"clients":[{"auth":"${HY2_AUTH}","email":"v4-hy2"}]},"streamSettings":{"network":"hysteria","security":"tls","tlsSettings":{"alpn":["h3"],"certificates":[{"certificateFile":"${XRAY_CERT_DIR}/${BASE_DOMAIN}/fullchain.pem","keyFile":"${XRAY_CERT_DIR}/${BASE_DOMAIN}/privkey.pem"}]},"hysteriaSettings":{"version":2,"auth":"${HY2_AUTH}","udpIdleTimeout":60}}}
 EOF2
       v4_hy2_ready=1
-      [[ "$bind" == "1" ]] && append_json_obj "$route_tmp" first_route <<'EOF2'
-    {"type":"field","inboundTag":["in-v4-hysteria2-udp"],"outboundTag":"out-v4"}
-EOF2
+      [[ "$bind" == "1" ]] && append_route_for_inbound "$route_tmp" first_route "in-v4-hysteria2-udp" "v4" "$outbound_mode"
     fi
     if [[ -n "$bind_ip6" && "${IPV6_PROTOCOLS:-0}" == *3* ]]; then
       append_json_obj "$in_tmp" first_in <<EOF2
     {"tag":"in-v6-hysteria2-udp","listen":"${bind_ip6}","port":${HY2_PORT},"protocol":"hysteria","settings":{"version":2,"clients":[{"auth":"${HY2_AUTH}","email":"v6-hy2"}]},"streamSettings":{"network":"hysteria","security":"tls","tlsSettings":{"alpn":["h3"],"certificates":[{"certificateFile":"${XRAY_CERT_DIR}/${BASE_DOMAIN}/fullchain.pem","keyFile":"${XRAY_CERT_DIR}/${BASE_DOMAIN}/privkey.pem"}]},"hysteriaSettings":{"version":2,"auth":"${HY2_AUTH}","udpIdleTimeout":60}}}
 EOF2
       v6_hy2_ready=1
-      [[ "$bind" == "1" ]] && append_json_obj "$route_tmp" first_route <<'EOF2'
-    {"type":"field","inboundTag":["in-v6-hysteria2-udp"],"outboundTag":"out-v6"}
-EOF2
+      [[ "$bind" == "1" ]] && append_route_for_inbound "$route_tmp" first_route "in-v6-hysteria2-udp" "v6" "$outbound_mode"
     fi
   fi
 
@@ -1562,18 +1662,14 @@ EOF2
     {"tag":"in-v4-reality-vision","listen":"${bind_ip4}","port":${REALITY_VISION_PORT},"protocol":"vless","settings":{"clients":[{"id":"${UUID}","flow":"xtls-rprx-vision","email":"v4-reality-vision"}],"decryption":"none"},"streamSettings":{"network":"raw","security":"reality","realitySettings":{"show":false,"dest":"${REALITY_TARGET}:443","serverNames":["${REALITY_TARGET}"],"privateKey":"${REALITY_PRIVATE_KEY}","shortIds":["${SHORT_ID}"]}}}
 EOF2
       v4_vision_ready=1
-      [[ "$bind" == "1" ]] && append_json_obj "$route_tmp" first_route <<'EOF2'
-    {"type":"field","inboundTag":["in-v4-reality-vision"],"outboundTag":"out-v4"}
-EOF2
+      [[ "$bind" == "1" ]] && append_route_for_inbound "$route_tmp" first_route "in-v4-reality-vision" "v4" "$outbound_mode"
     fi
     if [[ -n "$bind_ip6" && "${IPV6_PROTOCOLS:-0}" == *4* ]]; then
       append_json_obj "$in_tmp" first_in <<EOF2
     {"tag":"in-v6-reality-vision","listen":"${bind_ip6}","port":${REALITY_VISION_PORT},"protocol":"vless","settings":{"clients":[{"id":"${UUID}","flow":"xtls-rprx-vision","email":"v6-reality-vision"}],"decryption":"none"},"streamSettings":{"network":"raw","security":"reality","realitySettings":{"show":false,"dest":"${REALITY_TARGET}:443","serverNames":["${REALITY_TARGET}"],"privateKey":"${REALITY_PRIVATE_KEY}","shortIds":["${SHORT_ID}"]}}}
 EOF2
       v6_vision_ready=1
-      [[ "$bind" == "1" ]] && append_json_obj "$route_tmp" first_route <<'EOF2'
-    {"type":"field","inboundTag":["in-v6-reality-vision"],"outboundTag":"out-v6"}
-EOF2
+      [[ "$bind" == "1" ]] && append_route_for_inbound "$route_tmp" first_route "in-v6-reality-vision" "v6" "$outbound_mode"
     fi
   fi
 
@@ -1667,7 +1763,7 @@ cleanup_legacy_nginx_conf(){
 }
 
 install_random_camouflage(){
-  mkdir -p "$WEB_ROOT"
+  mkdir -p /var/www "$WEB_ROOT"
   local n zip tmp ok=0
   n=$((RANDOM % 9 + 1))
   zip="html${n}.zip"
@@ -1689,7 +1785,7 @@ install_random_camouflage(){
       fi
       shopt -u dotglob nullglob
       # SECURITY: remove any symlinks copied from the zip.
-      find "$WEB_ROOT" -type l -delete 2>/dev/null || true
+      find "$WEB_ROOT" -path "$WEB_ROOT/sub" -prune -o -type l -delete 2>/dev/null || true
       [[ -f "$WEB_ROOT/index.html" ]] || echo '<!doctype html><html><body><h1>Welcome</h1><p>It works.</p></body></html>' > "$WEB_ROOT/index.html"
       log "伪装站模板已安装：${zip}"
       ok=1
@@ -1702,7 +1798,10 @@ install_random_camouflage(){
 EOF2
   fi
   rm -rf "$tmp"
-  chmod -R a+rX "$WEB_ROOT" 2>/dev/null || true
+  # RC10 HARDENING: publish the camouflage site, but never loosen /sub.
+  find "$WEB_ROOT" -path "$WEB_ROOT/sub" -prune -o -type d -exec chmod 755 {} + 2>/dev/null || true
+  find "$WEB_ROOT" -path "$WEB_ROOT/sub/*" -prune -o -type f -exec chmod 644 {} + 2>/dev/null || true
+  ensure_web_subscription_permissions
 }
 
 configure_nginx(){
@@ -2208,7 +2307,7 @@ refresh_udp_conntrack_for_hy2(){
 
   count=$((end - start + 1))
   if [[ "$count" -gt "$max_flush" ]]; then
-    warn "HY2 跳跃端口范围过大（$count > $max_flush），为避免 CPU 尖峰和误伤现有 443/UDP 连接，跳过 conntrack 精确清理。旧 UDP 流会等待内核超时。"
+    warn "HY2 跳跃端口范围过大（$count > ${max_flush}），为避免 CPU 尖峰和误伤现有 443/UDP 连接，跳过 conntrack 精确清理。旧 UDP 流会等待内核超时。"
     return 0
   fi
 
@@ -2288,7 +2387,7 @@ enable_hy2_hopping(){
   if [[ "${XEM_INTERNAL_APPLY_HY2:-0}" != "1" ]]; then
     install_hy2_hopping_service
   fi
-  log "端口跳跃规则已设置。请确认云安全组放行 UDP $start-$end。"
+  log "端口跳跃规则已设置。请确认云安全组放行 UDP $start-${end}。"
 }
 
 install_hy2_hopping_service(){
@@ -2901,7 +3000,7 @@ apply_stable_network_tuning(){
   cc="bbr"
   if [[ "$available" != *bbr* ]]; then
     cc="${current:-cubic}"
-    warn "当前内核未显示支持 BBR：${available:-unknown}，将保持拥塞控制为 $cc。"
+    warn "当前内核未显示支持 BBR：${available:-unknown}，将保持拥塞控制为 ${cc}。"
   fi
 
   mkdir -p "$(dirname "$SYSCTL_FILE")"
@@ -3018,6 +3117,7 @@ deployment_summary(){
   protocol_enabled 5 && echo "  XHTTP+TLS+CDN 入口扩展: TCP ${CDN_PORT:-443} -> 127.0.0.1:${XHTTP_CDN_LOCAL_PORT:-31301}"
   [[ -n "${HY2_HOP_RANGE:-}" ]] && echo "  HY2 端口跳跃: UDP ${HY2_HOP_RANGE/:/-} -> ${HY2_PORT:-443}"
   echo "Xray 运行用户: ${XRAY_USER}"
+  echo "出口策略: $(normalize_ip_outbound_mode "${IP_OUTBOUND_MODE:-}")"
   echo "Cloudflare 源站限制: ${ENABLE_CF_ORIGIN_FIREWALL:-0}"
   echo "BestCF: ${BESTCF_ENABLED:-0} / ${BESTCF_MODE:-off} / 每类${BESTCF_PER_CATEGORY_LIMIT:-2} / 总上限${BESTCF_TOTAL_LIMIT:-10}"
   if [[ -n "${BASE_DOMAIN:-}" && -n "${SUB_TOKEN:-}" ]] && subscription_web_file_exists "$SUB_TOKEN"; then
@@ -3059,8 +3159,15 @@ install_full(){
   log "首次部署流程完成。"
 }
 
-list_remote_subscriptions(){
+ensure_remotes_file(){
+  mkdir -p "$SUB_DIR"
+  [[ ! -L "$REMOTES_FILE" ]] || die "拒绝使用符号链接远程订阅文件：$REMOTES_FILE"
   touch "$REMOTES_FILE"
+  chmod 600 "$REMOTES_FILE" 2>/dev/null || true
+}
+
+list_remote_subscriptions(){
+  ensure_remotes_file
   echo "===== 远程订阅列表 ====="
   if [[ ! -s "$REMOTES_FILE" ]]; then
     warn "暂无远程订阅。"
@@ -3077,13 +3184,13 @@ add_remote_subscription(){
   [[ -n "$name" ]] || name="remote"
   url=$(ask "请输入远程 base64 订阅 URL" "")
   [[ -n "$url" ]] || { warn "URL 为空，取消。"; return 0; }
-  touch "$REMOTES_FILE"
+  ensure_remotes_file
   echo "${name}|${url}" >> "$REMOTES_FILE"
   log "已添加远程订阅：$name"
 }
 
 delete_remote_subscription(){
-  touch "$REMOTES_FILE"
+  ensure_remotes_file
   list_remote_subscriptions
   local n tmp
   n=$(ask "请输入要删除的编号" "")
@@ -3096,6 +3203,7 @@ delete_remote_subscription(){
 
 clear_remote_subscriptions(){
   if confirm "确认清空所有远程订阅？" "N"; then
+    ensure_remotes_file
     : > "$REMOTES_FILE"
     log "已清空远程订阅。"
   fi
@@ -3173,7 +3281,7 @@ merge_remote_subscriptions(){
   load_state
   mkdir -p "$SUB_DIR" "$WEB_ROOT/sub"
   [[ -f "$SUB_DIR/local.raw" ]] || generate_subscription
-  touch "$REMOTES_FILE"
+  ensure_remotes_file
   local remote_raw="$SUB_DIR/remote.raw" merged="$SUB_DIR/merged.raw" merged_b64="$SUB_DIR/merged.b64"
   local name url fetch_file decoded_file size decoded_size max_bytes http_code
   max_bytes="${REMOTE_SUB_MAX_BYTES:-2097152}"
@@ -3384,15 +3492,15 @@ cf_delete_record_by_id(){
 
 cf_delete_record(){
   local name="$1" type="$2" expected="${3:-}" mode="${4:-owned}" resp count i rec_id content
-  resp=$(cf_get_record_json "$name" "$type") || { warn "无法读取 $type $name，跳过。"; return 0; }
+  resp=$(cf_get_record_json "$name" "$type") || { warn "无法读取 $type ${name}，跳过。"; return 0; }
   count=$(echo "$resp" | jq -r '.result | length')
-  [[ "$count" -gt 0 ]] || { info "Cloudflare 中不存在 $type $name，跳过。"; return 0; }
+  [[ "$count" -gt 0 ]] || { info "Cloudflare 中不存在 $type ${name}，跳过。"; return 0; }
   for ((i=0;i<count;i++)); do
     rec_id=$(echo "$resp" | jq -r ".result[$i].id // empty")
     content=$(echo "$resp" | jq -r ".result[$i].content // empty")
     [[ -n "$rec_id" ]] || continue
     if [[ "$mode" == "owned" && -n "$expected" && "$content" != "$expected" ]]; then
-      warn "跳过 $type $name：当前指向 $content，不等于本机 IP $expected。"
+      warn "跳过 $type ${name}：当前指向 ${content}，不等于本机 IP ${expected}。"
       continue
     fi
     if cf_delete_record_by_id "$rec_id"; then
@@ -3519,7 +3627,7 @@ uninstall_menu(){
       1) full_uninstall_xem; pause ;;
       2) systemctl stop xray 2>/dev/null || true; systemctl disable xray 2>/dev/null || true; pause ;;
       3) remove_hy2_hopping_rules; pause ;;
-      4) if confirm "确认删除 $APP_DIR 和旧目录 $LEGACY_APP_DIR？" "N"; then rm -rf "$APP_DIR" "$LEGACY_APP_DIR"; fi; pause ;;
+      4) if confirm "确认删除 $APP_DIR 和旧目录 ${LEGACY_APP_DIR}？" "N"; then rm -rf "$APP_DIR" "$LEGACY_APP_DIR"; fi; pause ;;
       5) delete_cloudflare_records_menu; pause ;;
       6) disable_cf_origin_firewall; pause ;;
       0) break ;;
@@ -3533,7 +3641,7 @@ main_menu(){
   load_state
   while true; do
     echo
-    echo "===== Xray Edge Manager v0.0.32-rc7-nginx-user-permission-fix ====="
+    echo "===== Xray Edge Manager v0.0.33-rc11-force-v4-egress ====="
     echo "1. 首次部署向导，推荐"
     echo "2. 安装/升级基础依赖"
     echo "3. 安装/升级 Xray-core"
@@ -3636,6 +3744,6 @@ case "${1:-}" in
     ;;
 esac
 
+need_root
 acquire_lock
 main_menu "$@"
-
