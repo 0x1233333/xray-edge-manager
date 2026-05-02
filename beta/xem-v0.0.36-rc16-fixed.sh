@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Xray Edge Manager / Xray Anti-Block Manager
-# v0.0.36-rc15-fixed — rc14/rc15 hardening: service apply, DNS guard, HY2 subscription sync, uninstall backup, state validation
+# v0.0.36-rc16-fixed — rc15 + BestCF cache-safe refresh, state defaults, domain/node validation
 #
 # Features:
 # - Xray-core only, no Docker, no sing-box
@@ -1004,6 +1004,15 @@ configure_base_domain(){
   done
 }
 
+sanitize_node_name(){
+  local name="$1"
+  name=$(printf '%s' "$name" | tr -cd 'A-Za-z0-9_.-' | sed 's/^[-_.]*//; s/[-_.]*$//')
+  # Keep YAML/subscription names short and deterministic.
+  [[ ${#name} -gt 64 ]] && name="${name:0:64}"
+  [[ -n "$name" ]] || name="node"
+  echo "$name"
+}
+
 configure_node_name(){
   load_state
   local default_name name
@@ -1013,8 +1022,7 @@ configure_node_name(){
     default_name="node"
   fi
   name=$(ask "请输入节点名称，用于订阅中区分机器，例如 jp1/us1/oracle-tokyo" "${NODE_NAME:-$default_name}")
-  name=$(printf '%s' "$name" | tr -cd 'A-Za-z0-9_.-' | sed 's/^[-_.]*//; s/[-_.]*$//')
-  [[ -n "$name" ]] || name="node"
+  name=$(sanitize_node_name "$name")
   save_kv "$STATE_FILE" NODE_NAME "$name"
   log "节点名称已设置：$name"
 }
@@ -1500,13 +1508,68 @@ valid_safe_token(){
   [[ "$v" =~ ^[A-Za-z0-9._~-]{8,128}$ ]]
 }
 
+choose_port_avoiding(){
+  # Usage: choose_port_avoiding preferred avoid1 avoid2 ...
+  local preferred="$1" cand avoid conflict
+  shift || true
+  for cand in "$preferred" 2443 3443 4443 5443 6443 7443 8444 9443; do
+    valid_port "$cand" || continue
+    conflict=0
+    for avoid in "$@"; do
+      [[ -n "$avoid" && "$cand" == "$avoid" ]] && conflict=1 && break
+    done
+    [[ "$conflict" == "0" ]] && { echo "$cand"; return 0; }
+  done
+  echo "$preferred"
+}
+
 validate_state_or_regen(){
   load_state
+
+  # State files may be edited manually or inherited from older releases. Before
+  # using any saved value in JSON, Nginx config, subscription URLs, or Mihomo YAML,
+  # normalize the values that can break rendering or trigger set -u.
+  if [[ -n "${BASE_DOMAIN:-}" ]] && ! validate_base_domain "$BASE_DOMAIN"; then
+    warn "BASE_DOMAIN 非法，必须重新设置：$BASE_DOMAIN"
+    save_kv "$STATE_FILE" BASE_DOMAIN ""
+    if [[ -r /dev/tty && -w /dev/tty ]]; then
+      configure_base_domain 1
+    else
+      die "BASE_DOMAIN 非法且当前不是交互终端，无法继续。请重新运行菜单设置母域名。"
+    fi
+  fi
+
+  local default_node safe_node
+  if [[ -n "${BASE_DOMAIN:-}" ]]; then default_node="${BASE_DOMAIN%%.*}"; else default_node="node"; fi
+  safe_node="$(sanitize_node_name "${NODE_NAME:-$default_node}")"
+  if [[ "${NODE_NAME:-}" != "$safe_node" ]]; then
+    warn "NODE_NAME 已规范化为安全格式：${NODE_NAME:-空} -> $safe_node"
+    save_kv "$STATE_FILE" NODE_NAME "$safe_node"
+  fi
 
   if [[ -n "${CDN_PORT:-}" ]] && { ! valid_port "$CDN_PORT" || ! is_cf_https_port "$CDN_PORT"; }; then
     warn "CDN_PORT 非法，已重置为 443：$CDN_PORT"
     save_kv "$STATE_FILE" CDN_PORT "443"
   fi
+  load_state
+
+  # Protocol-enabled ports must exist, otherwise here-doc expansion under
+  # set -u can abort the script even though preflight_ports used defaults.
+  if [[ "${PROTOCOLS:-0}" == *2* || "${PROTOCOLS:-0}" == *5* ]]; then
+    if [[ -z "${CDN_PORT:-}" ]]; then save_kv "$STATE_FILE" CDN_PORT "443"; fi
+    if [[ -z "${XHTTP_CDN_LOCAL_PORT:-}" ]]; then save_kv "$STATE_FILE" XHTTP_CDN_LOCAL_PORT "31301"; fi
+  fi
+  if [[ "${PROTOCOLS:-0}" == *1* && -z "${XHTTP_REALITY_PORT:-}" ]]; then
+    save_kv "$STATE_FILE" XHTTP_REALITY_PORT "2443"
+  fi
+  if [[ "${PROTOCOLS:-0}" == *3* && -z "${HY2_PORT:-}" ]]; then
+    save_kv "$STATE_FILE" HY2_PORT "443"
+  fi
+  if [[ "${PROTOCOLS:-0}" == *4* && -z "${REALITY_VISION_PORT:-}" ]]; then
+    save_kv "$STATE_FILE" REALITY_VISION_PORT "3443"
+  fi
+  load_state
+
   if [[ -n "${XHTTP_REALITY_PORT:-}" ]] && ! valid_port "$XHTTP_REALITY_PORT"; then
     warn "XHTTP_REALITY_PORT 非法，已重置为 2443：$XHTTP_REALITY_PORT"
     save_kv "$STATE_FILE" XHTTP_REALITY_PORT "2443"
@@ -1525,9 +1588,17 @@ validate_state_or_regen(){
   fi
 
   load_state
-  if [[ "${PROTOCOLS:-0}" == *1* && "${PROTOCOLS:-0}" == *4* && -n "${XHTTP_REALITY_PORT:-}" && "${XHTTP_REALITY_PORT:-}" == "${REALITY_VISION_PORT:-}" ]]; then
-    warn "XHTTP+REALITY 与 REALITY+Vision 端口相同，已将 REALITY+Vision 重置为 3443。"
-    save_kv "$STATE_FILE" REALITY_VISION_PORT "3443"
+  local picked
+  if [[ "${PROTOCOLS:-0}" == *1* && -n "${XHTTP_REALITY_PORT:-}" && "${XHTTP_REALITY_PORT:-}" == "${CDN_PORT:-443}" ]]; then
+    picked="$(choose_port_avoiding 2443 "${CDN_PORT:-443}" "${REALITY_VISION_PORT:-}")"
+    warn "XHTTP+REALITY 端口与 CDN/订阅端口冲突，已改为：$picked"
+    save_kv "$STATE_FILE" XHTTP_REALITY_PORT "$picked"
+  fi
+  load_state
+  if [[ "${PROTOCOLS:-0}" == *4* && -n "${REALITY_VISION_PORT:-}" ]] && { [[ "${REALITY_VISION_PORT:-}" == "${CDN_PORT:-443}" ]] || [[ "${PROTOCOLS:-0}" == *1* && "${REALITY_VISION_PORT:-}" == "${XHTTP_REALITY_PORT:-}" ]]; }; then
+    picked="$(choose_port_avoiding 3443 "${CDN_PORT:-443}" "${XHTTP_REALITY_PORT:-}")"
+    warn "REALITY+Vision 端口与其它 TCP 入站冲突，已改为：$picked"
+    save_kv "$STATE_FILE" REALITY_VISION_PORT "$picked"
   fi
 
   if [[ -n "${REALITY_TARGET:-}" ]] && ! validate_hostname "$REALITY_TARGET"; then
@@ -1947,6 +2018,7 @@ generate_xray_config(){
   generate_keys_if_needed
   validate_state_or_regen
   load_state
+  [[ -n "${BASE_DOMAIN:-}" ]] || configure_base_domain
   ensure_hy2_certificate_ready
   preflight_ports
   backup_configs
@@ -2236,6 +2308,7 @@ configure_nginx(){
   generate_keys_if_needed
   validate_state_or_regen
   load_state
+  [[ -n "${BASE_DOMAIN:-}" ]] || configure_base_domain
   mkdir -p "$APP_DIR" "$SUB_DIR" "$BESTCF_DIR" "$BACKUP_DIR"
   cleanup_legacy_nginx_conf
   disable_nginx_packaged_default_site
@@ -2683,6 +2756,7 @@ generate_subscription(){
   generate_keys_if_needed
   validate_state_or_regen
   load_state
+  [[ -n "${BASE_DOMAIN:-}" ]] || die "请先设置母域名。"
   ensure_bestcf_data_if_needed
   load_state
   mkdir -p "$SUB_DIR" "$WEB_ROOT/sub"
@@ -3277,35 +3351,36 @@ fetch_bestcf_all(){
   mkdir -p "$BESTCF_DIR"
 
   # BestCF is only a CDN acceleration entry, not a basic connectivity dependency.
-  # Success: atomically replace local cache with this round's fresh remote data.
-  # Failure: keep the previous local cache intact. Only when there is no cache at
-  # all will protocol 5 fall back to the user's own BASE_DOMAIN CDN entry.
-  local asset ok=0 tmp_dir
+  # rc16: replace each asset independently. A partially successful refresh must
+  # never delete a still-useful old cache for assets that failed this round.
+  local asset kind ok=0 tmp_dir
   tmp_dir="$(mktemp_dir "$BESTCF_DIR/.fetch.XXXXXX")"
 
   for asset in $BESTCF_ASSETS; do
     rm -f "$tmp_dir/$asset" "$tmp_dir/$asset.tmp" "$tmp_dir/$asset.raw"
+    if [[ "$asset" == *domain* ]]; then kind="domain"; else kind="ip"; fi
+    if download_bestcf_asset "$asset" "$tmp_dir/$asset" "$kind"; then
+      mv -f "$tmp_dir/$asset" "$BESTCF_DIR/$asset"
+      rm -f "$BESTCF_DIR/$asset.tmp" "$BESTCF_DIR/$asset.raw"
+      ok=1
+      info "BestCF 已刷新资产：$asset"
+    else
+      if [[ -s "$BESTCF_DIR/$asset" ]]; then
+        warn "BestCF 本轮未获取到 $asset，已保留旧缓存。"
+      else
+        warn "BestCF 本轮未获取到 $asset，且本地无缓存。"
+      fi
+    fi
   done
 
-  download_bestcf_asset "cmcc-ip.txt" "$tmp_dir/cmcc-ip.txt" "ip" && ok=1 || true
-  download_bestcf_asset "cucc-ip.txt" "$tmp_dir/cucc-ip.txt" "ip" && ok=1 || true
-  download_bestcf_asset "ctcc-ip.txt" "$tmp_dir/ctcc-ip.txt" "ip" && ok=1 || true
-  download_bestcf_asset "bestcf-ip.txt" "$tmp_dir/bestcf-ip.txt" "ip" && ok=1 || true
-  download_bestcf_asset "proxy-ip.txt" "$tmp_dir/proxy-ip.txt" "ip" && ok=1 || true
-  download_bestcf_asset "bestcf-domain.txt" "$tmp_dir/bestcf-domain.txt" "domain" && ok=1 || true
-
   if [[ "$ok" == "1" ]]; then
-    for asset in $BESTCF_ASSETS; do
-      rm -f "$BESTCF_DIR/$asset" "$BESTCF_DIR/$asset.tmp" "$BESTCF_DIR/$asset.raw"
-      if [[ -s "$tmp_dir/$asset" ]]; then
-        mv -f "$tmp_dir/$asset" "$BESTCF_DIR/$asset"
-      fi
-    done
-    log "BestCF 已使用本轮远端最新数据刷新。"
+    export BESTCF_FETCHED_THIS_RUN=1
+    log "BestCF 已使用本轮远端可用数据刷新；失败资产保留旧缓存。"
   else
-    warn "BestCF 远端数据不可用，已保留本地旧缓存。若本地无缓存，本次订阅会退回普通母域名 CDN Entry。"
+    warn "BestCF 远端数据本轮全部不可用，已保留本地旧缓存。若本地无缓存，本次订阅会退回普通母域名 CDN Entry。"
+    # Do not mark this run as fetched on total failure; later subscription
+    # regeneration in the same interactive process may retry.
   fi
-  export BESTCF_FETCHED_THIS_RUN=1
   rm -rf "$tmp_dir"
 
   # Warn if domain mode requires bestcf-domain.txt but it is missing.
@@ -4184,7 +4259,7 @@ main_menu(){
   load_state
   while true; do
     echo
-    echo "===== Xray Edge Manager v0.0.36-rc15-fixed ====="
+    echo "===== Xray Edge Manager v0.0.36-rc16-fixed ====="
     echo "1. 首次部署向导，推荐"
     echo "2. 安装/升级基础依赖"
     echo "3. 安装/升级 Xray-core"
