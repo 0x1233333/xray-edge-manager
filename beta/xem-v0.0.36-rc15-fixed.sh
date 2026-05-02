@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Xray Edge Manager / Xray Anti-Block Manager
-# v0.0.36-rc14-fixed — rc14 + service-apply, DNS-delete guard, port-conflict guard, HY2 v4/v6 hopping guards
+# v0.0.36-rc15-fixed — rc14/rc15 hardening: service apply, DNS guard, HY2 subscription sync, uninstall backup, state validation
 #
 # Features:
 # - Xray-core only, no Docker, no sing-box
@@ -396,7 +396,21 @@ except Exception:
 PYV6
     return $?
   fi
-  [[ "$ip" =~ ^[0-9A-Fa-f:]+$ ]]
+  # Fallback without python3: conservative textual validation.
+  # Reject obviously malformed literals such as empty groups beyond one "::",
+  # non-hex chars, too many groups, or groups longer than 4 hex chars.
+  [[ "$ip" =~ ^[0-9A-Fa-f:]+$ ]] || return 1
+  [[ "$ip" != *:::* ]] || return 1
+  if [[ "$ip" == *::*::* ]]; then return 1; fi
+  local rest="$ip" group count=0
+  rest="${rest//::/:}"
+  IFS=':' read -r -a _v6_groups <<< "$rest"
+  for group in "${_v6_groups[@]}"; do
+    [[ -z "$group" ]] && continue
+    [[ "$group" =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
+    count=$((count + 1))
+  done
+  [[ "$count" -le 8 ]]
 }
 
 public_ipv4(){
@@ -411,6 +425,20 @@ public_ipv6(){
 
 detect_public_ips(){
   local cur4 cur6 old4="${PUBLIC_IPV4:-}" old6="${PUBLIC_IPV6:-}"
+
+  # Do not trust historical state blindly. If an older version captured HTML,
+  # curl errors, ANSI noise, or any non-IP text, clear it before fallback use.
+  if [[ -n "$old4" ]] && ! valid_ipv4_literal "$old4"; then
+    warn "旧 PUBLIC_IPV4 不是合法 IPv4，已清空：$old4"
+    save_kv "$STATE_FILE" PUBLIC_IPV4 ""
+    old4=""
+  fi
+  if [[ -n "$old6" ]] && ! valid_ipv6_literal "$old6"; then
+    warn "旧 PUBLIC_IPV6 不是合法 IPv6，已清空：$old6"
+    save_kv "$STATE_FILE" PUBLIC_IPV6 ""
+    old6=""
+  fi
+
   cur4="$(public_ipv4 | tr -d '[:space:]' || true)"
   cur6="$(public_ipv6 | tr -d '[:space:]' || true)"
 
@@ -1328,13 +1356,21 @@ create_dns_records(){
 
   if [[ -n "$ip4" ]]; then
     cf_upsert_record "$BASE_DOMAIN" A "$ip4" true
-    if stack_has_direct_protocol "${IPV4_PROTOCOLS:-0}"; then cf_upsert_record "v4.$BASE_DOMAIN" A "$ip4" false; fi
+    if stack_has_direct_protocol "${IPV4_PROTOCOLS:-0}"; then
+      cf_upsert_record "v4.$BASE_DOMAIN" A "$ip4" false
+    else
+      cf_delete_record "v4.$BASE_DOMAIN" A "$ip4" owned || true
+    fi
   fi
   if [[ -n "$ip6" ]]; then
     cf_upsert_record "$BASE_DOMAIN" AAAA "$ip6" true
-    if stack_has_direct_protocol "${IPV6_PROTOCOLS:-0}"; then cf_upsert_record "v6.$BASE_DOMAIN" AAAA "$ip6" false; fi
+    if stack_has_direct_protocol "${IPV6_PROTOCOLS:-0}"; then
+      cf_upsert_record "v6.$BASE_DOMAIN" AAAA "$ip6" false
+    else
+      cf_delete_record "v6.$BASE_DOMAIN" AAAA "$ip6" owned || true
+    fi
   fi
-  log "DNS 记录处理完成：BASE_DOMAIN 始终用于订阅/伪装站；v4/v6 子域名按直连协议生成。"
+  log "DNS 记录处理完成：BASE_DOMAIN 始终用于订阅/伪装站；v4/v6 子域名按直连协议生成，未启用直连的 v4/v6 子域名会按本机 IP 归属校验清理。"
 }
 
 install_cert_deploy_hook(){
@@ -1449,17 +1485,114 @@ validate_x25519_key(){
   [[ "$k" =~ ^[A-Za-z0-9_-]{40,80}$ ]]
 }
 
+valid_uuid_literal(){
+  local u="$1"
+  [[ "$u" =~ ^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ ]]
+}
+
+valid_safe_xray_path(){
+  local p="$1"
+  [[ "$p" =~ ^/[A-Za-z0-9._~/-]{2,120}$ ]] && [[ "$p" != *"//"* ]]
+}
+
+valid_safe_token(){
+  local v="$1"
+  [[ "$v" =~ ^[A-Za-z0-9._~-]{8,128}$ ]]
+}
+
+validate_state_or_regen(){
+  load_state
+
+  if [[ -n "${CDN_PORT:-}" ]] && { ! valid_port "$CDN_PORT" || ! is_cf_https_port "$CDN_PORT"; }; then
+    warn "CDN_PORT 非法，已重置为 443：$CDN_PORT"
+    save_kv "$STATE_FILE" CDN_PORT "443"
+  fi
+  if [[ -n "${XHTTP_REALITY_PORT:-}" ]] && ! valid_port "$XHTTP_REALITY_PORT"; then
+    warn "XHTTP_REALITY_PORT 非法，已重置为 2443：$XHTTP_REALITY_PORT"
+    save_kv "$STATE_FILE" XHTTP_REALITY_PORT "2443"
+  fi
+  if [[ -n "${REALITY_VISION_PORT:-}" ]] && ! valid_port "$REALITY_VISION_PORT"; then
+    warn "REALITY_VISION_PORT 非法，已重置为 3443：$REALITY_VISION_PORT"
+    save_kv "$STATE_FILE" REALITY_VISION_PORT "3443"
+  fi
+  if [[ -n "${HY2_PORT:-}" ]] && ! valid_port "$HY2_PORT"; then
+    warn "HY2_PORT 非法，已重置为 443：$HY2_PORT"
+    save_kv "$STATE_FILE" HY2_PORT "443"
+  fi
+  if [[ -n "${XHTTP_CDN_LOCAL_PORT:-}" ]] && ! valid_port "$XHTTP_CDN_LOCAL_PORT"; then
+    warn "XHTTP_CDN_LOCAL_PORT 非法，已重置为 31301：$XHTTP_CDN_LOCAL_PORT"
+    save_kv "$STATE_FILE" XHTTP_CDN_LOCAL_PORT "31301"
+  fi
+
+  load_state
+  if [[ "${PROTOCOLS:-0}" == *1* && "${PROTOCOLS:-0}" == *4* && -n "${XHTTP_REALITY_PORT:-}" && "${XHTTP_REALITY_PORT:-}" == "${REALITY_VISION_PORT:-}" ]]; then
+    warn "XHTTP+REALITY 与 REALITY+Vision 端口相同，已将 REALITY+Vision 重置为 3443。"
+    save_kv "$STATE_FILE" REALITY_VISION_PORT "3443"
+  fi
+
+  if [[ -n "${REALITY_TARGET:-}" ]] && ! validate_hostname "$REALITY_TARGET"; then
+    warn "REALITY_TARGET 非法，已重置为 www.microsoft.com：$REALITY_TARGET"
+    save_kv "$STATE_FILE" REALITY_TARGET "www.microsoft.com"
+  fi
+  if [[ -n "${XHTTP_REALITY_PATH:-}" ]] && ! valid_safe_xray_path "$XHTTP_REALITY_PATH"; then
+    warn "XHTTP_REALITY_PATH 非法，已重新生成。"
+    save_kv "$STATE_FILE" XHTTP_REALITY_PATH "$(rand_path)"
+  fi
+  if [[ -n "${XHTTP_CDN_PATH:-}" ]] && ! valid_safe_xray_path "$XHTTP_CDN_PATH"; then
+    warn "XHTTP_CDN_PATH 非法，已重新生成。"
+    save_kv "$STATE_FILE" XHTTP_CDN_PATH "$(rand_path)"
+  fi
+  if [[ -n "${HY2_AUTH:-}" ]] && ! valid_safe_token "$HY2_AUTH"; then
+    warn "HY2_AUTH 非法，已重新生成。"
+    save_kv "$STATE_FILE" HY2_AUTH "$(rand_hex 16)"
+  fi
+
+  validate_or_regen_token SUB_TOKEN
+  validate_or_regen_token MERGED_SUB_TOKEN
+  load_state
+}
+
+ensure_hy2_certificate_ready(){
+  load_state
+  protocol_enabled 3 || return 0
+  [[ -n "${BASE_DOMAIN:-}" ]] || configure_base_domain
+  if [[ ! -f "/etc/letsencrypt/live/${BASE_DOMAIN}/fullchain.pem" || ! -f "/etc/letsencrypt/live/${BASE_DOMAIN}/privkey.pem" ]]; then
+    warn "检测到启用了 HY2，但本机缺少 ${BASE_DOMAIN} 证书；生成 Xray 配置前先申请证书。"
+    issue_certificate
+  else
+    sync_xray_certificate
+  fi
+  [[ -f "${XRAY_CERT_DIR}/${BASE_DOMAIN}/fullchain.pem" && -f "${XRAY_CERT_DIR}/${BASE_DOMAIN}/privkey.pem" ]] || die "HY2 证书副本不可用：${XRAY_CERT_DIR}/${BASE_DOMAIN}"
+}
+
 generate_keys_if_needed(){
   load_state
   command -v xray >/dev/null 2>&1 || die "请先安装 Xray。"
+  if [[ -n "${UUID:-}" ]] && ! valid_uuid_literal "$UUID"; then
+    warn "UUID 格式非法，已重新生成。"
+    save_kv "$STATE_FILE" UUID ""
+    load_state
+  fi
+  if [[ -n "${REALITY_PRIVATE_KEY:-}" ]] && ! validate_x25519_key "$REALITY_PRIVATE_KEY"; then
+    warn "REALITY_PRIVATE_KEY 格式非法，已重新生成。"
+    save_kv "$STATE_FILE" REALITY_PRIVATE_KEY ""
+    load_state
+  fi
+  if [[ -n "${REALITY_PUBLIC_KEY:-}" ]] && ! validate_x25519_key "$REALITY_PUBLIC_KEY"; then
+    warn "REALITY_PUBLIC_KEY 格式非法，已重新生成。"
+    save_kv "$STATE_FILE" REALITY_PUBLIC_KEY ""
+    load_state
+  fi
+
   [[ -n "${UUID:-}" ]] || save_kv "$STATE_FILE" UUID "$(xray uuid)"
+  load_state
   if [[ -z "${REALITY_PRIVATE_KEY:-}" || -z "${REALITY_PUBLIC_KEY:-}" ]]; then
     local raw_output priv pub first_candidate second_candidate
     raw_output=$(NO_COLOR=1 xray x25519 2>&1 | sed -r 's/\x1B\[[0-9;]*[mK]//g' | tr -d '\r' || true)
 
     # Prefer semantic labels, because xray output wording is more stable than line numbers.
-    priv=$(printf '%s\n' "$raw_output" | grep -iE 'Private[ _-]?key|PrivateKey|Seed' | awk -F':' '{print $2}' | tr -d '[:space:]' | head -n1)
-    pub=$(printf '%s\n' "$raw_output" | grep -iE 'Public[ _-]?key|PublicKey|Password|Client' | awk -F':' '{print $2}' | tr -d '[:space:]' | head -n1)
+    priv=$(printf '%s\n' "$raw_output" | grep -iE 'Private[ _-]?key|PrivateKey|Seed' | awk -F':' '{print $2}' | tr -d '[:space:]' | head -n1 || true)
+    pub=$(printf '%s\n' "$raw_output" | grep -iE 'Public[ _-]?key|PublicKey|Password|Client' | awk -F':' '{print $2}' | tr -d '[:space:]' | head -n1 || true)
 
     # Fallback: extract the first two base64url-looking tokens if labels change.
     if ! validate_x25519_key "${priv:-}" || ! validate_x25519_key "${pub:-}"; then
@@ -1487,8 +1620,7 @@ generate_keys_if_needed(){
   load_state
   # SECURITY FIX: validate tokens; auto-regenerate if format is invalid
   # (32-128 char hex; old installs keep 32, new installs default to 64).
-  validate_or_regen_token SUB_TOKEN
-  validate_or_regen_token MERGED_SUB_TOKEN
+  validate_state_or_regen
 }
 
 backup_configs(){
@@ -1813,7 +1945,9 @@ generate_xray_config(){
   [[ -n "${BASE_DOMAIN:-}" ]] || configure_base_domain
   [[ -n "${REALITY_TARGET:-}" ]] || choose_reality_target
   generate_keys_if_needed
+  validate_state_or_regen
   load_state
+  ensure_hy2_certificate_ready
   preflight_ports
   backup_configs
   ensure_xray_user
@@ -2100,6 +2234,7 @@ configure_nginx(){
   [[ -n "${BASE_DOMAIN:-}" ]] || configure_base_domain
   [[ -f "/etc/letsencrypt/live/${BASE_DOMAIN}/fullchain.pem" ]] || issue_certificate
   generate_keys_if_needed
+  validate_state_or_regen
   load_state
   mkdir -p "$APP_DIR" "$SUB_DIR" "$BESTCF_DIR" "$BACKUP_DIR"
   cleanup_legacy_nginx_conf
@@ -2533,7 +2668,12 @@ ensure_bestcf_data_if_needed(){
     return 0
   fi
 
-  info "正在拉取最新 BestCF 数据。若远端不可用，协议 5 将退回普通 CDN Entry。"
+  if [[ "${BESTCF_FETCHED_THIS_RUN:-0}" == "1" ]]; then
+    info "本轮已拉取过 BestCF 数据，跳过重复请求。"
+    return 0
+  fi
+
+  info "正在拉取最新 BestCF 数据。若远端不可用，将保留本地旧缓存；若本地也无缓存，协议 5 才退回普通 CDN Entry。"
   fetch_bestcf_all || true
 }
 
@@ -2541,6 +2681,7 @@ generate_subscription(){
   load_state
   [[ -n "${BASE_DOMAIN:-}" ]] || die "请先设置母域名。"
   generate_keys_if_needed
+  validate_state_or_regen
   load_state
   ensure_bestcf_data_if_needed
   load_state
@@ -2740,6 +2881,7 @@ enable_hy2_hopping(){
   fi
   if [[ "${XEM_INTERNAL_APPLY_HY2:-0}" != "1" ]]; then
     install_hy2_hopping_service
+    regenerate_subscriptions_after_change
   fi
   log "端口跳跃规则已设置。请确认云安全组放行 UDP $start-${end}。"
 }
@@ -3135,9 +3277,9 @@ fetch_bestcf_all(){
   mkdir -p "$BESTCF_DIR"
 
   # BestCF is only a CDN acceleration entry, not a basic connectivity dependency.
-  # Success: use this round's fresh remote data for CFDomain / ISP IP nodes.
-  # Failure: do not use any third-party fallback; clear local BestCF cache so
-  # protocol 5 falls back to the user's own BASE_DOMAIN CDN entry.
+  # Success: atomically replace local cache with this round's fresh remote data.
+  # Failure: keep the previous local cache intact. Only when there is no cache at
+  # all will protocol 5 fall back to the user's own BASE_DOMAIN CDN entry.
   local asset ok=0 tmp_dir
   tmp_dir="$(mktemp_dir "$BESTCF_DIR/.fetch.XXXXXX")"
 
@@ -3152,19 +3294,20 @@ fetch_bestcf_all(){
   download_bestcf_asset "proxy-ip.txt" "$tmp_dir/proxy-ip.txt" "ip" && ok=1 || true
   download_bestcf_asset "bestcf-domain.txt" "$tmp_dir/bestcf-domain.txt" "domain" && ok=1 || true
 
-  for asset in $BESTCF_ASSETS; do
-    rm -f "$BESTCF_DIR/$asset" "$BESTCF_DIR/$asset.tmp" "$BESTCF_DIR/$asset.raw"
-    if [[ -s "$tmp_dir/$asset" ]]; then
-      mv -f "$tmp_dir/$asset" "$BESTCF_DIR/$asset"
-    fi
-  done
+  if [[ "$ok" == "1" ]]; then
+    for asset in $BESTCF_ASSETS; do
+      rm -f "$BESTCF_DIR/$asset" "$BESTCF_DIR/$asset.tmp" "$BESTCF_DIR/$asset.raw"
+      if [[ -s "$tmp_dir/$asset" ]]; then
+        mv -f "$tmp_dir/$asset" "$BESTCF_DIR/$asset"
+      fi
+    done
+    log "BestCF 已使用本轮远端最新数据刷新。"
+  else
+    warn "BestCF 远端数据不可用，已保留本地旧缓存。若本地无缓存，本次订阅会退回普通母域名 CDN Entry。"
+  fi
+  export BESTCF_FETCHED_THIS_RUN=1
   rm -rf "$tmp_dir"
 
-  if [[ "$ok" != "1" ]]; then
-    warn "BestCF 远端数据不可用，已清空本地 BestCF 缓存。本次订阅会退回普通母域名 CDN Entry。"
-  else
-    log "BestCF 已使用本轮远端最新数据刷新。"
-  fi
   # Warn if domain mode requires bestcf-domain.txt but it is missing.
   if [[ "${BESTCF_ENABLED:-0}" == "1" && "${BESTCF_MODE:-off}" == "domain" ]] && [[ ! -s "$BESTCF_DIR/bestcf-domain.txt" ]]; then
     warn "当前为 domain 模式，但 bestcf-domain.txt 不可用，将退回母域名 CDN Entry。"
@@ -3859,6 +4002,9 @@ remove_hy2_hopping_rules(){
   save_kv "$STATE_FILE" HY2_HOP_RANGE_V6 ""
   save_kv "$STATE_FILE" HY2_HOP_TO_PORT_V4 ""
   save_kv "$STATE_FILE" HY2_HOP_TO_PORT_V6 ""
+  if [[ "${XEM_SKIP_SUB_REGEN:-0}" != "1" ]]; then
+    regenerate_subscriptions_after_change
+  fi
   log "已删除 HY2 端口跳跃规则，并清空持久化状态，开机不会自动恢复旧规则。"
 }
 
@@ -3946,11 +4092,15 @@ full_uninstall_xem(){
   confirm "确认完整卸载？" "N" || { warn "已取消。"; return 0; }
   confirm "再次确认：允许清理 Nginx/Xray/证书/状态文件？" "N" || { warn "已取消。"; return 0; }
 
-  mkdir -p "$BACKUP_DIR" 2>/dev/null || true
-  local ts; ts=$(date +%F-%H%M%S)
-  [[ -f "$XRAY_CONFIG" ]] && cp -a "$XRAY_CONFIG" "$BACKUP_DIR/config.json.before-uninstall.$ts.bak" 2>/dev/null || true
-  [[ -f "$NGINX_SITE" ]] && cp -a "$NGINX_SITE" "$BACKUP_DIR/nginx.before-uninstall.$ts.bak" 2>/dev/null || true
-  [[ -f "$STATE_FILE" ]] && cp -a "$STATE_FILE" "$BACKUP_DIR/state.env.before-uninstall.$ts.bak" 2>/dev/null || true
+  local uninstall_backup_dir ts
+  ts=$(date +%F-%H%M%S)
+  uninstall_backup_dir="/root/xem-uninstall-backups/$ts"
+  mkdir -p "$uninstall_backup_dir" 2>/dev/null || true
+  chmod 700 /root/xem-uninstall-backups "$uninstall_backup_dir" 2>/dev/null || true
+  [[ -f "$XRAY_CONFIG" ]] && cp -a "$XRAY_CONFIG" "$uninstall_backup_dir/config.json.before-uninstall.bak" 2>/dev/null || true
+  [[ -f "$NGINX_SITE" ]] && cp -a "$NGINX_SITE" "$uninstall_backup_dir/nginx.before-uninstall.bak" 2>/dev/null || true
+  [[ -f "$STATE_FILE" ]] && cp -a "$STATE_FILE" "$uninstall_backup_dir/state.env.before-uninstall.bak" 2>/dev/null || true
+  log "卸载前备份已保存到：$uninstall_backup_dir"
 
   if confirm "是否删除 Cloudflare DNS？默认不删" "N"; then
     delete_cloudflare_records_menu || true
@@ -3965,7 +4115,7 @@ full_uninstall_xem(){
   rm -f /etc/systemd/system/xem-geodata-update.service /etc/systemd/system/xem-geodata-update.timer
   rm -f /etc/systemd/system/xem-hy2-hopping.service /etc/systemd/system/xem-cf-origin-firewall.service
   rm -f "$CERT_DEPLOY_HOOK" /etc/logrotate.d/xray 2>/dev/null || true
-  remove_hy2_hopping_rules || true
+  XEM_SKIP_SUB_REGEN=1 remove_hy2_hopping_rules || true
   disable_cf_origin_firewall || true
 
   # Do not fetch and execute the remote Xray installer during uninstall.
@@ -4034,7 +4184,7 @@ main_menu(){
   load_state
   while true; do
     echo
-    echo "===== Xray Edge Manager v0.0.36-rc14-input-warp-audit ====="
+    echo "===== Xray Edge Manager v0.0.36-rc15-fixed ====="
     echo "1. 首次部署向导，推荐"
     echo "2. 安装/升级基础依赖"
     echo "3. 安装/升级 Xray-core"
@@ -4078,7 +4228,7 @@ main_menu(){
       6) setup_cloudflare; create_dns_records; pause ;;
       7) issue_certificate; pause ;;
       8) asn_report; pause ;;
-      9) asn_report; select_ip_stack_strategy; select_protocols; create_dns_records; choose_reality_target; generate_xray_config; configure_nginx; restart_services; regenerate_subscriptions_after_change; pause ;;
+      9) asn_report; select_ip_stack_strategy; select_protocols; create_dns_records; choose_reality_target; ensure_hy2_certificate_ready; generate_xray_config; configure_nginx; restart_services; regenerate_subscriptions_after_change; pause ;;
       10) configure_nginx; pause ;;
       11) bestcf_menu ;;
       12) configure_hy2_hopping_prompt; pause ;;
@@ -4123,6 +4273,7 @@ case "${1:-}" in
     load_state
     if [[ -n "${HY2_HOP_RANGE:-}" ]]; then
       XEM_INTERNAL_APPLY_HY2=1 enable_hy2_hopping "$HY2_HOP_RANGE"
+      regenerate_subscriptions_after_change || true
     fi
     exit 0
     ;;
