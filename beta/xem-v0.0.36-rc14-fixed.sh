@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Xray Edge Manager / Xray Anti-Block Manager
-# v0.0.33-rc11-force-v4-egress — rc10 + optional IPv4-only egress for dual-stack nodes
+# v0.0.36-rc14-fixed — rc14 + service-apply, DNS-delete guard, port-conflict guard, HY2 v4/v6 hopping guards
 #
 # Features:
 # - Xray-core only, no Docker, no sing-box
@@ -47,6 +47,7 @@ CF_ENV="$APP_DIR/cloudflare.env"
 CF_CRED="$APP_DIR/cloudflare.ini"
 SUB_DIR="$APP_DIR/subscription"
 REMOTES_FILE="$SUB_DIR/remotes.conf"
+WARP_OUTBOUND_FILE_DEFAULT="$APP_DIR/warp-outbound.json"
 BESTCF_DIR="$APP_DIR/bestcf"
 BACKUP_DIR="$APP_DIR/backups"
 DEBUG_DIR="$APP_DIR/debug"
@@ -82,6 +83,13 @@ REMOTE_SUB_MAX_BYTES="${XEM_REMOTE_SUB_MAX_BYTES:-2097152}"
 SUB_TOKEN_HEX_BYTES="${XEM_SUB_TOKEN_HEX_BYTES:-32}"
 # New installs use 64 hex chars by default. Existing 32-char tokens remain valid.
 [[ "$SUB_TOKEN_HEX_BYTES" =~ ^[0-9]+$ ]] && [[ "$SUB_TOKEN_HEX_BYTES" -ge 16 ]] && [[ "$SUB_TOKEN_HEX_BYTES" -le 64 ]] || SUB_TOKEN_HEX_BYTES=32
+
+# Must check root before touching /root. Otherwise a normal user sees a raw
+# mkdir/chmod permission failure instead of the intended diagnostic.
+if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+  echo -e "\033[31m[ERR]\033[0m 请使用 root 运行。" >&2
+  exit 1
+fi
 
 mkdir -p "$APP_DIR" "$APP_DIR/tmp" "$SUB_DIR" "$BESTCF_DIR" "$BACKUP_DIR" "$DEBUG_DIR"
 # SECURITY FIX: ensure APP_DIR and its tmp subdir are only accessible by root,
@@ -173,13 +181,13 @@ allowed_state_key(){
     UUID|REALITY_PRIVATE_KEY|REALITY_PUBLIC_KEY|SHORT_ID|XHTTP_REALITY_PATH|XHTTP_CDN_PATH|HY2_AUTH)
       return 0
       ;;
-    SUB_TOKEN|MERGED_SUB_TOKEN|CERT_EMAIL|REALITY_TARGET|ENABLE_IP_STACK_BINDING|IP_OUTBOUND_MODE)
+    SUB_TOKEN|MERGED_SUB_TOKEN|CERT_EMAIL|REALITY_TARGET|ENABLE_IP_STACK_BINDING|IP_OUTBOUND_MODE|WARP_OUTBOUND_FILE)
       return 0
       ;;
     BESTCF_ENABLED|BESTCF_MODE|BESTCF_PER_CATEGORY_LIMIT|BESTCF_TOTAL_LIMIT)
       return 0
       ;;
-    HY2_HOP_RANGE|HY2_HOP_TO_PORT|ENABLE_CF_ORIGIN_FIREWALL)
+    HY2_HOP_RANGE|HY2_HOP_TO_PORT|HY2_HOP_RANGE_V4|HY2_HOP_RANGE_V6|HY2_HOP_TO_PORT_V4|HY2_HOP_TO_PORT_V6|HY2_HOP_V4_READY|HY2_HOP_V6_READY|ENABLE_CF_ORIGIN_FIREWALL)
       return 0
       ;;
     LAST_XRAY_BACKUP|LAST_NGINX_BACKUP|LAST_SYSCTL_BACKUP)
@@ -238,7 +246,10 @@ safe_source_env_file(){
         ;;
     esac
 
-    allowed_state_key "$key" || die "状态文件包含未知键，拒绝加载：$file:$n key=$key"
+    if ! allowed_state_key "$key"; then
+      warn "状态文件包含未知键，已忽略：$file:$n key=$key"
+      continue
+    fi
 
     # Safely assign to global scope via declare -g (bash 4.2+)
     declare -g "$key=$val"
@@ -362,6 +373,32 @@ validate_hostname(){
   [[ "$d" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,}$ ]] || return 1
 }
 
+valid_ipv4_literal(){
+  local ip="$1" IFS=. a b c d
+  [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+  read -r a b c d <<< "$ip"
+  for n in "$a" "$b" "$c" "$d"; do
+    [[ "$n" =~ ^[0-9]+$ ]] || return 1
+    (( 10#$n >= 0 && 10#$n <= 255 )) || return 1
+  done
+}
+
+valid_ipv6_literal(){
+  local ip="$1"
+  [[ -n "$ip" && "$ip" == *:* ]] || return 1
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "$ip" <<'PYV6' >/dev/null 2>&1
+import ipaddress, sys
+try:
+    ipaddress.IPv6Address(sys.argv[1])
+except Exception:
+    raise SystemExit(1)
+PYV6
+    return $?
+  fi
+  [[ "$ip" =~ ^[0-9A-Fa-f:]+$ ]]
+}
+
 public_ipv4(){
   curl -4 -fsS --max-time 8 https://api.ipify.org 2>/dev/null || \
   curl -4 -fsS --max-time 8 https://ifconfig.co/ip 2>/dev/null || true
@@ -374,8 +411,17 @@ public_ipv6(){
 
 detect_public_ips(){
   local cur4 cur6 old4="${PUBLIC_IPV4:-}" old6="${PUBLIC_IPV6:-}"
-  cur4="$(public_ipv4 || true)"
-  cur6="$(public_ipv6 || true)"
+  cur4="$(public_ipv4 | tr -d '[:space:]' || true)"
+  cur6="$(public_ipv6 | tr -d '[:space:]' || true)"
+
+  if [[ -n "$cur4" ]] && ! valid_ipv4_literal "$cur4"; then
+    warn "公网 IPv4 检测结果不是合法 IP，已丢弃：$cur4"
+    cur4=""
+  fi
+  if [[ -n "$cur6" ]] && ! valid_ipv6_literal "$cur6"; then
+    warn "公网 IPv6 检测结果不是合法 IP，已丢弃：$cur6"
+    cur6=""
+  fi
 
   if [[ -n "$cur4" ]]; then
     save_kv "$STATE_FILE" PUBLIC_IPV4 "$cur4"
@@ -393,7 +439,7 @@ detect_public_ips(){
 
 local_ipv4_for_bind(){
   local public_ip="$1" src
-  if [[ -n "$public_ip" ]] && ip -4 addr show | grep -qw "$public_ip"; then
+  if [[ -n "$public_ip" ]] && ip -4 addr show | grep -Fqw "$public_ip"; then
     echo "$public_ip"; return 0
   fi
   [[ -n "$public_ip" ]] && warn "公网 IPv4 不在本机网卡上，可能是 NAT 环境：$public_ip"
@@ -409,7 +455,7 @@ local_ipv4_for_bind(){
 
 local_ipv6_for_bind(){
   local public_ip="$1" src
-  if [[ -n "$public_ip" ]] && ip -6 addr show scope global | grep -qw "$public_ip"; then
+  if [[ -n "$public_ip" ]] && ip -6 addr show scope global | grep -Fqw "$public_ip"; then
     echo "$public_ip"; return 0
   fi
   [[ -n "$public_ip" ]] && warn "公网 IPv6 不在本机网卡上，可能是 NAT/特殊路由环境：$public_ip"
@@ -836,6 +882,14 @@ install_self_to_local_bin(){
   need_root
   mkdir -p /usr/local/bin
   if [[ -f "${BASH_SOURCE[0]:-}" && "${BASH_SOURCE[0]}" != /dev/fd/* && "${BASH_SOURCE[0]}" != /proc/* ]]; then
+    local src_self dst_self
+    src_self="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")"
+    dst_self="$(readlink -m /usr/local/bin/xem 2>/dev/null || printf '%s' /usr/local/bin/xem)"
+    if [[ "$src_self" == "$dst_self" ]]; then
+      chmod 755 /usr/local/bin/xem 2>/dev/null || true
+      log "当前脚本已是 /usr/local/bin/xem，跳过自我复制。"
+      return 0
+    fi
     install -m 755 "${BASH_SOURCE[0]}" /usr/local/bin/xem
     log "已安装本地命令：/usr/local/bin/xem"
     return 0
@@ -1194,29 +1248,52 @@ select_protocols(){
     detect_public_ips
     echo
     echo "===== 出口策略 ====="
-    echo "1. stack：v4 入站走 IPv4 出口，v6 入站走 IPv6 出口（原逻辑）"
-    echo "2. force-v4：v4/v6/CDN 入站全部强制 IPv4 出口，适合解决目标站 IPv6 兼容性问题"
+    echo "1. auto：推荐。检测到 IPv4 时，v4/v6/CDN 入站全部强制 IPv4 出口；纯 IPv6 机器则只让 Xray 用户代理流量走 WARP IPv4 出口"
+    echo "2. force-v4：v4/v6/CDN 入站全部强制 IPv4 出口；要求本机有可用 IPv4"
+    echo "3. warp-v4：v4/v6/CDN 入站全部走 Xray WireGuard/WARP 出口，并强制目标 IPv4；适合纯 IPv6 机器"
+    echo "4. stack：v4 入站走 IPv4 出口，v6 入站走 IPv6 出口（原逻辑，不推荐你的当前需求）"
     echo "0. none：不写入站到出站路由，交给 Xray 默认 direct"
     local outbound_choice outbound_default
-    outbound_default="${IP_OUTBOUND_MODE:-}"
-    if [[ -z "$outbound_default" ]]; then
-      if [[ "${ENABLE_IP_STACK_BINDING:-1}" == "1" ]]; then outbound_default="stack"; else outbound_default="none"; fi
-    fi
-    outbound_choice=$(ask "请选择出口策略（1/2/0 或 stack/force-v4/none）" "$outbound_default")
+    outbound_default="${IP_OUTBOUND_MODE:-auto}"
+    # Old installs often stored stack only because ENABLE_IP_STACK_BINDING was enabled.
+    # For this branch, the safer default is auto, matching the requested policy.
+    [[ -z "${IP_OUTBOUND_MODE:-}" && "${ENABLE_IP_STACK_BINDING:-1}" == "0" ]] && outbound_default="none"
+    outbound_choice=$(ask "请选择出口策略（1/2/3/4/0 或 auto/force-v4/warp-v4/stack/none）" "$outbound_default")
     case "$outbound_choice" in
-      1|stack|normal|same-stack)
-        save_kv "$STATE_FILE" IP_OUTBOUND_MODE "stack"
+      1|auto|default|recommended|推荐)
+        save_kv "$STATE_FILE" IP_OUTBOUND_MODE "auto"
         save_kv "$STATE_FILE" ENABLE_IP_STACK_BINDING "1"
+        if [[ -z "${PUBLIC_IPV4:-}" && -n "${PUBLIC_IPV6:-}" ]]; then
+          if [[ -z "${WARP_OUTBOUND_FILE:-}" ]]; then
+            save_kv "$STATE_FILE" WARP_OUTBOUND_FILE "$WARP_OUTBOUND_FILE_DEFAULT"
+          fi
+          warn "当前看起来是纯 IPv6 机器；auto 会解析为 warp-v4。请准备 WARP outbound JSON：${WARP_OUTBOUND_FILE:-$WARP_OUTBOUND_FILE_DEFAULT}"
+        fi
         ;;
       2|force-v4|v4|ipv4|all-v4)
         if [[ -n "${PUBLIC_IPV4:-}" ]]; then
           save_kv "$STATE_FILE" IP_OUTBOUND_MODE "force-v4"
           save_kv "$STATE_FILE" ENABLE_IP_STACK_BINDING "1"
         else
-          warn "未检测到 IPv4，不能启用 force-v4；已回退到 stack。"
-          save_kv "$STATE_FILE" IP_OUTBOUND_MODE "stack"
+          warn "未检测到 IPv4，force-v4 不成立；已改为 auto。纯 IPv6 机器会在生成 Xray 配置时解析为 warp-v4。"
+          save_kv "$STATE_FILE" IP_OUTBOUND_MODE "auto"
           save_kv "$STATE_FILE" ENABLE_IP_STACK_BINDING "1"
+          if [[ -z "${WARP_OUTBOUND_FILE:-}" ]]; then save_kv "$STATE_FILE" WARP_OUTBOUND_FILE "$WARP_OUTBOUND_FILE_DEFAULT"; fi
         fi
+        ;;
+      3|warp-v4|warp|warp4|warp-ipv4)
+        save_kv "$STATE_FILE" IP_OUTBOUND_MODE "warp-v4"
+        save_kv "$STATE_FILE" ENABLE_IP_STACK_BINDING "1"
+        if [[ -z "${WARP_OUTBOUND_FILE:-}" ]]; then
+          save_kv "$STATE_FILE" WARP_OUTBOUND_FILE "$WARP_OUTBOUND_FILE_DEFAULT"
+        fi
+        warn "已选择 warp-v4。请先把 wgcf-cli generate --xray 生成的 WireGuard outbound JSON 放到：${WARP_OUTBOUND_FILE:-$WARP_OUTBOUND_FILE_DEFAULT}"
+        warn "脚本生成 Xray 配置时会强制设置 tag=out-warp、domainStrategy=ForceIPv4、noKernelTun=true；不会修改系统默认路由。"
+        ;;
+      4|stack|normal|same-stack)
+        save_kv "$STATE_FILE" IP_OUTBOUND_MODE "stack"
+        save_kv "$STATE_FILE" ENABLE_IP_STACK_BINDING "1"
+        warn "已选择 stack：v6 入站会走 IPv6 出口，不符合你当前的 IPv6 兼容性目标。"
         ;;
       0|none|off|no)
         save_kv "$STATE_FILE" IP_OUTBOUND_MODE "none"
@@ -1224,11 +1301,18 @@ select_protocols(){
         warn "未写入入站到出站路由；监听仍会按 v4/v6 精确绑定。"
         ;;
       *)
-        warn "未知出口策略：$outbound_choice，已使用 stack。"
-        save_kv "$STATE_FILE" IP_OUTBOUND_MODE "stack"
+        warn "未知出口策略：$outbound_choice，已使用 auto。"
+        save_kv "$STATE_FILE" IP_OUTBOUND_MODE "auto"
         save_kv "$STATE_FILE" ENABLE_IP_STACK_BINDING "1"
         ;;
     esac
+  fi
+
+  # XHTTP+REALITY and REALITY+Vision are both TCP listeners. They must not share
+  # the same port even if Xray config generation happens to pass JSON validation.
+  if [[ "$p" == *1* && "$p" == *4* ]]; then
+    load_state
+    [[ "${XHTTP_REALITY_PORT:-2443}" != "${REALITY_VISION_PORT:-3443}" ]] || die "TCP 端口冲突：XHTTP+REALITY 与 REALITY+Vision 不能使用同一个端口。"
   fi
   load_state
   log "协议组合：$p"
@@ -1483,6 +1567,9 @@ preflight_ports(){
     p="${XHTTP_CDN_LOCAL_PORT:-31301}"; proc=$(get_proc_tcp "$p")
     [[ -z "$proc" || "$proc" == *xray* ]] || die "TCP $p 是 XHTTP CDN 本地回源端口，但已被非 Xray 进程占用：$proc"
   fi
+  if protocol_enabled 1 && protocol_enabled 4; then
+    [[ "${XHTTP_REALITY_PORT:-2443}" != "${REALITY_VISION_PORT:-3443}" ]] || die "TCP ${XHTTP_REALITY_PORT:-2443} 冲突：XHTTP+REALITY 与 REALITY+Vision 不能使用同一个 TCP 端口。"
+  fi
   if protocol_enabled 4; then
     p="${REALITY_VISION_PORT:-3443}"; proc=$(get_proc_tcp "$p")
     [[ "$p" != "$sub_port" ]] || die "TCP $p 冲突：订阅/伪装站由 Nginx 使用；REALITY+Vision 请改用 3443 等其它 TCP 端口。HY2 UDP 443 不受影响。"
@@ -1505,13 +1592,42 @@ append_json_obj(){
 normalize_ip_outbound_mode(){
   local mode="${1:-}"
   if [[ -z "$mode" ]]; then
-    if [[ "${ENABLE_IP_STACK_BINDING:-1}" == "1" ]]; then mode="stack"; else mode="none"; fi
+    if [[ "${ENABLE_IP_STACK_BINDING:-1}" == "0" ]]; then mode="none"; else mode="auto"; fi
   fi
   case "$mode" in
-    1|stack|normal|same-stack) echo "stack" ;;
+    1|auto|default|recommended|推荐) echo "auto" ;;
     2|force-v4|v4|ipv4|all-v4) echo "force-v4" ;;
+    3|warp-v4|warp|warp4|warp-ipv4) echo "warp-v4" ;;
+    4|stack|normal|same-stack) echo "stack" ;;
     0|none|off|no) echo "none" ;;
-    *) echo "stack" ;;
+    *) echo "auto" ;;
+  esac
+}
+
+resolve_ip_outbound_mode(){
+  local requested="$(normalize_ip_outbound_mode "${1:-}")" bind4="${2:-}" bind6="${3:-}"
+  case "$requested" in
+    auto)
+      if [[ -n "$bind4" ]]; then
+        echo "force-v4"
+      elif [[ -n "$bind6" ]]; then
+        echo "warp-v4"
+      else
+        echo "none"
+      fi
+      ;;
+    force-v4)
+      if [[ -n "$bind4" ]]; then
+        echo "force-v4"
+      elif [[ -n "$bind6" ]]; then
+        echo "warp-v4"
+      else
+        echo "none"
+      fi
+      ;;
+    warp-v4|stack|none)
+      echo "$requested"
+      ;;
   esac
 }
 
@@ -1520,6 +1636,9 @@ outbound_tag_for_stack(){
   case "$mode" in
     force-v4)
       echo "out-v4"
+      ;;
+    warp-v4)
+      echo "out-warp"
       ;;
     stack)
       case "$stack" in
@@ -1545,6 +1664,149 @@ append_route_for_inbound(){
 EOF2
 }
 
+warp_outbound_file_path(){
+  local f="${WARP_OUTBOUND_FILE:-}"
+  [[ -n "$f" ]] || f="$WARP_OUTBOUND_FILE_DEFAULT"
+  # Accept accidental surrounding whitespace from state files or manual input,
+  # but never allow control characters or an empty path.
+  f="$(printf '%s' "$f" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+  [[ -n "$f" ]] || die "WARP outbound 文件路径为空。"
+  if printf '%s' "$f" | LC_ALL=C grep -q '[[:cntrl:]]'; then
+    die "WARP outbound 文件路径包含控制字符，拒绝使用。"
+  fi
+  echo "$f"
+}
+
+sanitize_warp_outbound_json(){
+  local src="$1" dst="$2"
+  # Normalize user-provided wgcf/Xray JSON before validation. This accepts
+  # harmless copy/paste whitespace while keeping protocol/key/peer checks strict.
+  jq '
+    def trimstr: if type == "string" then gsub("^[[:space:]]+|[[:space:]]+$"; "") else . end;
+    .protocol |= trimstr
+    | .tag? |= trimstr
+    | .settings.secretKey? |= trimstr
+    | .settings.address? |= (if type == "array" then map(trimstr) elif type == "string" then trimstr else . end)
+    | .settings.peers? |= map(
+        .publicKey? |= trimstr
+        | .preSharedKey? |= trimstr
+        | .endpoint? |= trimstr
+        | .allowedIPs? |= (if type == "array" then map(trimstr) else . end)
+      )
+  ' "$src" > "$dst" || die "WARP outbound JSON 不是合法 JSON，或格式化清洗失败：$src"
+}
+
+validate_warp_outbound_json(){
+  local src="$1"
+  jq -e '
+    type == "object"
+    and .protocol == "wireguard"
+    and (.settings | type == "object")
+    and (.settings.secretKey | type == "string" and length > 0)
+    and (.settings.peers | type == "array" and length > 0)
+    and all(.settings.peers[];
+      (.publicKey | type == "string" and length > 0)
+      and (.endpoint | type == "string" and length > 0)
+    )
+  ' "$src" >/dev/null || die "WARP outbound JSON 格式不合格：必须是 Xray wireguard outbound 对象，并包含 settings.secretKey、settings.peers[].publicKey、settings.peers[].endpoint。"
+}
+
+validate_warp_ipv6_endpoints_for_ipv6_only(){
+  local src="$1" bad
+  bad="$(jq -r '
+    def ipv6_ep_ok:
+      test("^\\[[0-9A-Fa-f:.]+\\]:[0-9]+$")
+      and ((capture(":(?<port>[0-9]+)$").port | tonumber? // 0) >= 1)
+      and ((capture(":(?<port>[0-9]+)$").port | tonumber? // 0) <= 65535);
+    .settings.peers[]?.endpoint // empty | select(ipv6_ep_ok | not)
+  ' "$src" | head -n 5)"
+  if [[ -n "$bad" ]]; then
+    err "纯 IPv6 机器使用 warp-v4 时，WARP peer endpoint 必须是 IPv6 字面量且端口有效。"
+    err "示例：[2606:4700:d0::a29f:c001]:2408"
+    err "发现不合格 endpoint："
+    printf '%s\n' "$bad" >&2
+    die "请不要使用 IPv4 endpoint、域名 endpoint、空 endpoint 或非法端口。前后空格会自动 trim，但内容本身必须合格。"
+  fi
+}
+
+validate_and_append_warp_outbound(){
+  local file="$1" first_ref="$2" warp_file clean_tmp tmp
+  warp_file="$(warp_outbound_file_path)"
+  [[ -f "$warp_file" ]] || die "未找到 WARP outbound JSON：$warp_file。请先使用 wgcf-cli generate --xray 生成，并复制到该路径。"
+  [[ ! -L "$warp_file" ]] || die "拒绝读取符号链接 WARP outbound 文件：$warp_file"
+
+  clean_tmp="$(mktemp_file "$APP_DIR/tmp/warp-outbound.clean.XXXXXX.json")"
+  sanitize_warp_outbound_json "$warp_file" "$clean_tmp"
+  validate_warp_outbound_json "$clean_tmp"
+  if [[ -z "${PUBLIC_IPV4:-}" ]]; then
+    validate_warp_ipv6_endpoints_for_ipv6_only "$clean_tmp"
+  fi
+
+  tmp="$(mktemp_file "$APP_DIR/tmp/warp-outbound.XXXXXX.json")"
+  # Enforce a stable tag and IPv4 target resolution. noKernelTun=true keeps WARP
+  # inside Xray and avoids changing the host default route, which is important
+  # for keeping public IPv4/IPv6 inbounds reachable.
+  jq '
+    .tag="out-warp"
+    | .settings.domainStrategy="ForceIPv4"
+    | .settings.noKernelTun=true
+    | .settings.peers |= map(
+        .allowedIPs = (["0.0.0.0/0"] + ((.allowedIPs // []) | map(select(. != "0.0.0.0/0" and . != "::/0"))))
+      )
+  ' "$clean_tmp" > "$tmp" || die "处理 WARP outbound JSON 失败。"
+  append_json_obj "$file" "$first_ref" < "$tmp"
+}
+
+inspect_generated_xray_config(){
+  local conf="$1" report="$2"
+  : > "$report"
+
+  jq -e '
+    type == "object"
+    and (.inbounds | type == "array")
+    and (.outbounds | type == "array")
+    and (.routing | type == "object")
+    and (.routing.rules | type == "array")
+  ' "$conf" >/dev/null 2>>"$report" || {
+    echo "Xray candidate JSON 顶层结构不完整：必须包含 inbounds/outbounds/routing.rules 数组。" >>"$report"
+    return 1
+  }
+
+  local dup_in dup_out missing_out empty_tag
+  dup_in="$(jq -r '.inbounds[]?.tag // empty' "$conf" | sort | uniq -d | sed -n '1,20p')"
+  dup_out="$(jq -r '.outbounds[]?.tag // empty' "$conf" | sort | uniq -d | sed -n '1,20p')"
+  empty_tag="$(jq -r '
+    [(.inbounds[]? | select((.tag // "") == "") | "inbound missing tag"),
+     (.outbounds[]? | select((.tag // "") == "") | "outbound missing tag")]
+    | .[]
+  ' "$conf" | sed -n '1,20p')"
+  missing_out="$(jq -r '
+    ([.outbounds[]?.tag] | map(select(type == "string" and length > 0))) as $outs
+    | .routing.rules[]?
+    | select(has("outboundTag") and ((.outboundTag as $o | $outs | index($o)) | not))
+    | .outboundTag
+  ' "$conf" | sort -u | sed -n '1,20p')"
+
+  if [[ -n "$empty_tag" ]]; then
+    echo "存在缺失 tag 的 inbound/outbound：" >>"$report"
+    printf '%s\n' "$empty_tag" >>"$report"
+  fi
+  if [[ -n "$dup_in" ]]; then
+    echo "存在重复 inbound tag：" >>"$report"
+    printf '%s\n' "$dup_in" >>"$report"
+  fi
+  if [[ -n "$dup_out" ]]; then
+    echo "存在重复 outbound tag：" >>"$report"
+    printf '%s\n' "$dup_out" >>"$report"
+  fi
+  if [[ -n "$missing_out" ]]; then
+    echo "routing.rules 引用了不存在的 outboundTag：" >>"$report"
+    printf '%s\n' "$missing_out" >>"$report"
+  fi
+
+  [[ ! -s "$report" ]]
+}
+
 generate_xray_config(){
   need_root
   load_state
@@ -1565,10 +1827,17 @@ generate_xray_config(){
   ip4="${PUBLIC_IPV4:-}"; ip6="${PUBLIC_IPV6:-}"
   [[ -n "$ip4" ]] && bind_ip4=$(local_ipv4_for_bind "$ip4") && save_kv "$STATE_FILE" BIND_IPV4 "$bind_ip4"
   [[ -n "$ip6" ]] && bind_ip6=$(local_ipv6_for_bind "$ip6") && save_kv "$STATE_FILE" BIND_IPV6 "$bind_ip6"
-  outbound_mode="$(normalize_ip_outbound_mode "${IP_OUTBOUND_MODE:-}")"
-  if [[ "$outbound_mode" == "force-v4" && -z "$bind_ip4" ]]; then
-    warn "已选择 force-v4，但本机未检测到可用 IPv4，自动回退到 stack。"
-    outbound_mode="stack"
+  local requested_outbound_mode
+  requested_outbound_mode="$(normalize_ip_outbound_mode "${IP_OUTBOUND_MODE:-}")"
+  outbound_mode="$(resolve_ip_outbound_mode "$requested_outbound_mode" "$bind_ip4" "$bind_ip6")"
+  if [[ "$requested_outbound_mode" != "$outbound_mode" ]]; then
+    info "出口策略 ${requested_outbound_mode} 已按本机 IP 栈解析为：${outbound_mode}"
+  fi
+  if [[ "$outbound_mode" == "warp-v4" ]]; then
+    save_kv "$STATE_FILE" WARP_OUTBOUND_FILE "$(warp_outbound_file_path)"
+    if [[ -n "$bind_ip4" ]]; then
+      warn "当前机器检测到 IPv4，仍选择了 warp-v4；如非专门测试，建议改回 auto 或 force-v4，避免 WARP 增加延迟。"
+    fi
   fi
   bind="${ENABLE_IP_STACK_BINDING:-1}"
   [[ "$outbound_mode" != "none" ]] && bind="1"
@@ -1590,6 +1859,9 @@ EOF2
   append_json_obj "$out_tmp" first_out <<'EOF2'
     {"tag":"block","protocol":"blackhole"}
 EOF2
+  if [[ "$outbound_mode" == "warp-v4" ]]; then
+    validate_and_append_warp_outbound "$out_tmp" first_out
+  fi
   if [[ "$bind" == "1" && -n "$bind_ip4" && "$bind_ip4" != "0.0.0.0" ]]; then
     append_json_obj "$out_tmp" first_out <<EOF2
     {"tag":"out-v4","protocol":"freedom","sendThrough":"${bind_ip4}","settings":{"domainStrategy":"UseIPv4"}}
@@ -1704,6 +1976,24 @@ EOF2
     err "生成的 Xray JSON 非法，已阻断更新，生产配置未被覆盖。"
     err "失败配置已保存：$debug_conf"
     die "请把该文件中的敏感字段脱敏后再发给别人审查。"
+  fi
+
+  local xray_audit_log
+  xray_audit_log=$(mktemp_file "$(dirname "$XRAY_CONFIG")/.xray-audit.XXXXXX.log")
+  if ! inspect_generated_xray_config "$xray_target_tmp" "$xray_audit_log"; then
+    local ts debug_conf debug_log
+    ts=$(date +%F-%H%M%S)
+    mkdir -p "$DEBUG_DIR"; chmod 700 "$DEBUG_DIR" 2>/dev/null || true
+    debug_conf="$DEBUG_DIR/failed-xray-audit.$ts.json"
+    debug_log="$DEBUG_DIR/failed-xray-audit.$ts.log"
+    cp -f "$xray_target_tmp" "$debug_conf" 2>/dev/null || true
+    cp -f "$xray_audit_log" "$debug_log" 2>/dev/null || true
+    chmod 600 "$debug_conf" "$debug_log" 2>/dev/null || true
+    err "生成的 Xray 配置自检失败，已阻断更新，生产配置未被覆盖。"
+    sed -n '1,160p' "$xray_audit_log" >&2 || true
+    err "失败配置已保存：$debug_conf"
+    err "自检日志已保存：$debug_log"
+    die "请先修复脚本生成逻辑或输入格式，再重新生成。"
   fi
 
   local xray_test_log
@@ -1966,11 +2256,21 @@ EOF2
   atomic_move_into_place "$nginx_target_tmp" "$NGINX_SITE" "644"
   if ! nginx -t; then
     restore_latest_nginx_config || true
-    nginx -t >/dev/null 2>&1 || warn "Nginx 回滚后配置测试仍失败，请人工检查 /etc/nginx 配置。"
+    if nginx -t >/dev/null 2>&1; then
+      systemctl reload nginx 2>/dev/null || systemctl restart nginx 2>/dev/null || warn "Nginx 已回滚但 reload/restart 旧配置失败，请人工检查服务状态。"
+    else
+      warn "Nginx 回滚后配置测试仍失败，请人工检查 /etc/nginx 配置。"
+    fi
     die "Nginx 配置测试失败，已尝试原子回滚。"
   fi
   systemctl enable nginx >/dev/null 2>&1 || true
-  if ! systemctl reload nginx && ! systemctl restart nginx; then restore_latest_nginx_config || true; die "Nginx reload/restart 失败，已回滚。"; fi
+  if ! systemctl reload nginx && ! systemctl restart nginx; then
+    restore_latest_nginx_config || true
+    if nginx -t >/dev/null 2>&1; then
+      systemctl reload nginx 2>/dev/null || systemctl restart nginx 2>/dev/null || warn "Nginx 已回滚但 reload/restart 旧配置失败，请人工检查服务状态。"
+    fi
+    die "Nginx reload/restart 失败，已回滚。"
+  fi
   log "Nginx / 伪装站 / 订阅路径 / 默认黑洞配置完成。"
 }
 
@@ -2040,11 +2340,33 @@ add_reality_vision_link(){
   echo "vless://${UUID}@${server_uri}:${REALITY_VISION_PORT}?encryption=none&security=reality&sni=${REALITY_TARGET}&fp=chrome&pbk=${REALITY_PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&flow=xtls-rprx-vision#$(uri_encode "$name")" >> "$raw"
 }
 
+hy2_hop_range_for_stack(){
+  local stack="$1"
+  case "$stack" in
+    v4)
+      if [[ "${HY2_HOP_V4_READY:-}" == "1" && -n "${HY2_HOP_RANGE_V4:-}" ]]; then
+        echo "$HY2_HOP_RANGE_V4"
+      elif [[ -z "${HY2_HOP_V4_READY+x}" && -n "${HY2_HOP_RANGE:-}" ]]; then
+        echo "$HY2_HOP_RANGE"
+      fi
+      ;;
+    v6)
+      if [[ "${HY2_HOP_V6_READY:-}" == "1" && -n "${HY2_HOP_RANGE_V6:-}" ]]; then
+        echo "$HY2_HOP_RANGE_V6"
+      elif [[ -z "${HY2_HOP_V6_READY+x}" && -n "${HY2_HOP_RANGE:-}" ]]; then
+        echo "$HY2_HOP_RANGE"
+      fi
+      ;;
+  esac
+}
+
 add_hy2_link(){
-  local server="$1" name="$2" raw="$3" server_uri mport_param=""
+  local server="$1" name="$2" raw="$3" server_uri mport_param="" hop_range="" stack="v4"
   server_uri=$(format_uri_host "$server")
-  if [[ -n "${HY2_HOP_RANGE:-}" ]]; then
-    mport_param="&mport=${HY2_HOP_RANGE/:/-}"
+  [[ "$server" == v6.* || "$server" == *:* ]] && stack="v6"
+  hop_range="$(hy2_hop_range_for_stack "$stack")"
+  if [[ -n "$hop_range" ]]; then
+    mport_param="&mport=${hop_range/:/-}"
   fi
   echo "hysteria2://${HY2_AUTH}@${server_uri}:${HY2_PORT:-443}?sni=${BASE_DOMAIN}&insecure=0&alpn=h3${mport_param}#$(uri_encode "$name")" >> "$raw"
 }
@@ -2170,8 +2492,10 @@ EOF2
     alpn:
       - h3
 EOF2
-      [[ -n "${HY2_HOP_RANGE:-}" ]] && cat >> "$f" <<EOF2
-    ports: ${HY2_HOP_RANGE/:/-}
+      local hop_range_v4
+      hop_range_v4="$(hy2_hop_range_for_stack v4)"
+      [[ -n "$hop_range_v4" ]] && cat >> "$f" <<EOF2
+    ports: ${hop_range_v4/:/-}
     hop-interval: 30
 EOF2
     fi
@@ -2187,8 +2511,10 @@ EOF2
     alpn:
       - h3
 EOF2
-      [[ -n "${HY2_HOP_RANGE:-}" ]] && cat >> "$f" <<EOF2
-    ports: ${HY2_HOP_RANGE/:/-}
+      local hop_range_v6
+      hop_range_v6="$(hy2_hop_range_for_stack v6)"
+      [[ -n "$hop_range_v6" ]] && cat >> "$f" <<EOF2
+    ports: ${hop_range_v6/:/-}
     hop-interval: 30
 EOF2
     fi
@@ -2349,7 +2675,7 @@ enable_hy2_hopping(){
   else
     ensure_iptables
   fi
-  local range="$1" start end to_port old_range old_to_port
+  local range="$1" start end to_port old_range old_to_port ip4_ok=0 ip6_ok=0
   to_port="${HY2_PORT:-443}"
   hy2_range_valid "$range" || die "端口范围格式错误。"
   valid_port "$to_port" || die "HY2_PORT 无效：$to_port"
@@ -2369,9 +2695,19 @@ enable_hy2_hopping(){
   start="${range%%:*}"; end="${range##*:}"
   info "设置 HY2 UDP 端口跳跃：$start-$end -> $to_port"
   remove_hy2_nat_range "$range" "$to_port"
-  iptables -t nat -A PREROUTING -p udp --dport "$start:$end" -j REDIRECT --to-ports "$to_port" || die "iptables 端口跳跃规则添加失败。"
+  if iptables -t nat -A PREROUTING -p udp --dport "$start:$end" -j REDIRECT --to-ports "$to_port"; then
+    ip4_ok=1
+  else
+    die "iptables 端口跳跃规则添加失败。"
+  fi
   if command -v ip6tables >/dev/null 2>&1; then
-    ip6tables -t nat -A PREROUTING -p udp --dport "$start:$end" -j REDIRECT --to-ports "$to_port" 2>/dev/null || warn "ip6tables 规则添加失败，IPv6 跳跃可能不可用。"
+    if ip6tables -t nat -A PREROUTING -p udp --dport "$start:$end" -j REDIRECT --to-ports "$to_port" 2>/dev/null; then
+      ip6_ok=1
+    else
+      warn "ip6tables 规则添加失败，IPv6 跳跃不会写入 v6 订阅 mport。"
+    fi
+  else
+    warn "未检测到 ip6tables，IPv6 跳跃不会写入 v6 订阅 mport。"
   fi
   refresh_udp_conntrack_for_hy2 "$start" "$end" "$to_port"
   if command -v netfilter-persistent >/dev/null 2>&1; then
@@ -2384,6 +2720,24 @@ enable_hy2_hopping(){
   fi
   save_kv "$STATE_FILE" HY2_HOP_RANGE "$range"
   save_kv "$STATE_FILE" HY2_HOP_TO_PORT "$to_port"
+  if [[ "$ip4_ok" == "1" ]]; then
+    save_kv "$STATE_FILE" HY2_HOP_V4_READY "1"
+    save_kv "$STATE_FILE" HY2_HOP_RANGE_V4 "$range"
+    save_kv "$STATE_FILE" HY2_HOP_TO_PORT_V4 "$to_port"
+  else
+    save_kv "$STATE_FILE" HY2_HOP_V4_READY "0"
+    save_kv "$STATE_FILE" HY2_HOP_RANGE_V4 ""
+    save_kv "$STATE_FILE" HY2_HOP_TO_PORT_V4 ""
+  fi
+  if [[ "$ip6_ok" == "1" ]]; then
+    save_kv "$STATE_FILE" HY2_HOP_V6_READY "1"
+    save_kv "$STATE_FILE" HY2_HOP_RANGE_V6 "$range"
+    save_kv "$STATE_FILE" HY2_HOP_TO_PORT_V6 "$to_port"
+  else
+    save_kv "$STATE_FILE" HY2_HOP_V6_READY "0"
+    save_kv "$STATE_FILE" HY2_HOP_RANGE_V6 ""
+    save_kv "$STATE_FILE" HY2_HOP_TO_PORT_V6 ""
+  fi
   if [[ "${XEM_INTERNAL_APPLY_HY2:-0}" != "1" ]]; then
     install_hy2_hopping_service
   fi
@@ -2586,9 +2940,18 @@ restart_services(){
   if [[ -f "$NGINX_SITE" ]]; then
     if ! nginx -t >/dev/null 2>&1; then
       restore_latest_nginx_config || true
+      if nginx -t >/dev/null 2>&1; then
+        systemctl reload nginx 2>/dev/null || systemctl restart nginx 2>/dev/null || warn "Nginx 已回滚但 reload/restart 旧配置失败，请人工检查服务状态。"
+      fi
       die "Nginx 配置测试失败，已回滚。"
     fi
-    systemctl reload nginx || systemctl restart nginx || { restore_latest_nginx_config || true; die "Nginx reload/restart 失败，已回滚。"; }
+    if ! systemctl reload nginx && ! systemctl restart nginx; then
+      restore_latest_nginx_config || true
+      if nginx -t >/dev/null 2>&1; then
+        systemctl reload nginx 2>/dev/null || systemctl restart nginx 2>/dev/null || warn "Nginx 已回滚但 reload/restart 旧配置失败，请人工检查服务状态。"
+      fi
+      die "Nginx reload/restart 失败，已回滚。"
+    fi
   fi
   log "服务已重启。"
 }
@@ -3118,6 +3481,10 @@ deployment_summary(){
   [[ -n "${HY2_HOP_RANGE:-}" ]] && echo "  HY2 端口跳跃: UDP ${HY2_HOP_RANGE/:/-} -> ${HY2_PORT:-443}"
   echo "Xray 运行用户: ${XRAY_USER}"
   echo "出口策略: $(normalize_ip_outbound_mode "${IP_OUTBOUND_MODE:-}")"
+  if [[ "$(normalize_ip_outbound_mode "${IP_OUTBOUND_MODE:-}")" == "auto" ]]; then
+    echo "  auto 规则: 有 IPv4 -> force-v4；纯 IPv6 -> warp-v4；只影响 Xray 用户代理流量，不修改系统默认路由"
+  fi
+  if [[ "$(normalize_ip_outbound_mode "${IP_OUTBOUND_MODE:-}")" == "warp-v4" || "$(normalize_ip_outbound_mode "${IP_OUTBOUND_MODE:-}")" == "auto" ]]; then echo "WARP outbound: $(warp_outbound_file_path)"; fi
   echo "Cloudflare 源站限制: ${ENABLE_CF_ORIGIN_FIREWALL:-0}"
   echo "BestCF: ${BESTCF_ENABLED:-0} / ${BESTCF_MODE:-off} / 每类${BESTCF_PER_CATEGORY_LIMIT:-2} / 总上限${BESTCF_TOTAL_LIMIT:-10}"
   if [[ -n "${BASE_DOMAIN:-}" && -n "${SUB_TOKEN:-}" ]] && subscription_web_file_exists "$SUB_TOKEN"; then
@@ -3275,6 +3642,20 @@ resolve_and_check_ssrf(){
   return 0
 }
 
+
+normalize_base64_file_for_decode(){
+  local input="$1" output="$2" s mod
+  s="$(tr -d '[:space:]' < "$input" | tr '_-' '/+')"
+  mod=$(( ${#s} % 4 ))
+  case "$mod" in
+    0) ;;
+    2) s="${s}==" ;;
+    3) s="${s}=" ;;
+    *) return 1 ;;
+  esac
+  printf '%s' "$s" > "$output"
+}
+
 merge_remote_subscriptions(){
   load_state
   generate_keys_if_needed
@@ -3346,7 +3727,9 @@ merge_remote_subscriptions(){
       continue
     fi
 
-    if ! base64 -d "$fetch_file" > "$decoded_file" 2>/dev/null; then
+    local normalized_b64_file
+    normalized_b64_file="$(mktemp_file "$APP_DIR/tmp/remote-sub-normalized.XXXXXX")"
+    if ! normalize_base64_file_for_decode "$fetch_file" "$normalized_b64_file" || ! base64 -d "$normalized_b64_file" > "$decoded_file" 2>/dev/null; then
       warn "解码失败：$name"
       continue
     fi
@@ -3470,6 +3853,12 @@ remove_hy2_hopping_rules(){
   command -v netfilter-persistent >/dev/null 2>&1 && netfilter-persistent save || true
   save_kv "$STATE_FILE" HY2_HOP_RANGE ""
   save_kv "$STATE_FILE" HY2_HOP_TO_PORT ""
+  save_kv "$STATE_FILE" HY2_HOP_V4_READY "0"
+  save_kv "$STATE_FILE" HY2_HOP_V6_READY "0"
+  save_kv "$STATE_FILE" HY2_HOP_RANGE_V4 ""
+  save_kv "$STATE_FILE" HY2_HOP_RANGE_V6 ""
+  save_kv "$STATE_FILE" HY2_HOP_TO_PORT_V4 ""
+  save_kv "$STATE_FILE" HY2_HOP_TO_PORT_V6 ""
   log "已删除 HY2 端口跳跃规则，并清空持久化状态，开机不会自动恢复旧规则。"
 }
 
@@ -3492,6 +3881,10 @@ cf_delete_record_by_id(){
 
 cf_delete_record(){
   local name="$1" type="$2" expected="${3:-}" mode="${4:-owned}" resp count i rec_id content
+  if [[ "$mode" == "owned" && -z "$expected" ]]; then
+    warn "owned 删除模式下 expected IP 为空，跳过删除：$type $name"
+    return 0
+  fi
   resp=$(cf_get_record_json "$name" "$type") || { warn "无法读取 $type ${name}，跳过。"; return 0; }
   count=$(echo "$resp" | jq -r '.result | length')
   [[ "$count" -gt 0 ]] || { info "Cloudflare 中不存在 $type ${name}，跳过。"; return 0; }
@@ -3641,7 +4034,7 @@ main_menu(){
   load_state
   while true; do
     echo
-    echo "===== Xray Edge Manager v0.0.33-rc11-force-v4-egress ====="
+    echo "===== Xray Edge Manager v0.0.36-rc14-input-warp-audit ====="
     echo "1. 首次部署向导，推荐"
     echo "2. 安装/升级基础依赖"
     echo "3. 安装/升级 Xray-core"
@@ -3667,8 +4060,8 @@ main_menu(){
     case "$c" in
       1) install_full; pause ;;
       2) install_deps; pause ;;
-      3) install_or_upgrade_xray; pause ;;
-      4) update_geodata; if confirm "是否启用每周一凌晨 4-5 点安全自动更新 geodata？" "N"; then enable_geodata_timer; fi; pause ;;
+      3) install_or_upgrade_xray; if [[ -f "$XRAY_CONFIG" ]]; then restart_services; else warn "尚未生成 Xray 配置，跳过服务重启。"; fi; pause ;;
+      4) update_geodata; if [[ -f "$XRAY_CONFIG" ]] && xray_test_config "$XRAY_CONFIG" >/dev/null 2>&1; then systemctl restart xray 2>/dev/null || warn "Xray 重启失败，请稍后执行菜单 17 检查。"; else warn "Xray 配置不存在或测试未通过，跳过重启。"; fi; if confirm "是否启用每周一凌晨 4-5 点安全自动更新 geodata？" "N"; then enable_geodata_timer; fi; pause ;;
       5)
         network_status
         echo "1. 应用稳定型网络优化"
@@ -3685,7 +4078,7 @@ main_menu(){
       6) setup_cloudflare; create_dns_records; pause ;;
       7) issue_certificate; pause ;;
       8) asn_report; pause ;;
-      9) asn_report; select_ip_stack_strategy; select_protocols; create_dns_records; choose_reality_target; generate_xray_config; configure_nginx; regenerate_subscriptions_after_change; pause ;;
+      9) asn_report; select_ip_stack_strategy; select_protocols; create_dns_records; choose_reality_target; generate_xray_config; configure_nginx; restart_services; regenerate_subscriptions_after_change; pause ;;
       10) configure_nginx; pause ;;
       11) bestcf_menu ;;
       12) configure_hy2_hopping_prompt; pause ;;
