@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Xray Edge Manager / Xray Anti-Block Manager
-# v0.0.36-rc16-fixed — rc15 + BestCF cache-safe refresh, state defaults, domain/node validation
+# v0.0.36-rc17-fixed — rc16 + cert/domain preflight, nginx rollback, SSRF host hardening
 #
 # Features:
 # - Xray-core only, no Docker, no sing-box
@@ -1427,7 +1427,12 @@ EOF2
 
 issue_certificate(){
   load_state
-  [[ -n "${BASE_DOMAIN:-}" ]] || configure_base_domain
+  if [[ -z "${BASE_DOMAIN:-}" ]] || ! validate_base_domain "$BASE_DOMAIN"; then
+    warn "证书申请前检测到 BASE_DOMAIN 缺失或非法，需重新设置。"
+    configure_base_domain 1
+    load_state
+  fi
+  [[ -n "${BASE_DOMAIN:-}" ]] && validate_base_domain "$BASE_DOMAIN" || die "BASE_DOMAIN 仍非法，拒绝申请证书。"
   [[ -n "${CF_API_TOKEN:-}" ]] || setup_cloudflare
   mkdir -p "$APP_DIR"
   install_cert_deploy_hook
@@ -1508,6 +1513,13 @@ valid_safe_token(){
   [[ "$v" =~ ^[A-Za-z0-9._~-]{8,128}$ ]]
 }
 
+valid_short_id(){
+  local v="$1"
+  # REALITY shortId is a hex string representing 0-8 bytes. Keep an even
+  # number of hex chars so both Xray and client URI generation stay valid.
+  [[ "$v" =~ ^[a-f0-9]{0,16}$ ]] && (( ${#v} % 2 == 0 ))
+}
+
 choose_port_avoiding(){
   # Usage: choose_port_avoiding preferred avoid1 avoid2 ...
   local preferred="$1" cand avoid conflict
@@ -1524,6 +1536,41 @@ choose_port_avoiding(){
 }
 
 validate_state_or_regen(){
+  load_state
+
+  # Normalize protocol state first. Older or hand-edited state can contain
+  # strings like abc, 19, or 00123. All downstream checks use substring tests,
+  # so normalize v4/v6 stacks and derive PROTOCOLS from them before any other
+  # validation or here-doc rendering.
+  local raw_v4 raw_v6 raw_p normalized_v4 normalized_v6 derived_protocols
+  raw_v4="${IPV4_PROTOCOLS:-}"
+  raw_v6="${IPV6_PROTOCOLS:-}"
+  raw_p="${PROTOCOLS:-0}"
+  if [[ -z "$raw_v4" && -z "$raw_v6" && "$raw_p" != "0" ]]; then
+    raw_v4="$raw_p"
+    raw_v6="0"
+  fi
+  normalized_v4="$(normalize_stack_protocols "${raw_v4:-0}")"
+  normalized_v6="$(normalize_stack_protocols "${raw_v6:-0}")"
+  if [[ "${IPV4_PROTOCOLS:-}" != "$normalized_v4" ]]; then
+    warn "IPV4_PROTOCOLS 已归一化：${IPV4_PROTOCOLS:-空} -> $normalized_v4"
+    save_kv "$STATE_FILE" IPV4_PROTOCOLS "$normalized_v4"
+  fi
+  if [[ "${IPV6_PROTOCOLS:-}" != "$normalized_v6" ]]; then
+    warn "IPV6_PROTOCOLS 已归一化：${IPV6_PROTOCOLS:-空} -> $normalized_v6"
+    save_kv "$STATE_FILE" IPV6_PROTOCOLS "$normalized_v6"
+  fi
+  load_state
+  derived_protocols="$(build_default_protocols_from_stack_strategy)"
+  if [[ "${PROTOCOLS:-0}" != "$derived_protocols" ]]; then
+    warn "PROTOCOLS 已由 IPv4/IPv6 策略重新推导：${PROTOCOLS:-空} -> $derived_protocols"
+    save_kv "$STATE_FILE" PROTOCOLS "$derived_protocols"
+  fi
+  if [[ "$derived_protocols" == *2* || "$derived_protocols" == *5* ]]; then
+    [[ "${ENABLE_CDN:-}" == "1" ]] || save_kv "$STATE_FILE" ENABLE_CDN "1"
+  else
+    [[ "${ENABLE_CDN:-}" == "0" ]] || save_kv "$STATE_FILE" ENABLE_CDN "0"
+  fi
   load_state
 
   # State files may be edited manually or inherited from older releases. Before
@@ -1617,6 +1664,10 @@ validate_state_or_regen(){
     warn "HY2_AUTH 非法，已重新生成。"
     save_kv "$STATE_FILE" HY2_AUTH "$(rand_hex 16)"
   fi
+  if [[ -n "${SHORT_ID:-}" ]] && ! valid_short_id "$SHORT_ID"; then
+    warn "SHORT_ID 非法，已重新生成。"
+    save_kv "$STATE_FILE" SHORT_ID "$(rand_hex 8)"
+  fi
 
   validate_or_regen_token SUB_TOKEN
   validate_or_regen_token MERGED_SUB_TOKEN
@@ -1681,7 +1732,9 @@ generate_keys_if_needed(){
     save_kv "$STATE_FILE" REALITY_PRIVATE_KEY "$priv"
     save_kv "$STATE_FILE" REALITY_PUBLIC_KEY "$pub"
   fi
-  [[ -n "${SHORT_ID:-}" ]] || save_kv "$STATE_FILE" SHORT_ID "$(rand_hex 8)"
+  if [[ -z "${SHORT_ID:-}" ]] || ! valid_short_id "${SHORT_ID:-}"; then
+    save_kv "$STATE_FILE" SHORT_ID "$(rand_hex 8)"
+  fi
   [[ -n "${XHTTP_REALITY_PATH:-}" ]] || save_kv "$STATE_FILE" XHTTP_REALITY_PATH "$(rand_path)"
   [[ -n "${XHTTP_CDN_PATH:-}" ]] || save_kv "$STATE_FILE" XHTTP_CDN_PATH "$(rand_path)"
   [[ -n "${HY2_AUTH:-}" ]] || save_kv "$STATE_FILE" HY2_AUTH "$(rand_hex 16)"
@@ -2303,12 +2356,17 @@ EOF2
 configure_nginx(){
   need_root
   load_state
-  [[ -n "${BASE_DOMAIN:-}" ]] || configure_base_domain
-  [[ -f "/etc/letsencrypt/live/${BASE_DOMAIN}/fullchain.pem" ]] || issue_certificate
+  validate_state_or_regen
+  load_state
+  if [[ -z "${BASE_DOMAIN:-}" ]] || ! validate_base_domain "$BASE_DOMAIN"; then
+    configure_base_domain 1
+    load_state
+  fi
+  [[ -n "${BASE_DOMAIN:-}" ]] && validate_base_domain "$BASE_DOMAIN" || die "BASE_DOMAIN 非法，拒绝生成 Nginx/证书配置。"
+  [[ -f "/etc/letsencrypt/live/${BASE_DOMAIN}/fullchain.pem" && -f "/etc/letsencrypt/live/${BASE_DOMAIN}/privkey.pem" ]] || issue_certificate
   generate_keys_if_needed
   validate_state_or_regen
   load_state
-  [[ -n "${BASE_DOMAIN:-}" ]] || configure_base_domain
   mkdir -p "$APP_DIR" "$SUB_DIR" "$BESTCF_DIR" "$BACKUP_DIR"
   cleanup_legacy_nginx_conf
   disable_nginx_packaged_default_site
@@ -2318,6 +2376,7 @@ configure_nginx(){
 
   local nginx_http_v6_listen="" nginx_https_v6_listen="" nginx_https_listen="" nginx_http2_directive="" nginx_version="" nginx_target_tmp=""
   local nginx_default_http_v6_listen="" nginx_default_https_v6_listen="" nginx_default_https_block=""
+  local nginx_site_existed=0
   local nginx_http_redirect="" xhttp_cdn_location="" cdn_ipv6_enabled=0
 
   detect_public_ips
@@ -2461,23 +2520,33 @@ EOF2
   # Nginx cannot safely test a non-included *.tmp site file in the live include tree.
   # Apply the fully-written candidate atomically, then immediately run nginx -t and
   # atomically roll back if the whole Nginx config tree rejects it.
+  [[ -f "$NGINX_SITE" ]] && nginx_site_existed=1
   atomic_move_into_place "$nginx_target_tmp" "$NGINX_SITE" "644"
   if ! nginx -t; then
-    restore_latest_nginx_config || true
-    if nginx -t >/dev/null 2>&1; then
-      systemctl reload nginx 2>/dev/null || systemctl restart nginx 2>/dev/null || warn "Nginx 已回滚但 reload/restart 旧配置失败，请人工检查服务状态。"
+    if [[ "$nginx_site_existed" == "1" ]]; then
+      restore_latest_nginx_config || true
     else
-      warn "Nginx 回滚后配置测试仍失败，请人工检查 /etc/nginx 配置。"
+      warn "Nginx 首次配置测试失败，未找到旧配置备份，删除坏的新配置：$NGINX_SITE"
+      rm -f "$NGINX_SITE"
     fi
-    die "Nginx 配置测试失败，已尝试原子回滚。"
+    if nginx -t >/dev/null 2>&1; then
+      systemctl reload nginx 2>/dev/null || systemctl restart nginx 2>/dev/null || warn "Nginx 已回滚/清理但 reload/restart 旧配置失败，请人工检查服务状态。"
+    else
+      warn "Nginx 回滚/清理后配置测试仍失败，请人工检查 /etc/nginx 配置。"
+    fi
+    die "Nginx 配置测试失败，已尝试原子回滚或清理坏配置。"
   fi
   systemctl enable nginx >/dev/null 2>&1 || true
   if ! systemctl reload nginx && ! systemctl restart nginx; then
-    restore_latest_nginx_config || true
-    if nginx -t >/dev/null 2>&1; then
-      systemctl reload nginx 2>/dev/null || systemctl restart nginx 2>/dev/null || warn "Nginx 已回滚但 reload/restart 旧配置失败，请人工检查服务状态。"
+    if [[ "$nginx_site_existed" == "1" ]]; then
+      restore_latest_nginx_config || true
+    else
+      rm -f "$NGINX_SITE"
     fi
-    die "Nginx reload/restart 失败，已回滚。"
+    if nginx -t >/dev/null 2>&1; then
+      systemctl reload nginx 2>/dev/null || systemctl restart nginx 2>/dev/null || warn "Nginx 已回滚/清理但 reload/restart 旧配置失败，请人工检查服务状态。"
+    fi
+    die "Nginx reload/restart 失败，已回滚或清理新配置。"
   fi
   log "Nginx / 伪装站 / 订阅路径 / 默认黑洞配置完成。"
 }
@@ -3143,7 +3212,13 @@ restart_services(){
   ensure_xray_service
   if ! xray_test_config "$XRAY_CONFIG" >/dev/null 2>&1; then
     restore_latest_xray_config || true
-    die "Xray 配置测试失败，已回滚。"
+    ensure_xray_service || true
+    if xray_test_config "$XRAY_CONFIG" >/dev/null 2>&1; then
+      systemctl restart xray 2>/dev/null || warn "Xray 已回滚到旧配置，但重启旧配置失败，请人工检查服务状态。"
+    else
+      warn "Xray 回滚后旧配置测试仍失败，请人工检查：$XRAY_CONFIG"
+    fi
+    die "Xray 配置测试失败，已回滚并尝试恢复旧服务。"
   fi
   if ! systemctl restart xray; then
     restore_latest_xray_config || true
@@ -3374,7 +3449,11 @@ fetch_bestcf_all(){
   done
 
   if [[ "$ok" == "1" ]]; then
-    export BESTCF_FETCHED_THIS_RUN=1
+    if [[ "${BESTCF_ENABLED:-0}" == "1" && "${BESTCF_MODE:-off}" == "domain" && ! -s "$BESTCF_DIR/bestcf-domain.txt" ]]; then
+      warn "BestCF 本轮有部分资产成功，但 domain 模式缺少 bestcf-domain.txt；本轮后续生成订阅仍允许重试。"
+    else
+      export BESTCF_FETCHED_THIS_RUN=1
+    fi
     log "BestCF 已使用本轮远端可用数据刷新；失败资产保留旧缓存。"
   else
     warn "BestCF 远端数据本轮全部不可用，已保留本地旧缓存。若本地无缓存，本次订阅会退回普通母域名 CDN Entry。"
@@ -3622,9 +3701,29 @@ restore_network_tuning(){
 }
 
 show_status(){
+  load_state
   echo "===== Xray ====="; xray version 2>/dev/null || true; systemctl status xray --no-pager -l 2>/dev/null || true
   echo "===== Nginx ====="; nginx -t 2>&1 || true; systemctl status nginx --no-pager -l 2>/dev/null || true
-  echo "===== Listen ====="; ss -tulpen | grep -E ':(443|2053|2083|2087|2096|8443|2443|3443)\b' || true
+  echo "===== Listen ====="
+  local ports=() pattern p
+  ports+=("${CDN_PORT:-443}")
+  [[ "${PROTOCOLS:-0}" == *1* ]] && ports+=("${XHTTP_REALITY_PORT:-2443}")
+  [[ "${PROTOCOLS:-0}" == *4* ]] && ports+=("${REALITY_VISION_PORT:-3443}")
+  [[ "${PROTOCOLS:-0}" == *3* ]] && ports+=("${HY2_PORT:-443}")
+  [[ "${PROTOCOLS:-0}" == *2* || "${PROTOCOLS:-0}" == *5* ]] && ports+=("${XHTTP_CDN_LOCAL_PORT:-31301}")
+  # HY2 hopping is NAT REDIRECT, not a userspace listener, but show the range so
+  # status output matches the currently published subscription state.
+  [[ -n "${HY2_HOP_RANGE:-}" ]] && echo "HY2 hopping range: ${HY2_HOP_RANGE} -> ${HY2_HOP_TO_PORT:-${HY2_PORT:-443}}"
+  pattern=""
+  for p in "${ports[@]}"; do
+    valid_port "$p" || continue
+    if [[ -z "$pattern" ]]; then pattern="$p"; else pattern="$pattern|$p"; fi
+  done
+  if [[ -n "$pattern" ]]; then
+    ss -tulpen | grep -E ":(${pattern})\b" || true
+  else
+    ss -tulpen || true
+  fi
 }
 
 subscription_web_file_exists(){
@@ -3794,21 +3893,53 @@ clear_remote_subscriptions(){
   fi
 }
 
-# SECURITY: extract hostname from http(s) URL for private-address validation.
+# SECURITY: extract a standards-compliant host from http(s) URL authority.
+# Reject userinfo and malformed ports here instead of relying on curl/libc to
+# interpret unusual forms such as decimal, octal, or hex IPv4.
 extract_url_host(){
-  local url="$1"
-  url="${url#http://}"; url="${url#https://}"
-  url="${url%%/*}"
-  # strip optional port
-  local host
-  if [[ "$url" == \[*\]* ]]; then
-    host="${url#[}"; host="${host%%]*}"
+  local raw="$1" authority host port rest
+  case "$raw" in
+    http://*) authority="${raw#http://}" ;;
+    https://*) authority="${raw#https://}" ;;
+    *) return 1 ;;
+  esac
+  authority="${authority%%[/?#]*}"
+  [[ -n "$authority" ]] || return 1
+  [[ "$authority" != *@* ]] || return 1
+
+  if [[ "$authority" == \[*\]* ]]; then
+    host="${authority#\[}"
+    host="${host%%\]*}"
+    rest="${authority#*\]}"
+    if [[ -n "$rest" ]]; then
+      [[ "$rest" == :* ]] || return 1
+      port="${rest#:}"
+      [[ -n "$port" && "$port" =~ ^[0-9]+$ ]] || return 1
+      valid_port "$port" || return 1
+    fi
   else
-    host="${url%:*}"
-    # if no colon at all (no port), host == url
-    [[ "$url" == *:* ]] || host="$url"
+    if [[ "$authority" == *:* ]]; then
+      host="${authority%:*}"
+      port="${authority##*:}"
+      [[ -n "$host" && -n "$port" && "$port" =~ ^[0-9]+$ ]] || return 1
+      valid_port "$port" || return 1
+    else
+      host="$authority"
+    fi
   fi
+  [[ -n "$host" ]] || return 1
   printf '%s' "$host"
+}
+
+valid_remote_url_host(){
+  local h="$1"
+  [[ -n "$h" && ${#h} -le 253 ]] || return 1
+  if valid_ipv4_literal "$h" || valid_ipv6_literal "$h"; then
+    return 0
+  fi
+  # Normal hostnames only. This deliberately rejects decimal/octal/hex IP
+  # shorthands, underscores, single-label hosts, and other authority tricks.
+  validate_hostname "$h"
 }
 
 # SECURITY: return 0 (true) if the host is a private/loopback/reserved address.
@@ -3845,8 +3976,9 @@ is_private_host(){
 # Returns 1 (reject) if any resolved IP is private; 0 if safe.
 resolve_and_check_ssrf(){
   local hostname="$1"
-  # Bare IP — check directly.
-  if [[ "$hostname" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ || "$hostname" =~ ^[0-9A-Fa-f:]+$ ]]; then
+  # Bare standard IP — check directly. Non-standard IP shorthands are rejected
+  # earlier by valid_remote_url_host and must not be interpreted by libc/curl.
+  if valid_ipv4_literal "$hostname" || valid_ipv6_literal "$hostname"; then
     is_private_host "$hostname" && return 1
     return 0
   fi
@@ -3907,7 +4039,15 @@ merge_remote_subscriptions(){
       warn "远程订阅 URL 过长，已跳过：$name"
       continue
     fi
-    local _rhost; _rhost=$(extract_url_host "$url")
+    local _rhost
+    if ! _rhost=$(extract_url_host "$url"); then
+      warn "远程订阅 URL authority 格式非法，已拒绝：$name"
+      continue
+    fi
+    if ! valid_remote_url_host "$_rhost"; then
+      warn "远程订阅 URL host 不是标准域名/IPv4/IPv6，已拒绝：$name ($_rhost)"
+      continue
+    fi
     if is_private_host "$_rhost"; then
       warn "远程订阅 URL 指向私有地址（字面量），已拒绝：$name ($_rhost)"
       continue
@@ -4259,7 +4399,7 @@ main_menu(){
   load_state
   while true; do
     echo
-    echo "===== Xray Edge Manager v0.0.36-rc16-fixed ====="
+    echo "===== Xray Edge Manager v0.0.36-rc17-fixed ====="
     echo "1. 首次部署向导，推荐"
     echo "2. 安装/升级基础依赖"
     echo "3. 安装/升级 Xray-core"
