@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Xray Edge Manager / Xray Anti-Block Manager
-# v0.0.36-rc21-warpreg-integrated — strict BASE/v4/v6 DNS role model, cert reuse, GitHub Raw safe run, WARP auto generation
+# v0.0.36-rc22-production-ready — strict BASE/v4/v6 DNS role model, cert reuse, GitHub Raw safe run, WARP auto generation, production preflight/postflight
 #
 # Features:
 # - Xray-core only, no Docker, no sing-box
@@ -1536,6 +1536,36 @@ apply_domain_role_dns_records(){
   fi
 }
 
+
+require_public_ip_for_dns_update(){
+  local ip4="${1:-}" ip6="${2:-}"
+  if [[ -z "$ip4" && -z "$ip6" ]]; then
+    die "未检测到合法公网 IPv4/IPv6，拒绝刷新或重建 DNS，避免出现 DNS 假成功。请先检查公网出口，或确认状态文件中的 PUBLIC_IPV4/PUBLIC_IPV6。"
+  fi
+  if [[ "${IPV4_PROTOCOLS:-0}" != "0" && -z "$ip4" ]]; then
+    die "IPv4 协议已启用（IPV4_PROTOCOLS=${IPV4_PROTOCOLS:-0}），但未检测到公网 IPv4，拒绝创建不完整 DNS。请重新选择协议或修复 IPv4。"
+  fi
+  if [[ "${IPV6_PROTOCOLS:-0}" != "0" && -z "$ip6" ]]; then
+    die "IPv6 协议已启用（IPV6_PROTOCOLS=${IPV6_PROTOCOLS:-0}），但未检测到公网 IPv6，拒绝创建不完整 DNS。请重新选择协议或修复 IPv6。"
+  fi
+}
+
+assert_deploy_stack_ready(){
+  load_state
+  detect_public_ips
+  load_state
+  local ip4="${PUBLIC_IPV4:-}" ip6="${PUBLIC_IPV6:-}"
+  [[ -n "$ip4" || -n "$ip6" ]] || die "未检测到公网 IPv4/IPv6，拒绝继续生产部署。"
+  [[ "${PROTOCOLS:-0}" != "0" ]] || die "当前 v4/v6 协议组合为空（PROTOCOLS=0），拒绝生成无入站生产配置。请重新选择协议。"
+  if [[ "${IPV4_PROTOCOLS:-0}" != "0" && -z "$ip4" ]]; then
+    die "IPv4 协议已启用但没有公网 IPv4。请重新选择协议，或先修复 IPv4。"
+  fi
+  if [[ "${IPV6_PROTOCOLS:-0}" != "0" && -z "$ip6" ]]; then
+    die "IPv6 协议已启用但没有公网 IPv6。请重新选择协议，或先修复 IPv6。"
+  fi
+  log "部署栈预检通过：IPv4=${ip4:-无} IPv6=${ip6:-无} PROTOCOLS=${PROTOCOLS:-0}"
+}
+
 create_dns_records(){
   require_cmds curl jq
   load_state
@@ -1567,12 +1597,14 @@ create_dns_records(){
 
   case "$mode" in
     1)
+      require_public_ip_for_dns_update "$ip4" "$ip6"
       apply_domain_role_dns_records "$ip4" "$ip6"
       ;;
     2)
       warn "已选择复用现有 DNS，不修改 BASE/v4/v6 的 A/AAAA。请确认它们已指向当前 VPS。"
       ;;
     3)
+      require_public_ip_for_dns_update "$ip4" "$ip6"
       warn "即将仅清理 BASE/v4/v6 三个名称下的 A/AAAA，然后按当前 VPS IP 重新创建。"
       confirm "确认执行 DNS 清场并重建？" "N" || { warn "已取消 DNS 清场。"; return 0; }
       delete_managed_a_aaaa_records force "$ip4" "$ip6"
@@ -2251,36 +2283,83 @@ warp_reg_asset_name(){
   esac
 }
 
+valid_sha256_hex(){
+  local v="$1"
+  [[ "$v" =~ ^[A-Fa-f0-9]{64}$ ]]
+}
+
+file_sha256(){
+  sha256sum "$1" | awk '{print tolower($1)}'
+}
+
+is_elf_binary(){
+  local f="$1" magic
+  magic="$(od -An -tx1 -N4 "$f" 2>/dev/null | tr -d '[:space:]')"
+  [[ "$magic" == "7f454c46" ]]
+}
+
+authorize_unpinned_warp_reg(){
+  local actual="${1:-}" ack
+  if [[ -n "${XEM_WARP_REG_SHA256:-}" ]]; then
+    return 0
+  fi
+  if [[ "${XEM_TRUST_WARP_REG:-0}" == "1" ]]; then
+    warn "XEM_TRUST_WARP_REG=1：允许使用未做 SHA256 pin 的 warp-reg。生产环境建议改用 XEM_WARP_REG_SHA256。"
+    return 0
+  fi
+  warn "生产安全提示：warp-reg 是第三方二进制，未设置 XEM_WARP_REG_SHA256 时不适合无人值守生产部署。"
+  [[ -n "$actual" ]] && warn "当前文件 SHA256：$actual"
+  if [[ ! -r /dev/tty || ! -w /dev/tty ]]; then
+    die "非交互环境拒绝使用未 pin 的 warp-reg。请设置 XEM_WARP_REG_SHA256=<64位SHA256>，或显式设置 XEM_TRUST_WARP_REG=1。"
+  fi
+  ack=$(ask "如确认信任该第三方二进制，请输入 YES_I_TRUST_WARP_REG" "")
+  [[ "$ack" == "YES_I_TRUST_WARP_REG" ]] || die "已取消安装/执行 warp-reg。"
+}
+
+verify_warp_reg_binary(){
+  local f="$1" expected actual
+  [[ -f "$f" && -x "$f" ]] || die "warp-reg 不存在或不可执行：$f"
+  is_elf_binary "$f" || die "warp-reg 文件不是 ELF 二进制，拒绝执行：$f"
+  actual="$(file_sha256 "$f")"
+  if [[ -n "${XEM_WARP_REG_SHA256:-}" ]]; then
+    expected="${XEM_WARP_REG_SHA256,,}"
+    valid_sha256_hex "$expected" || die "XEM_WARP_REG_SHA256 格式非法，应为64位十六进制。"
+    [[ "$actual" == "$expected" ]] || die "warp-reg SHA256 校验失败。expected=$expected actual=$actual"
+    log "warp-reg SHA256 pin 校验通过：$actual"
+  else
+    authorize_unpinned_warp_reg "$actual"
+  fi
+}
+
 install_warp_reg(){
   need_root
   ensure_runtime_dirs
-  require_cmds curl jq sha256sum
-  local asset url tmp expected actual
+  require_cmds curl jq sha256sum od
+  local asset url tmp actual
   if [[ -x "$WARP_REG_BIN" ]]; then
-    info "warp-reg 已存在：$WARP_REG_BIN"
+    verify_warp_reg_binary "$WARP_REG_BIN"
+    info "warp-reg 已存在并通过执行前检查：$WARP_REG_BIN"
     return 0
   fi
   asset="$(warp_reg_asset_name)" || die "当前架构暂不支持自动下载 warp-reg：$(uname -m)"
   url="${WARP_REG_RELEASE_BASE}/${asset}"
   warn "即将下载第三方 warp-reg 工具，用于自动注册 Cloudflare WARP 免费账户并生成 WireGuard 参数。"
   warn "项目地址：https://github.com/badafans/warp-reg"
-  warn "如需强校验，可设置 XEM_WARP_REG_SHA256；否则只做下载成功和可执行性检查。"
-  if [[ "${XEM_TRUST_WARP_REG:-0}" != "1" ]]; then
-    confirm "是否继续下载并安装 warp-reg？直接回车 = Y" "Y" || die "已取消安装 warp-reg。"
-  fi
+  warn "生产建议：设置 XEM_WARP_REG_SHA256 做二进制 pin；无人值守环境未 pin 默认拒绝执行。"
   tmp="$(mktemp_file "$APP_DIR/tmp/warp-reg.XXXXXX")"
   curl -fL --retry 3 --retry-delay 2 --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time 120 -o "$tmp" "$url" || die "下载 warp-reg 失败：$url"
-  if [[ -n "${XEM_WARP_REG_SHA256:-}" ]]; then
-    expected="${XEM_WARP_REG_SHA256,,}"
-    actual="$(sha256sum "$tmp" | awk '{print tolower($1)}')"
-    [[ "$actual" == "$expected" ]] || die "warp-reg SHA256 校验失败。expected=$expected actual=$actual"
-    log "warp-reg SHA256 pin 校验通过。"
-  fi
   chmod 700 "$tmp"
-  "$tmp" -h >/dev/null 2>&1 || true
+  is_elf_binary "$tmp" || die "下载的 warp-reg 不是 ELF 二进制，拒绝安装：$url"
+  actual="$(file_sha256 "$tmp")"
+  if [[ -n "${XEM_WARP_REG_SHA256:-}" ]]; then
+    verify_warp_reg_binary "$tmp"
+  else
+    authorize_unpinned_warp_reg "$actual"
+  fi
   mv -f "$tmp" "$WARP_REG_BIN"
   chmod 700 "$WARP_REG_BIN"
   log "warp-reg 已安装：$WARP_REG_BIN"
+  info "warp-reg SHA256：$actual"
 }
 
 trim_text(){
@@ -2327,20 +2406,60 @@ select_warp_endpoint_for_host(){
   fi
 }
 
+validate_warp_reg_config_file(){
+  local file="$1" secret public reserved_raw reserved_json addr4 addr6
+  [[ -s "$file" && ! -L "$file" ]] || die "warp-reg 账户配置不存在、为空或是符号链接：$file"
+  secret="$(warp_reg_field "$file" private_key | trim_text)"
+  public="$(warp_reg_field "$file" public_key | trim_text)"
+  reserved_raw="$(warp_reg_field "$file" reserved | trim_text)"
+  addr4="$(warp_reg_field "$file" v4 | trim_text)"
+  addr6="$(warp_reg_field "$file" v6 | trim_text)"
+  valid_warp_key_text "$secret" || return 1
+  valid_warp_key_text "$public" || return 1
+  valid_ipv4_literal "$addr4" || return 1
+  [[ -z "$addr6" ]] || valid_ipv6_literal "$addr6" || return 1
+  reserved_json="$(warp_reg_reserved_json "$reserved_raw")" || return 1
+  [[ -n "$reserved_json" ]]
+}
+
 run_warp_reg_account(){
-  local force="${1:-0}" tmp
+  local force="${1:-0}" tmp backup ts
   install_warp_reg
   ensure_runtime_dirs
   if [[ "$force" != "1" && -s "$WARP_REG_CONFIG" ]]; then
-    info "复用已有 warp-reg 账户配置：$WARP_REG_CONFIG"
-    return 0
+    if validate_warp_reg_config_file "$WARP_REG_CONFIG"; then
+      info "复用已有 warp-reg 账户配置：$WARP_REG_CONFIG"
+      return 0
+    fi
+    warn "已有 warp-reg 账户配置格式异常，将尝试重新注册；旧文件会先备份。"
+    force=1
   fi
   tmp="$(mktemp_file "$APP_DIR/tmp/warp-reg-config.XXXXXX")"
-  "$WARP_REG_BIN" > "$tmp" || die "执行 warp-reg 失败，未生成 WARP 账户配置。"
+  if ! "$WARP_REG_BIN" > "$tmp"; then
+    rm -f "$tmp" 2>/dev/null || true
+    die "执行 warp-reg 失败，未生成 WARP 账户配置。"
+  fi
   chmod 600 "$tmp"
+  if ! validate_warp_reg_config_file "$tmp"; then
+    local debug_bad
+    ts=$(date +%F-%H%M%S)
+    debug_bad="$DEBUG_DIR/failed-warp-reg-output.$ts.txt"
+    mkdir -p "$DEBUG_DIR"; chmod 700 "$DEBUG_DIR" 2>/dev/null || true
+    cp -f "$tmp" "$debug_bad" 2>/dev/null || true
+    chmod 600 "$debug_bad" 2>/dev/null || true
+    die "warp-reg 输出字段不完整或格式异常，未覆盖旧配置。原始输出已保存：$debug_bad"
+  fi
+  if [[ -f "$WARP_REG_CONFIG" ]]; then
+    ts=$(date +%F-%H%M%S)
+    backup="$BACKUP_DIR/warp-reg-config.$ts.bak"
+    mkdir -p "$BACKUP_DIR"
+    cp -a "$WARP_REG_CONFIG" "$backup" 2>/dev/null || true
+    chmod 600 "$backup" 2>/dev/null || true
+    info "旧 WARP 账户配置已备份：$backup"
+  fi
   mv -f "$tmp" "$WARP_REG_CONFIG"
   chmod 600 "$WARP_REG_CONFIG"
-  log "WARP 账户配置已生成：$WARP_REG_CONFIG"
+  log "WARP 账户配置已生成并通过格式校验：$WARP_REG_CONFIG"
 }
 
 generate_warp_outbound_from_warp_reg(){
@@ -4509,6 +4628,100 @@ deployment_summary(){
   fi
 }
 
+
+deployment_healthcheck(){
+  load_state
+  local failed=0 mode warp_file
+  echo "===== 部署后生产自检 ====="
+
+  if [[ -f "$XRAY_CONFIG" ]]; then
+    if ( xray_test_config "$XRAY_CONFIG" ) >/dev/null 2>&1; then
+      log "Xray 配置测试通过。"
+    else
+      err "Xray 配置测试失败：$XRAY_CONFIG"
+      failed=1
+    fi
+  else
+    err "Xray 配置文件不存在：$XRAY_CONFIG"
+    failed=1
+  fi
+
+  if systemctl is-active --quiet xray 2>/dev/null; then
+    log "Xray 服务 active。"
+  else
+    err "Xray 服务不是 active。"
+    failed=1
+  fi
+
+  if [[ -f "$NGINX_SITE" ]]; then
+    if nginx -t >/dev/null 2>&1; then
+      log "Nginx 配置测试通过。"
+    else
+      err "Nginx 配置测试失败：$NGINX_SITE"
+      failed=1
+    fi
+    if systemctl is-active --quiet nginx 2>/dev/null; then
+      log "Nginx 服务 active。"
+    else
+      err "Nginx 服务不是 active。"
+      failed=1
+    fi
+  else
+    warn "未发现本脚本 Nginx 站点配置：$NGINX_SITE"
+  fi
+
+  if [[ -n "${BASE_DOMAIN:-}" ]] && validate_base_domain "$BASE_DOMAIN"; then
+    log "BASE_DOMAIN 合法：$BASE_DOMAIN"
+  else
+    err "BASE_DOMAIN 未设置或非法。"
+    failed=1
+  fi
+
+  if [[ -n "${SUB_TOKEN:-}" ]]; then
+    if subscription_web_file_exists "$SUB_TOKEN"; then
+      log "本机订阅文件已发布到 Web 目录。"
+    else
+      err "本机订阅文件未发布到 Web 目录，请执行订阅重生成。"
+      failed=1
+    fi
+  else
+    err "SUB_TOKEN 未生成。"
+    failed=1
+  fi
+
+  mode="$(normalize_ip_outbound_mode "${IP_OUTBOUND_MODE:-}")"
+  if [[ "$mode" == "warp-v4" || "$mode" == "auto" ]]; then
+    if [[ -f "$XRAY_CONFIG" ]] && jq -e 'any(.outbounds[]?; .tag == "out-warp")' "$XRAY_CONFIG" >/dev/null 2>&1; then
+      if ! warp_file="$(warp_outbound_file_path 2>/dev/null)"; then
+        err "WARP outbound 文件路径无效。"
+        failed=1
+      elif [[ -s "$warp_file" && ! -L "$warp_file" ]]; then
+        if ( validate_warp_outbound_json "$warp_file" ) >/dev/null 2>&1; then
+          log "WARP outbound 存在并通过基础校验：$warp_file"
+        else
+          err "WARP outbound 校验失败：$warp_file"
+          failed=1
+        fi
+      else
+        err "Xray 配置引用 out-warp，但 WARP outbound 文件不存在或不可用：$warp_file"
+        failed=1
+      fi
+    elif [[ "$mode" == "warp-v4" ]]; then
+      err "出口策略为 warp-v4，但 Xray 配置未包含 out-warp。"
+      failed=1
+    else
+      info "auto 出口策略当前未解析到 WARP，通常表示本机已有 IPv4，使用 force-v4。"
+    fi
+  fi
+
+  if [[ "$failed" -eq 0 ]]; then
+    log "部署后生产自检通过。"
+  else
+    err "部署后生产自检未通过，请先处理上面的错误再投入生产。"
+    return 1
+  fi
+}
+
 install_full(){
   need_root
   install_deps
@@ -4520,6 +4733,7 @@ install_full(){
   asn_report
   select_ip_stack_strategy
   select_protocols
+  assert_deploy_stack_ready
   create_dns_records
   issue_certificate
   choose_reality_target
@@ -4529,6 +4743,7 @@ install_full(){
   handle_firewall_ports
   restart_services
   regenerate_subscriptions_after_change
+  deployment_healthcheck
   deployment_summary
   log "首次部署流程完成。"
 }
@@ -5186,7 +5401,7 @@ main_menu(){
   load_state
   while true; do
     echo
-    echo "===== Xray Edge Manager v0.0.36-rc21-warpreg-integrated ====="
+    echo "===== Xray Edge Manager v0.0.36-rc22-production-ready ====="
     echo "1. 首次部署向导，推荐"
     echo "2. 安装/升级基础依赖"
     echo "3. 安装/升级 Xray-core"
@@ -5208,6 +5423,7 @@ main_menu(){
     echo "19. 安装状态"
     echo "20. 卸载 / 清理"
     echo "21. WARP 出站管理 / 自动生成 warp-outbound.json"
+    echo "22. 部署后生产自检"
     echo "0. 退出"
     local c; c=$(ask "请选择" "0")
     case "$c" in
@@ -5231,7 +5447,7 @@ main_menu(){
       6) setup_cloudflare; create_dns_records; pause ;;
       7) issue_certificate; pause ;;
       8) asn_report; pause ;;
-      9) asn_report; select_ip_stack_strategy; select_protocols; create_dns_records; choose_reality_target; ensure_hy2_certificate_ready; generate_xray_config; configure_nginx; restart_services; regenerate_subscriptions_after_change; pause ;;
+      9) asn_report; select_ip_stack_strategy; select_protocols; assert_deploy_stack_ready; create_dns_records; choose_reality_target; ensure_hy2_certificate_ready; generate_xray_config; configure_nginx; restart_services; regenerate_subscriptions_after_change; deployment_healthcheck; pause ;;
       10) configure_nginx; pause ;;
       11) bestcf_menu ;;
       12) configure_hy2_hopping_prompt; pause ;;
@@ -5244,6 +5460,7 @@ main_menu(){
       19) show_installation_state; pause ;;
       20) uninstall_menu ;;
       21) warp_outbound_menu ;;
+      22) deployment_healthcheck; pause ;;
       0) exit 0 ;;
       *) warn "无效选择。" ;;
     esac
@@ -5288,6 +5505,13 @@ case "${1:-}" in
     if [[ "${ENABLE_CF_ORIGIN_FIREWALL:-0}" == "1" ]]; then
       apply_cf_origin_firewall
     fi
+    exit 0
+    ;;
+  --healthcheck)
+    need_root
+    acquire_lock
+    load_state
+    deployment_healthcheck
     exit 0
     ;;
   --warp-regenerate)
