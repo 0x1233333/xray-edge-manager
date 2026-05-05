@@ -95,7 +95,7 @@ bash /root/xem.sh
 如果你从 beta 路径下载：
 
 ```bash
-curl -fsSL -o /root/xem.sh https://raw.githubusercontent.com/0x1233333/xray-edge-manager/refs/heads/main/beta/xem-v0.0.36-rc22-production-ready.sh
+curl -fsSL -o /root/xem.sh https://raw.githubusercontent.com/0x1233333/xray-edge-manager/refs/heads/main/beta/xem-v0.0.36-rc22-fixed.sh
 bash -n /root/xem.sh
 bash /root/xem.sh
 ```
