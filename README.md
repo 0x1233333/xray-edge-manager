@@ -48,7 +48,6 @@ Cloudflare 托管域名
 不推荐环境：
 
 ```text
-OpenWrt / iStoreOS
 Alpine
 CentOS / Rocky / Alma
 非 systemd 系统
