@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Xray Edge Manager / Xray Anti-Block Manager
-# v0.0.36-rc20-domain-model — strict BASE/v4/v6 DNS role model, cert reuse, safer remote subscriptions
+# v0.0.36-rc20-fixed-github-run-lf1 — strict BASE/v4/v6 DNS role model, cert reuse, GitHub Raw safe run
 #
 # Features:
 # - Xray-core only, no Docker, no sing-box
@@ -71,7 +71,10 @@ CF_IPS_V4_URL="https://www.cloudflare.com/ips-v4"
 CF_IPS_V6_URL="https://www.cloudflare.com/ips-v6"
 CF_ORIGIN_CHAIN="XEM_CF_ORIGIN"
 DEFAULT_HY2_HOP_RANGE="20000:20100"
-SCRIPT_RAW_URL="https://raw.githubusercontent.com/0x1233333/xray-edge-manager/main/xem.sh"
+# When this script is run through bash <(curl ...), it cannot safely copy
+# itself from /dev/fd. Use this URL for later self-install/timer jobs.
+# Override with XEM_SCRIPT_RAW_URL when testing a branch, fork, or tagged release.
+SCRIPT_RAW_URL="${XEM_SCRIPT_RAW_URL:-https://raw.githubusercontent.com/0x1233333/xray-edge-manager/main/xem.sh}"
 XRAY_CORE_RELEASE_API="https://api.github.com/repos/XTLS/Xray-core/releases"
 XRAY_INSTALL_SCRIPT_URL="https://github.com/XTLS/Xray-install/raw/main/install-release.sh"
 BESTCF_RELEASE_API="https://api.github.com/repos/DustinWin/BestCF/releases/tags/bestcf"
@@ -311,13 +314,19 @@ save_kv(){
 ask(){
   local prompt="$1" default="${2:-}" ans msg
   if [[ -n "$default" ]]; then msg="$prompt [$default]: "; else msg="$prompt: "; fi
-  if [[ -r /dev/tty && -w /dev/tty ]]; then
-    printf '%s' "$msg" > /dev/tty
-    IFS= read -r ans < /dev/tty || true
+
+  # Robust interactive input: some non-interactive shells report /dev/tty as
+  # present but fail when opening it. Open it once and fall back cleanly to
+  # stdin/stderr, avoiding noisy "/dev/tty: No such device" diagnostics.
+  if { exec 3<>/dev/tty; } 2>/dev/null; then
+    printf '%s' "$msg" >&3 || true
+    IFS= read -r ans <&3 || ans=""
+    exec 3<&- 3>&- || true
   else
-    printf '%s' "$msg" >&2
-    IFS= read -r ans || true
+    printf '%s' "$msg" >&2 || true
+    IFS= read -r ans || ans=""
   fi
+
   if [[ -n "$default" ]]; then echo "${ans:-$default}"; else echo "$ans"; fi
 }
 
@@ -954,17 +963,24 @@ install_self_to_local_bin(){
   # Require explicit user confirmation, and support SHA256 pin verification.
   warn "当前可能是 bash <(curl ...) 方式运行，无法可靠复制自身。"
   warn "将从仓库下载一次用于固化本地命令：$SCRIPT_RAW_URL"
-  warn "这意味着你信任该远程地址提供的脚本内容。可设置 XEM_SELF_SHA256 进行强校验。"
+  warn "这意味着你信任该远程地址提供的脚本内容。测试分支/ fork 请用 XEM_SCRIPT_RAW_URL 覆盖。"
+  warn "可设置 XEM_SELF_SHA256 进行强校验。"
+  warn "首次部署中 HY2 跳跃、BestCF 定时任务、源站防火墙等功能需要 /usr/local/bin/xem。"
   if [[ "${XEM_TRUST_REMOTE_SELF:-0}" != "1" ]]; then
-    confirm "是否继续从远程下载并安装本脚本？" "N" || die "已取消远程安装。请手动下载脚本后执行 install -m 755 xem.sh /usr/local/bin/xem"
+    confirm "是否继续从远程下载并安装本脚本？你已经在执行该 Raw 脚本，直接回车 = Y" "Y" || die "已取消远程安装。请手动下载脚本后执行 install -m 755 xem.sh /usr/local/bin/xem"
   fi
   local tmp_script
   tmp_script="$(mktemp_file "$APP_DIR/tmp/xem-self.XXXXXX.sh")"
   curl -fsSL --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time 60 "$SCRIPT_RAW_URL" -o "$tmp_script" || die "下载本地命令失败。"
   if command -v perl >/dev/null 2>&1; then
-    perl -C -pi -e 's/\x{00A0}/ /g' "$tmp_script" 2>/dev/null || true
+    # Normalize common copy/paste damage before installing the persistent local command.
+    # This does not make a CRLF GitHub Raw script executable on first launch, but it
+    # prevents a normalized bootstrap from installing a broken persistent copy.
+    perl -C -pi -e 's/\x{00A0}/ /g; s/\r$//g' "$tmp_script" 2>/dev/null || true
+  else
+    sed -i 's/\r$//' "$tmp_script" 2>/dev/null || true
   fi
-  bash -n "$tmp_script" || die "下载的脚本语法检查失败，拒绝安装。"
+  bash -n "$tmp_script" || die "下载的脚本语法检查失败，拒绝安装。请确认 GitHub 仓库中的 xem.sh 使用 LF 换行。"
   # SHA256 pin verification if configured
   if [[ -n "${XEM_SELF_SHA256:-}" ]]; then
     local expected_self actual_self
@@ -1734,6 +1750,28 @@ issue_certificate(){
   sync_xray_certificate
   show_existing_certificate_info || true
   log "证书申请完成：/etc/letsencrypt/live/$BASE_DOMAIN/"
+}
+
+ensure_certificate_for_nginx(){
+  load_state
+  [[ -n "${BASE_DOMAIN:-}" ]] && validate_base_domain "$BASE_DOMAIN" || die "BASE_DOMAIN 非法，无法校验证书。"
+
+  if certificate_exists_for_base_domain && certificate_matches_base_domain; then
+    sync_xray_certificate
+    return 0
+  fi
+
+  warn "未检测到可用于 Nginx/TLS 的证书，准备申请或复用证书。"
+  issue_certificate
+  load_state
+
+  if ! certificate_exists_for_base_domain; then
+    die "未发现证书文件：/etc/letsencrypt/live/${BASE_DOMAIN}/fullchain.pem 和 privkey.pem。已停止生成 Nginx 配置，避免写入不可启动配置。"
+  fi
+  if ! certificate_matches_base_domain; then
+    die "当前证书未同时覆盖 ${BASE_DOMAIN} 和 *.${BASE_DOMAIN}。已停止生成 Nginx 配置。"
+  fi
+  sync_xray_certificate
 }
 choose_reality_target(){
   load_state
@@ -2657,7 +2695,7 @@ configure_nginx(){
     load_state
   fi
   [[ -n "${BASE_DOMAIN:-}" ]] && validate_base_domain "$BASE_DOMAIN" || die "BASE_DOMAIN 非法，拒绝生成 Nginx/证书配置。"
-  [[ -f "/etc/letsencrypt/live/${BASE_DOMAIN}/fullchain.pem" && -f "/etc/letsencrypt/live/${BASE_DOMAIN}/privkey.pem" ]] || issue_certificate
+  ensure_certificate_for_nginx
   generate_keys_if_needed
   validate_state_or_regen
   load_state
