@@ -528,7 +528,7 @@ local_ipv6_for_bind(){
 
 get_proc_by_port(){
   local proto="$1" port="$2"
-  ss -H -lpn "$proto" "sport = :$port" 2>/dev/null | awk '{print $NF}' | head -n1
+  ss -H -lpn "$proto" "sport = :$port" 2>/dev/null | awk '{print $NF; exit}'
 }
 
 nginx_conf_user_field(){
@@ -782,13 +782,16 @@ xray_release_asset_name(){
 
 extract_sha256_from_dgst(){
   local dgst="$1"
-  grep -iE 'SHA2-256|SHA256|sha256' "$dgst" 2>/dev/null | grep -Eio '[a-f0-9]{64}' | head -n1
+  # Avoid `grep | head` under `set -o pipefail`; SIGPIPE can make the
+  # whole script exit silently. The digest file is trusted only after this
+  # explicit 64-hex extraction succeeds.
+  grep -Eio -m1 '[a-f0-9]{64}' "$dgst" 2>/dev/null || true
 }
 
 install_or_upgrade_xray_release_verified(){
   need_root
   ensure_runtime_dirs
-  local asset release_json tag asset_url dgst_url tmp zip dgst expected actual extract_dir xray_bin dat f
+  local asset release_json release_obj tag asset_url dgst_url tmp zip dgst expected actual extract_dir xray_bin dat f
 
   asset="$(xray_release_asset_name)" || die "当前架构暂不支持自动匹配 Xray 官方 Release：$(uname -m)"
   # SECURITY FIX: use APP_DIR instead of /tmp to avoid symlink race in multi-user systems.
@@ -813,25 +816,23 @@ install_or_upgrade_xray_release_verified(){
     release_filter='map(select((.draft|not) and (.prerelease|not)))'
   fi
 
-  tag=$(jq -r --arg asset "$asset" --argjson allow_pre "$allow_prerelease" '
+  # Select one release object first, then take ZIP and .dgst from the same
+  # release. Do not use `jq ... | head -n1` under pipefail: when GitHub returns
+  # many releases, head may close the pipe early and jq exits with SIGPIPE,
+  # causing a silent script exit before any die() message is printed.
+  release_obj=$(jq -c --arg asset "$asset" --argjson allow_pre "$allow_prerelease" '
     (if $allow_pre == 1 then map(select(.draft|not)) else map(select((.draft|not) and (.prerelease|not))) end) |
-    map(select(any(.assets[]?; .name == $asset))) |
-    .[0].tag_name // empty
-  ' "$release_json")
-  asset_url=$(jq -r --arg asset "$asset" --argjson allow_pre "$allow_prerelease" '
-    (if $allow_pre == 1 then map(select(.draft|not)) else map(select((.draft|not) and (.prerelease|not))) end)[] |
-    .assets[]? |
-    select(.name == $asset) |
-    .browser_download_url
-  ' "$release_json" | head -n1)
-  dgst_url=$(jq -r --arg asset "$asset" --argjson allow_pre "$allow_prerelease" '
-    (if $allow_pre == 1 then map(select(.draft|not)) else map(select((.draft|not) and (.prerelease|not))) end)[] |
-    .assets[]? |
-    select(.name == ($asset + ".dgst")) |
-    .browser_download_url
-  ' "$release_json" | head -n1)
+    map(select(any(.assets[]?; .name == $asset) and any(.assets[]?; .name == ($asset + ".dgst")))) |
+    .[0] // empty
+  ' "$release_json") || die "解析 Xray-core Release JSON 失败。"
 
-  [[ -n "$tag" && -n "$asset_url" && -n "$dgst_url" ]] || die "未在 Xray-core 官方 Release 中找到 $asset 及其 .dgst 校验文件。"
+  [[ -n "$release_obj" && "$release_obj" != "null" ]] || die "未在 Xray-core 官方 Release 中找到 $asset 及其 .dgst 校验文件。"
+
+  tag=$(jq -r '.tag_name // empty' <<<"$release_obj") || die "解析 Xray-core Release tag 失败。"
+  asset_url=$(jq -r --arg asset "$asset" '.assets[]? | select(.name == $asset) | .browser_download_url' <<<"$release_obj") || die "解析 Xray ZIP 下载地址失败。"
+  dgst_url=$(jq -r --arg asset "$asset" '.assets[]? | select(.name == ($asset + ".dgst")) | .browser_download_url' <<<"$release_obj") || die "解析 Xray digest 下载地址失败。"
+
+  [[ -n "$tag" && -n "$asset_url" && -n "$dgst_url" && "$asset_url" != "null" && "$dgst_url" != "null" ]] || die "未在 Xray-core 官方 Release 中找到 $asset 及其 .dgst 校验文件。"
 
   info "准备安装 Xray-core ${tag}：$asset"
   info "下载官方 ZIP 与同 Release digest 文件。"
@@ -851,13 +852,13 @@ install_or_upgrade_xray_release_verified(){
 
   mkdir -p "$extract_dir"
   unzip -oq "$zip" -d "$extract_dir" || die "解压 Xray ZIP 失败。"
-  xray_bin="$(find "$extract_dir" -type f -name xray | head -n1)"
+  xray_bin="$(find "$extract_dir" -type f -name xray -print -quit)"
   [[ -n "$xray_bin" && -f "$xray_bin" ]] || die "Xray ZIP 中未找到 xray 二进制。"
 
   install -d /usr/local/bin /usr/local/etc/xray /usr/local/share/xray /var/log/xray
   install -m 755 "$xray_bin" /usr/local/bin/xray
   for dat in geoip.dat geosite.dat; do
-    f="$(find "$extract_dir" -type f -name "$dat" | head -n1 || true)"
+    f="$(find "$extract_dir" -type f -name "$dat" -print -quit || true)"
     [[ -n "$f" && -f "$f" ]] && install -m 644 "$f" "/usr/local/share/xray/$dat"
   done
 
@@ -1214,7 +1215,7 @@ cf_upsert_record(){
   echo "$list" | jq -e '.success == true' >/dev/null || { err "Cloudflare DNS 记录查询失败：$type $name"; echo "$list" >&2; return 1; }
 
   mapfile -t ids < <(echo "$list" | jq -r '.result[]?.id // empty')
-  rec_id=$(echo "$list" | jq -r --arg content "$content" '.result[]? | select(.content == $content) | .id' | head -n1)
+  rec_id=$(echo "$list" | jq -r --arg content "$content" '[.result[]? | select(.content == $content) | .id][0] // empty')
   [[ -z "$rec_id" && "${#ids[@]}" -gt 0 ]] && rec_id="${ids[0]}"
 
   payload=$(jq -nc --arg type "$type" --arg name "$name" --arg content "$content" --argjson proxied "$proxied" \
@@ -4074,8 +4075,7 @@ bestcf_asset_url(){
   url=$(curl -fsSL --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time "$CURL_MAX_TIME" \
     -H "Accept: application/vnd.github+json" \
     "$BESTCF_RELEASE_API" 2>/dev/null \
-    | jq -r --arg name "$asset" '.assets[]? | select(.name == $name) | .browser_download_url' \
-    | head -n1 || true)
+    | jq -r --arg name "$asset" '[.assets[]? | select(.name == $name) | .browser_download_url][0] // empty' || true)
   if [[ -z "$url" || "$url" == "null" ]]; then
     url="https://github.com/DustinWin/BestCF/releases/download/bestcf/${asset}"
   fi
