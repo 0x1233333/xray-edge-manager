@@ -75,7 +75,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/0x1233333/xray-edge-manager/
 如果使用 beta 文件，例如：
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/0x1233333/xray-edge-manager/refs/heads/main/beta/xem-v0.0.36-rc22-production-ready.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/0x1233333/xray-edge-manager/refs/heads/main/beta/xem-v0.0.36-rc22-fixed.sh)
 ```
 
 如果 `curl` 不可用：
