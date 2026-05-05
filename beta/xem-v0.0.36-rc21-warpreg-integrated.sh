@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Xray Edge Manager / Xray Anti-Block Manager
-# v0.0.36-rc20-fixed-github-run-lf1 — strict BASE/v4/v6 DNS role model, cert reuse, GitHub Raw safe run
+# v0.0.36-rc21-warpreg-integrated — strict BASE/v4/v6 DNS role model, cert reuse, GitHub Raw safe run, WARP auto generation
 #
 # Features:
 # - Xray-core only, no Docker, no sing-box
@@ -49,6 +49,12 @@ CF_CRED="$APP_DIR/cloudflare.ini"
 SUB_DIR="$APP_DIR/subscription"
 REMOTES_FILE="$SUB_DIR/remotes.conf"
 WARP_OUTBOUND_FILE_DEFAULT="$APP_DIR/warp-outbound.json"
+WARP_DIR="$APP_DIR/warp"
+WARP_REG_BIN="$WARP_DIR/warp-reg"
+WARP_REG_CONFIG="$WARP_DIR/config"
+WARP_REG_RELEASE_BASE="https://github.com/badafans/warp-reg/releases/download/v1.0"
+WARP_ENDPOINT_IPV4_DEFAULT="${XEM_WARP_ENDPOINT_IPV4:-162.159.192.1:2408}"
+WARP_ENDPOINT_IPV6_DEFAULT="${XEM_WARP_ENDPOINT_IPV6:-[2606:4700:d0::a29f:c001]:2408}"
 BESTCF_DIR="$APP_DIR/bestcf"
 BACKUP_DIR="$APP_DIR/backups"
 DEBUG_DIR="$APP_DIR/debug"
@@ -95,10 +101,10 @@ if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
   exit 1
 fi
 
-mkdir -p "$APP_DIR" "$APP_DIR/tmp" "$SUB_DIR" "$BESTCF_DIR" "$BACKUP_DIR" "$DEBUG_DIR"
+mkdir -p "$APP_DIR" "$APP_DIR/tmp" "$SUB_DIR" "$WARP_DIR" "$BESTCF_DIR" "$BACKUP_DIR" "$DEBUG_DIR"
 # SECURITY FIX: ensure APP_DIR and its tmp subdir are only accessible by root,
 # even if the parent directory permissions are more permissive.
-chmod 700 "$APP_DIR" "$APP_DIR/tmp" 2>/dev/null || true
+chmod 700 "$APP_DIR" "$APP_DIR/tmp" "$WARP_DIR" 2>/dev/null || true
 
 log()  { echo -e "\033[32m[OK]\033[0m $*" >&2; }
 info() { echo -e "\033[36m[INFO]\033[0m $*" >&2; }
@@ -132,10 +138,10 @@ ensure_runtime_dirs(){
   # Keep runtime directories present even if an earlier failed run, cleanup task,
   # or manual rm removed APP_DIR/tmp while the script is still being used.
   local dir
-  for dir in "$APP_DIR" "$APP_DIR/tmp" "$SUB_DIR" "$BESTCF_DIR" "$BACKUP_DIR" "$DEBUG_DIR"; do
+  for dir in "$APP_DIR" "$APP_DIR/tmp" "$SUB_DIR" "$WARP_DIR" "$BESTCF_DIR" "$BACKUP_DIR" "$DEBUG_DIR"; do
     ensure_dir_or_die "$dir"
   done
-  chmod 700 "$APP_DIR" "$APP_DIR/tmp" 2>/dev/null || true
+  chmod 700 "$APP_DIR" "$APP_DIR/tmp" "$WARP_DIR" 2>/dev/null || true
 }
 
 
@@ -1393,7 +1399,8 @@ select_protocols(){
           if [[ -z "${WARP_OUTBOUND_FILE:-}" ]]; then
             save_kv "$STATE_FILE" WARP_OUTBOUND_FILE "$WARP_OUTBOUND_FILE_DEFAULT"
           fi
-          warn "当前看起来是纯 IPv6 机器；auto 会解析为 warp-v4。请准备 WARP outbound JSON：${WARP_OUTBOUND_FILE:-$WARP_OUTBOUND_FILE_DEFAULT}"
+          warn "当前看起来是纯 IPv6 机器；auto 会解析为 warp-v4。"
+          ensure_warp_outbound_ready_prompt
         fi
         ;;
       2|force-v4|v4|ipv4|all-v4)
@@ -1413,8 +1420,9 @@ select_protocols(){
         if [[ -z "${WARP_OUTBOUND_FILE:-}" ]]; then
           save_kv "$STATE_FILE" WARP_OUTBOUND_FILE "$WARP_OUTBOUND_FILE_DEFAULT"
         fi
-        warn "已选择 warp-v4。请先把 wgcf-cli generate --xray 生成的 WireGuard outbound JSON 放到：${WARP_OUTBOUND_FILE:-$WARP_OUTBOUND_FILE_DEFAULT}"
+        warn "已选择 warp-v4。脚本可以使用 warp-reg 自动生成 WARP outbound；也兼容手动放入 wgcf-cli generate --xray 生成的 JSON。"
         warn "脚本生成 Xray 配置时会强制设置 tag=out-warp、domainStrategy=ForceIPv4、noKernelTun=true；不会修改系统默认路由。"
+        ensure_warp_outbound_ready_prompt
         ;;
       4|stack|normal|same-stack)
         save_kv "$STATE_FILE" IP_OUTBOUND_MODE "stack"
@@ -2229,6 +2237,269 @@ append_route_for_inbound(){
   append_json_obj "$file" "$first_ref" <<EOF2
     {"type":"field","inboundTag":["${inbound}"],"outboundTag":"${out}"}
 EOF2
+}
+
+
+warp_reg_asset_name(){
+  case "$(uname -m)" in
+    x86_64|amd64) echo "main-linux-amd64" ;;
+    i386|i686) echo "main-linux-386" ;;
+    aarch64|arm64|armv8*) echo "main-linux-arm64" ;;
+    armv7l|armv7*) echo "main-linux-arm" ;;
+    armv6l|armv6*) echo "main-linux-arm" ;;
+    *) return 1 ;;
+  esac
+}
+
+install_warp_reg(){
+  need_root
+  ensure_runtime_dirs
+  require_cmds curl jq sha256sum
+  local asset url tmp expected actual
+  if [[ -x "$WARP_REG_BIN" ]]; then
+    info "warp-reg 已存在：$WARP_REG_BIN"
+    return 0
+  fi
+  asset="$(warp_reg_asset_name)" || die "当前架构暂不支持自动下载 warp-reg：$(uname -m)"
+  url="${WARP_REG_RELEASE_BASE}/${asset}"
+  warn "即将下载第三方 warp-reg 工具，用于自动注册 Cloudflare WARP 免费账户并生成 WireGuard 参数。"
+  warn "项目地址：https://github.com/badafans/warp-reg"
+  warn "如需强校验，可设置 XEM_WARP_REG_SHA256；否则只做下载成功和可执行性检查。"
+  if [[ "${XEM_TRUST_WARP_REG:-0}" != "1" ]]; then
+    confirm "是否继续下载并安装 warp-reg？直接回车 = Y" "Y" || die "已取消安装 warp-reg。"
+  fi
+  tmp="$(mktemp_file "$APP_DIR/tmp/warp-reg.XXXXXX")"
+  curl -fL --retry 3 --retry-delay 2 --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time 120 -o "$tmp" "$url" || die "下载 warp-reg 失败：$url"
+  if [[ -n "${XEM_WARP_REG_SHA256:-}" ]]; then
+    expected="${XEM_WARP_REG_SHA256,,}"
+    actual="$(sha256sum "$tmp" | awk '{print tolower($1)}')"
+    [[ "$actual" == "$expected" ]] || die "warp-reg SHA256 校验失败。expected=$expected actual=$actual"
+    log "warp-reg SHA256 pin 校验通过。"
+  fi
+  chmod 700 "$tmp"
+  "$tmp" -h >/dev/null 2>&1 || true
+  mv -f "$tmp" "$WARP_REG_BIN"
+  chmod 700 "$WARP_REG_BIN"
+  log "warp-reg 已安装：$WARP_REG_BIN"
+}
+
+trim_text(){
+  sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
+}
+
+warp_reg_field(){
+  local file="$1" key="$2"
+  # Split only on the first "key:" delimiter; values such as IPv6 addresses
+  # contain additional colons and must be preserved verbatim.
+  awk -v k="$key" '
+    index($0, k ":") == 1 {
+      v = substr($0, length(k) + 2)
+      gsub(/^[[:space:]]+/, "", v)
+      gsub(/[[:space:]]+$/, "", v)
+      print v
+      exit
+    }
+  ' "$file"
+}
+
+warp_reg_reserved_json(){
+  local raw="$1" compact
+  compact="$(printf '%s' "$raw" | tr -d '[:space:]')"
+  jq -e -c '
+    if type == "array" and length == 3 and all(.[]; type == "number" and . >= 0 and . <= 255) then . else empty end
+  ' <<<"$compact" 2>/dev/null || return 1
+}
+
+valid_warp_key_text(){
+  local v="$1"
+  [[ "$v" =~ ^[A-Za-z0-9+/=]{32,128}$ ]]
+}
+
+select_warp_endpoint_for_host(){
+  load_state
+  # Keep this condition aligned with validate_warp_ipv6_endpoints_for_ipv6_only:
+  # if no usable public IPv4 is detected, use an IPv6 literal endpoint so pure
+  # IPv6 machines can reach WARP and the generated JSON passes validation.
+  if [[ -z "${PUBLIC_IPV4:-}" ]]; then
+    echo "$WARP_ENDPOINT_IPV6_DEFAULT"
+  else
+    echo "$WARP_ENDPOINT_IPV4_DEFAULT"
+  fi
+}
+
+run_warp_reg_account(){
+  local force="${1:-0}" tmp
+  install_warp_reg
+  ensure_runtime_dirs
+  if [[ "$force" != "1" && -s "$WARP_REG_CONFIG" ]]; then
+    info "复用已有 warp-reg 账户配置：$WARP_REG_CONFIG"
+    return 0
+  fi
+  tmp="$(mktemp_file "$APP_DIR/tmp/warp-reg-config.XXXXXX")"
+  "$WARP_REG_BIN" > "$tmp" || die "执行 warp-reg 失败，未生成 WARP 账户配置。"
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$WARP_REG_CONFIG"
+  chmod 600 "$WARP_REG_CONFIG"
+  log "WARP 账户配置已生成：$WARP_REG_CONFIG"
+}
+
+generate_warp_outbound_from_warp_reg(){
+  need_root
+  ensure_runtime_dirs
+  require_cmds jq
+  local force="${1:-0}" secret public reserved_raw reserved_json addr4 addr6 endpoint out tmp_clean
+  detect_public_ips
+  run_warp_reg_account "$force"
+
+  secret="$(warp_reg_field "$WARP_REG_CONFIG" private_key | trim_text)"
+  public="$(warp_reg_field "$WARP_REG_CONFIG" public_key | trim_text)"
+  reserved_raw="$(warp_reg_field "$WARP_REG_CONFIG" reserved | trim_text)"
+  addr4="$(warp_reg_field "$WARP_REG_CONFIG" v4 | trim_text)"
+  addr6="$(warp_reg_field "$WARP_REG_CONFIG" v6 | trim_text)"
+  endpoint="$(select_warp_endpoint_for_host | trim_text)"
+
+  valid_warp_key_text "$secret" || die "warp-reg 输出 private_key 格式异常。"
+  valid_warp_key_text "$public" || die "warp-reg 输出 public_key 格式异常。"
+  valid_ipv4_literal "$addr4" || die "warp-reg 输出 v4 地址异常：$addr4"
+  [[ -z "$addr6" ]] || valid_ipv6_literal "$addr6" || die "warp-reg 输出 v6 地址异常：$addr6"
+  reserved_json="$(warp_reg_reserved_json "$reserved_raw")" || die "warp-reg 输出 reserved 格式异常：$reserved_raw"
+
+  out="$(warp_outbound_file_path)"
+  mkdir -p "$(dirname "$out")"
+  tmp_clean="$(mktemp_file "$APP_DIR/tmp/warp-outbound.generated.XXXXXX.json")"
+  if [[ -n "$addr6" ]]; then
+    jq -nc \
+      --arg secret "$secret" \
+      --arg public "$public" \
+      --arg addr4 "${addr4}/32" \
+      --arg addr6 "${addr6}/128" \
+      --arg endpoint "$endpoint" \
+      --argjson reserved "$reserved_json" '
+      {
+        tag:"out-warp",
+        protocol:"wireguard",
+        settings:{
+          secretKey:$secret,
+          address:[$addr4,$addr6],
+          peers:[{publicKey:$public,allowedIPs:["0.0.0.0/0","::/0"],endpoint:$endpoint}],
+          reserved:$reserved,
+          mtu:1280,
+          domainStrategy:"ForceIPv4",
+          noKernelTun:true
+        }
+      }
+    ' > "$tmp_clean" || die "生成 WARP outbound JSON 失败。"
+  else
+    jq -nc \
+      --arg secret "$secret" \
+      --arg public "$public" \
+      --arg addr4 "${addr4}/32" \
+      --arg endpoint "$endpoint" \
+      --argjson reserved "$reserved_json" '
+      {
+        tag:"out-warp",
+        protocol:"wireguard",
+        settings:{
+          secretKey:$secret,
+          address:[$addr4],
+          peers:[{publicKey:$public,allowedIPs:["0.0.0.0/0","::/0"],endpoint:$endpoint}],
+          reserved:$reserved,
+          mtu:1280,
+          domainStrategy:"ForceIPv4",
+          noKernelTun:true
+        }
+      }
+    ' > "$tmp_clean" || die "生成 WARP outbound JSON 失败。"
+  fi
+
+  validate_warp_outbound_json "$tmp_clean"
+  if [[ -z "${PUBLIC_IPV4:-}" ]]; then
+    validate_warp_ipv6_endpoints_for_ipv6_only "$tmp_clean"
+  fi
+  install -m 600 "$tmp_clean" "$out"
+  save_kv "$STATE_FILE" WARP_OUTBOUND_FILE "$out"
+  log "已生成 Xray WARP outbound：$out"
+  info "当前 WARP endpoint：$endpoint"
+}
+
+ensure_warp_outbound_ready_prompt(){
+  load_state
+  local out
+  out="$(warp_outbound_file_path)"
+  if [[ -s "$out" && ! -L "$out" ]]; then
+    info "WARP outbound JSON 已存在：$out"
+    return 0
+  fi
+  warn "未找到 WARP outbound JSON：$out"
+  if confirm "是否使用 v2ray-agent 同类 warp-reg 逻辑自动生成？直接回车 = Y" "Y"; then
+    generate_warp_outbound_from_warp_reg 0
+  else
+    warn "已跳过自动生成。后续如使用 warp-v4，需要手动准备 WARP outbound JSON。"
+  fi
+}
+
+warp_outbound_menu(){
+  while true; do
+    load_state
+    echo
+    echo "===== WARP 出站管理 ====="
+    echo "1. 查看 WARP outbound 状态"
+    echo "2. 使用 warp-reg 生成/复用 WARP outbound，推荐"
+    echo "3. 强制重新注册 WARP 账户并重写 outbound"
+    echo "4. 设置出口策略为 warp-v4，并重新生成 Xray 配置"
+    echo "5. 设置出口策略为 auto，并重新生成 Xray 配置"
+    echo "0. 返回"
+    local c out
+    c=$(ask "请选择" "0")
+    case "$c" in
+      1)
+        out="$(warp_outbound_file_path)"
+        echo "WARP outbound 文件：$out"
+        if [[ -s "$out" ]]; then
+          jq '{tag,protocol,settings:{address:.settings.address,endpoint:.settings.peers[0].endpoint,domainStrategy:.settings.domainStrategy,noKernelTun:.settings.noKernelTun,allowedIPs:.settings.peers[0].allowedIPs,mtu:.settings.mtu}}' "$out" 2>/dev/null || cat "$out"
+        else
+          warn "尚未生成 WARP outbound。"
+        fi
+        pause
+        ;;
+      2)
+        generate_warp_outbound_from_warp_reg 0
+        pause
+        ;;
+      3)
+        confirm "确认重新注册新的 WARP 账户？旧的 WARP 参数会被覆盖。" "N" && generate_warp_outbound_from_warp_reg 1
+        pause
+        ;;
+      4)
+        generate_warp_outbound_from_warp_reg 0
+        save_kv "$STATE_FILE" IP_OUTBOUND_MODE "warp-v4"
+        save_kv "$STATE_FILE" ENABLE_IP_STACK_BINDING "1"
+        if [[ -f "$XRAY_CONFIG" ]]; then
+          generate_xray_config
+          restart_services
+          regenerate_subscriptions_after_change
+        else
+          warn "尚未生成主 Xray 配置，已只保存 WARP outbound 和出口策略。"
+        fi
+        pause
+        ;;
+      5)
+        ensure_warp_outbound_ready_prompt
+        save_kv "$STATE_FILE" IP_OUTBOUND_MODE "auto"
+        save_kv "$STATE_FILE" ENABLE_IP_STACK_BINDING "1"
+        if [[ -f "$XRAY_CONFIG" ]]; then
+          generate_xray_config
+          restart_services
+          regenerate_subscriptions_after_change
+        else
+          warn "尚未生成主 Xray 配置，已只保存 auto 出口策略。"
+        fi
+        pause
+        ;;
+      0) break ;;
+      *) warn "无效选择。" ;;
+    esac
+  done
 }
 
 warp_outbound_file_path(){
@@ -4915,7 +5186,7 @@ main_menu(){
   load_state
   while true; do
     echo
-    echo "===== Xray Edge Manager v0.0.36-rc20-domain-model ====="
+    echo "===== Xray Edge Manager v0.0.36-rc21-warpreg-integrated ====="
     echo "1. 首次部署向导，推荐"
     echo "2. 安装/升级基础依赖"
     echo "3. 安装/升级 Xray-core"
@@ -4936,6 +5207,7 @@ main_menu(){
     echo "18. 部署摘要"
     echo "19. 安装状态"
     echo "20. 卸载 / 清理"
+    echo "21. WARP 出站管理 / 自动生成 warp-outbound.json"
     echo "0. 退出"
     local c; c=$(ask "请选择" "0")
     case "$c" in
@@ -4971,6 +5243,7 @@ main_menu(){
       18) deployment_summary; pause ;;
       19) show_installation_state; pause ;;
       20) uninstall_menu ;;
+      21) warp_outbound_menu ;;
       0) exit 0 ;;
       *) warn "无效选择。" ;;
     esac
@@ -5015,6 +5288,25 @@ case "${1:-}" in
     if [[ "${ENABLE_CF_ORIGIN_FIREWALL:-0}" == "1" ]]; then
       apply_cf_origin_firewall
     fi
+    exit 0
+    ;;
+  --warp-regenerate)
+    need_root
+    acquire_lock
+    load_state
+    generate_warp_outbound_from_warp_reg 1
+    if [[ -f "$XRAY_CONFIG" ]]; then
+      generate_xray_config
+      restart_services
+      regenerate_subscriptions_after_change || true
+    fi
+    exit 0
+    ;;
+  --warp-ensure)
+    need_root
+    acquire_lock
+    load_state
+    generate_warp_outbound_from_warp_reg 0
     exit 0
     ;;
 esac
