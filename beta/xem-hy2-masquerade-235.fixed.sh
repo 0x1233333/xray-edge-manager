@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
 # Xray Edge Manager / Xray Anti-Block Manager
-# v0.0.36-rc22-production-ready — strict BASE/v4/v6 DNS role model, cert reuse, GitHub Raw safe run, WARP auto generation, production preflight/postflight
+# v0.0.36-rc22-production-ready-p1 — strict BASE/v4/v6 DNS role model, cert reuse, GitHub Raw safe run, WARP auto generation, production preflight/postflight
 #
 # Features:
 # - Xray-core only, no Docker, no sing-box
-# - Per-stack protocol selection: IPv4 and IPv6 can independently select 0/1/2/3/4/5 or combinations like 123
+# - Per-stack protocol selection: IPv4 and IPv6 can independently select 0/1/2/3/4/5 or combinations like 235
 # - Domain role model:
 #   BASE_DOMAIN       = public subscription URL + camouflage site + CDN transit entry only
 #   v4.BASE_DOMAIN    = IPv4 direct nodes only; managed DNS type: A only
 #   v6.BASE_DOMAIN    = IPv6 direct nodes only; managed DNS type: AAAA only
 # - Protocols:
-#   1 = VLESS + XHTTP + REALITY direct
+#   1 = VLESS + XHTTP + REALITY direct backup
 #   2 = VLESS + XHTTP + TLS + CDN via Nginx
-#   3 = Xray Hysteria2 UDP high-speed backup
+#   3 = Xray Hysteria2 UDP high-speed backup with port hopping and H3 masquerade
 #   4 = VLESS + REALITY + Vision backup direct
 #   5 = VLESS + XHTTP + TLS + CDN extra CDN/BestCF entry using the same CDN inbound
 # - NAT-aware: PUBLIC IP is used for DNS; BIND IP is used for Xray listen.
@@ -1243,9 +1243,23 @@ stack_has_hy2(){ [[ "$1" == *"3"* ]]; }
 stack_has_vision(){ [[ "$1" == *"4"* ]]; }
 stack_has_direct_protocol(){ [[ "$1" == *"1"* || "$1" == *"3"* || "$1" == *"4"* ]]; }
 
+valid_stack_protocol_input(){
+  local p="$1"
+  p="$(printf '%s' "$p" | tr -d '[:space:]')"
+  [[ -n "$p" ]] || return 1
+  [[ "$p" =~ ^[0-5,]+$ ]] || return 1
+  p="${p//,/}"
+  [[ -n "$p" ]] || return 1
+  # 0 means disabled and must not be mixed with enabled protocols.
+  if [[ "$p" == *0* && "$p" != "0" ]]; then
+    return 1
+  fi
+  return 0
+}
+
 normalize_stack_protocols(){
   local p="$1" out=""
-  p="${p//,/}"; p="${p// /}"
+  p="$(printf '%s' "$p" | tr -d '[:space:],')"
   [[ "$p" == "0" || -z "$p" ]] && { echo "0"; return 0; }
   [[ "$p" == *1* ]] && out="${out}1"
   [[ "$p" == *2* ]] && out="${out}2"
@@ -1261,15 +1275,23 @@ select_one_stack_protocols(){
   echo >&2
   echo "===== ${label} 协议组合选择 =====" >&2
   echo "0. 不生成 ${label} 节点" >&2
-  echo "1. ${label} VLESS + XHTTP + REALITY，直连，默认主力" >&2
-  echo "2. ${label} VLESS + XHTTP + TLS + CDN，CDN 隐藏，使用母域名" >&2
-  echo "3. ${label} Xray Hysteria2，UDP 高速备用，实验" >&2
-  echo "4. ${label} VLESS + REALITY + Vision，可选直连备用" >&2
-  echo "5. ${label} VLESS + XHTTP + TLS + CDN 入口扩展，复用 CDN 入站，可配合 BestCF/优选域名/域名前置" >&2
-  echo "可以输入组合，例如 123、13、23、1234；直接回车 = 使用方括号里的默认/当前值。" >&2
-  mode=$(ask "请选择 ${label} 协议组合（0/1/2/3/4/5 或组合）" "${current:-$default_mode}")
-  normalized=$(normalize_stack_protocols "$mode")
-  echo "$normalized"
+  echo "1. ${label} VLESS + XHTTP + REALITY，直连备用；受 REALITY 版本事件影响，不作为默认推荐" >&2
+  echo "2. ${label} VLESS + XHTTP + TLS + CDN，Mihomo 开发版兼容主入口，推荐" >&2
+  echo "3. ${label} Xray Hysteria2，UDP 高速安全备用，支持端口跳跃与 H3 伪装，推荐" >&2
+  echo "4. ${label} VLESS + REALITY + Vision，高级备用；需自行确认客户端/服务端版本" >&2
+  echo "5. ${label} VLESS + XHTTP + TLS + CDN 入口扩展，复用 CDN 入站，可配合 BestCF/优选域名/域名前置，推荐" >&2
+  echo "推荐组合：235 = CDN XHTTP 主入口 + HY2 UDP 高速备用 + BestCF/CDN 扩展。" >&2
+  echo "保守组合：25 = 只走 CDN XHTTP，不启用 HY2；REALITY 组合 1/4 需手动输入。" >&2
+  [[ -n "$current" ]] && echo "当前已保存：$current；本次直接回车会使用推荐值：$default_mode。" >&2
+  while true; do
+    mode=$(ask "请选择 ${label} 协议组合（0/1/2/3/4/5 或组合）" "$default_mode")
+    if valid_stack_protocol_input "$mode"; then
+      normalized=$(normalize_stack_protocols "$mode")
+      echo "$normalized"
+      return 0
+    fi
+    warn "协议组合输入非法：只能包含 0/1/2/3/4/5、逗号或空格；0 不能与其它协议混用。"
+  done
 }
 
 build_default_protocols_from_stack_strategy(){
@@ -1293,19 +1315,19 @@ select_ip_stack_strategy(){
 
   echo
   echo "===== IPv4 / IPv6 独立协议组合 ====="
-  echo "IPv4 和 IPv6 各自输入协议组合，例如 IPv4=123，IPv6=13。"
-  echo "0=不生成该栈节点；1=XHTTP+REALITY直连；2=XHTTP+TLS+CDN；3=Hysteria2 UDP；4=REALITY+Vision；5=CDN/BestCF入口扩展。"
-  echo "直接按回车会使用方括号里的默认/当前值。"
+  echo "IPv4 和 IPv6 各自输入协议组合；推荐 IPv4=235，IPv6=235；保守可用 25。"
+  echo "0=不生成该栈节点；1=XHTTP+REALITY直连备用；2=XHTTP+TLS+CDN；3=Hysteria2 UDP；4=REALITY+Vision；5=CDN/BestCF入口扩展。"
+  echo "直接按回车会使用推荐组合，不再把历史值当默认值；历史值会在下方提示。"
 
   if [[ -n "$ip4" ]]; then
-    v4_protos=$(select_one_stack_protocols "IPv4" "${IPV4_PROTOCOLS:-}" "123")
+    v4_protos=$(select_one_stack_protocols "IPv4" "${IPV4_PROTOCOLS:-}" "235")
     save_kv "$STATE_FILE" IPV4_PROTOCOLS "$v4_protos"
   else
     save_kv "$STATE_FILE" IPV4_PROTOCOLS "0"
     warn "未检测到 IPv4，IPv4 协议组合设为 0。"
   fi
   if [[ -n "$ip6" ]]; then
-    v6_protos=$(select_one_stack_protocols "IPv6" "${IPV6_PROTOCOLS:-}" "123")
+    v6_protos=$(select_one_stack_protocols "IPv6" "${IPV6_PROTOCOLS:-}" "235")
     save_kv "$STATE_FILE" IPV6_PROTOCOLS "$v6_protos"
   else
     save_kv "$STATE_FILE" IPV6_PROTOCOLS "0"
@@ -1567,6 +1589,47 @@ assert_deploy_stack_ready(){
   log "部署栈预检通过：IPv4=${ip4:-无} IPv6=${ip6:-无} PROTOCOLS=${PROTOCOLS:-0}"
 }
 
+cf_record_exact_match(){
+  local name="$1" type="$2" content="$3" proxied="$4" resp
+  resp=$(cf_get_record_json "$name" "$type" 2>/dev/null || true)
+  [[ -n "$resp" ]] || return 1
+  echo "$resp" | jq -e --arg content "$content" --argjson proxied "$proxied" '
+    (.success == true) and any(.result[]?; .content == $content and .proxied == $proxied)
+  ' >/dev/null 2>&1
+}
+
+validate_reused_dns_records(){
+  require_cmds curl jq
+  load_state
+  local ip4="${1:-}" ip6="${2:-}" failed=0
+  require_public_ip_for_dns_update "$ip4" "$ip6"
+
+  if [[ -n "$ip4" ]] && ! cf_record_exact_match "$BASE_DOMAIN" A "$ip4" true; then
+    warn "复用 DNS 校验失败：缺少 proxied=true 的 A ${BASE_DOMAIN} -> ${ip4}。"
+    failed=1
+  fi
+  if [[ -n "$ip6" ]] && ! cf_record_exact_match "$BASE_DOMAIN" AAAA "$ip6" true; then
+    warn "复用 DNS 校验失败：缺少 proxied=true 的 AAAA ${BASE_DOMAIN} -> ${ip6}。"
+    failed=1
+  fi
+
+  if [[ -n "$ip4" && "${IPV4_PROTOCOLS:-0}" != "0" ]] && stack_has_direct_protocol "${IPV4_PROTOCOLS:-0}"; then
+    if ! cf_record_exact_match "v4.$BASE_DOMAIN" A "$ip4" false; then
+      warn "复用 DNS 校验失败：IPv4 直连协议已启用，但缺少 proxied=false 的 A v4.${BASE_DOMAIN} -> ${ip4}。"
+      failed=1
+    fi
+  fi
+  if [[ -n "$ip6" && "${IPV6_PROTOCOLS:-0}" != "0" ]] && stack_has_direct_protocol "${IPV6_PROTOCOLS:-0}"; then
+    if ! cf_record_exact_match "v6.$BASE_DOMAIN" AAAA "$ip6" false; then
+      warn "复用 DNS 校验失败：IPv6 直连协议已启用，但缺少 proxied=false 的 AAAA v6.${BASE_DOMAIN} -> ${ip6}。"
+      failed=1
+    fi
+  fi
+
+  (( failed == 0 )) || die "复用 DNS 校验未通过。建议选择 1 刷新为当前 VPS IP，避免 DNS 假成功。"
+  log "复用 DNS 校验通过：BASE/v4/v6 关键 A/AAAA 记录符合当前协议角色。"
+}
+
 create_dns_records(){
   require_cmds curl jq
   load_state
@@ -1602,7 +1665,8 @@ create_dns_records(){
       apply_domain_role_dns_records "$ip4" "$ip6"
       ;;
     2)
-      warn "已选择复用现有 DNS，不修改 BASE/v4/v6 的 A/AAAA。请确认它们已指向当前 VPS。"
+      warn "已选择复用现有 DNS，不修改 BASE/v4/v6 的 A/AAAA；开始校验现有记录是否匹配当前 VPS 与协议角色。"
+      validate_reused_dns_records "$ip4" "$ip6"
       ;;
     3)
       require_public_ip_for_dns_update "$ip4" "$ip6"
@@ -1697,6 +1761,16 @@ certificate_matches_base_domain(){
   [[ -n "$cert" && -f "$cert" ]] || return 1
   san_text=$(openssl x509 -noout -text -in "$cert" 2>/dev/null | tr '\n' ' ')
   [[ "$san_text" == *"DNS:${BASE_DOMAIN}"* && "$san_text" == *"DNS:*.${BASE_DOMAIN}"* ]]
+}
+
+certificate_sha256_fingerprint(){
+  local cert fp
+  cert="$(cert_live_fullchain 2>/dev/null || true)"
+  [[ -n "$cert" && -f "$cert" ]] || return 1
+  command -v openssl >/dev/null 2>&1 || return 1
+  fp="$(openssl x509 -noout -fingerprint -sha256 -inform pem -in "$cert" 2>/dev/null | sed 's/^.*=//' | tr 'A-F' 'a-f' || true)"
+  [[ -n "$fp" ]] || return 1
+  echo "$fp"
 }
 
 show_existing_certificate_info(){
@@ -1844,6 +1918,22 @@ choose_reality_target(){
   log "REALITY target: $target"
 }
 
+reality_protocols_enabled(){
+  load_state
+  [[ "${PROTOCOLS:-0}" == *1* || "${PROTOCOLS:-0}" == *4* || \
+     "${IPV4_PROTOCOLS:-0}" == *1* || "${IPV4_PROTOCOLS:-0}" == *4* || \
+     "${IPV6_PROTOCOLS:-0}" == *1* || "${IPV6_PROTOCOLS:-0}" == *4* ]]
+}
+
+ensure_reality_target_if_needed(){
+  load_state
+  if reality_protocols_enabled; then
+    [[ -n "${REALITY_TARGET:-}" ]] || choose_reality_target
+  else
+    info "当前协议组合不包含 REALITY 直连协议 1/4，跳过 REALITY target 配置。"
+  fi
+}
+
 validate_x25519_key(){
   local k="$1"
   [[ "$k" =~ ^[A-Za-z0-9_-]{40,80}$ ]]
@@ -1862,6 +1952,12 @@ valid_safe_xray_path(){
 valid_safe_token(){
   local v="$1"
   [[ "$v" =~ ^[A-Za-z0-9._~-]{8,128}$ ]]
+}
+
+valid_hy2_auth_token(){
+  local v="$1"
+  # HY2 认证口令用于 URI userinfo。默认强制 256-bit+ hex，兼顾强度与 Mihomo URI 兼容性。
+  [[ "$v" =~ ^[a-f0-9]{64,128}$ ]]
 }
 
 valid_short_id(){
@@ -2011,9 +2107,9 @@ validate_state_or_regen(){
     warn "XHTTP_CDN_PATH 非法，已重新生成。"
     save_kv "$STATE_FILE" XHTTP_CDN_PATH "$(rand_path)"
   fi
-  if [[ -n "${HY2_AUTH:-}" ]] && ! valid_safe_token "$HY2_AUTH"; then
-    warn "HY2_AUTH 非法，已重新生成。"
-    save_kv "$STATE_FILE" HY2_AUTH "$(rand_hex 16)"
+  if [[ -n "${HY2_AUTH:-}" ]] && ! valid_hy2_auth_token "$HY2_AUTH"; then
+    warn "HY2_AUTH 不满足 256-bit hex 强度要求，已重新生成。"
+    save_kv "$STATE_FILE" HY2_AUTH "$(rand_hex 32)"
   fi
   if [[ -n "${SHORT_ID:-}" ]] && ! valid_short_id "$SHORT_ID"; then
     warn "SHORT_ID 非法，已重新生成。"
@@ -2089,7 +2185,7 @@ generate_keys_if_needed(){
   fi
   [[ -n "${XHTTP_REALITY_PATH:-}" ]] || save_kv "$STATE_FILE" XHTTP_REALITY_PATH "$(rand_path)"
   [[ -n "${XHTTP_CDN_PATH:-}" ]] || save_kv "$STATE_FILE" XHTTP_CDN_PATH "$(rand_path)"
-  [[ -n "${HY2_AUTH:-}" ]] || save_kv "$STATE_FILE" HY2_AUTH "$(rand_hex 16)"
+  [[ -n "${HY2_AUTH:-}" ]] || save_kv "$STATE_FILE" HY2_AUTH "$(rand_hex 32)"
   [[ -n "${SUB_TOKEN:-}" ]] || save_kv "$STATE_FILE" SUB_TOKEN "$(rand_token)"
   [[ -n "${MERGED_SUB_TOKEN:-}" ]] || save_kv "$STATE_FILE" MERGED_SUB_TOKEN "$(rand_token)"
   [[ -n "${XHTTP_CDN_LOCAL_PORT:-}" ]] || save_kv "$STATE_FILE" XHTTP_CDN_LOCAL_PORT "31301"
@@ -2769,7 +2865,7 @@ generate_xray_config(){
   need_root
   load_state
   [[ -n "${BASE_DOMAIN:-}" ]] || configure_base_domain
-  [[ -n "${REALITY_TARGET:-}" ]] || choose_reality_target
+  ensure_reality_target_if_needed
   generate_keys_if_needed
   validate_state_or_regen
   load_state
@@ -2875,14 +2971,14 @@ EOF2
   if protocol_enabled 3; then
     if [[ -n "$bind_ip4" && "${IPV4_PROTOCOLS:-0}" == *3* ]]; then
       append_json_obj "$in_tmp" first_in <<EOF2
-    {"tag":"in-v4-hysteria2-udp","listen":"${bind_ip4}","port":${HY2_PORT},"protocol":"hysteria","settings":{"version":2,"clients":[{"auth":"${HY2_AUTH}","email":"v4-hy2"}]},"streamSettings":{"network":"hysteria","security":"tls","tlsSettings":{"alpn":["h3"],"certificates":[{"certificateFile":"${XRAY_CERT_DIR}/${BASE_DOMAIN}/fullchain.pem","keyFile":"${XRAY_CERT_DIR}/${BASE_DOMAIN}/privkey.pem"}]},"hysteriaSettings":{"version":2,"auth":"${HY2_AUTH}","udpIdleTimeout":60}}}
+    {"tag":"in-v4-hysteria2-udp","listen":"${bind_ip4}","port":${HY2_PORT},"protocol":"hysteria","settings":{"version":2,"users":[{"auth":"${HY2_AUTH}","level":0,"email":"v4-hy2"}]},"streamSettings":{"network":"hysteria","security":"tls","tlsSettings":{"alpn":["h3"],"certificates":[{"certificateFile":"${XRAY_CERT_DIR}/${BASE_DOMAIN}/fullchain.pem","keyFile":"${XRAY_CERT_DIR}/${BASE_DOMAIN}/privkey.pem"}]},"hysteriaSettings":{"version":2,"auth":"${HY2_AUTH}","udpIdleTimeout":60,"masquerade":{"type":"file","dir":"${WEB_ROOT}"}}}}
 EOF2
       v4_hy2_ready=1
       [[ "$bind" == "1" ]] && append_route_for_inbound "$route_tmp" first_route "in-v4-hysteria2-udp" "v4" "$outbound_mode"
     fi
     if [[ -n "$bind_ip6" && "${IPV6_PROTOCOLS:-0}" == *3* ]]; then
       append_json_obj "$in_tmp" first_in <<EOF2
-    {"tag":"in-v6-hysteria2-udp","listen":"${bind_ip6}","port":${HY2_PORT},"protocol":"hysteria","settings":{"version":2,"clients":[{"auth":"${HY2_AUTH}","email":"v6-hy2"}]},"streamSettings":{"network":"hysteria","security":"tls","tlsSettings":{"alpn":["h3"],"certificates":[{"certificateFile":"${XRAY_CERT_DIR}/${BASE_DOMAIN}/fullchain.pem","keyFile":"${XRAY_CERT_DIR}/${BASE_DOMAIN}/privkey.pem"}]},"hysteriaSettings":{"version":2,"auth":"${HY2_AUTH}","udpIdleTimeout":60}}}
+    {"tag":"in-v6-hysteria2-udp","listen":"${bind_ip6}","port":${HY2_PORT},"protocol":"hysteria","settings":{"version":2,"users":[{"auth":"${HY2_AUTH}","level":0,"email":"v6-hy2"}]},"streamSettings":{"network":"hysteria","security":"tls","tlsSettings":{"alpn":["h3"],"certificates":[{"certificateFile":"${XRAY_CERT_DIR}/${BASE_DOMAIN}/fullchain.pem","keyFile":"${XRAY_CERT_DIR}/${BASE_DOMAIN}/privkey.pem"}]},"hysteriaSettings":{"version":2,"auth":"${HY2_AUTH}","udpIdleTimeout":60,"masquerade":{"type":"file","dir":"${WEB_ROOT}"}}}}
 EOF2
       v6_hy2_ready=1
       [[ "$bind" == "1" ]] && append_route_for_inbound "$route_tmp" first_route "in-v6-hysteria2-udp" "v6" "$outbound_mode"
@@ -3363,14 +3459,19 @@ hy2_hop_range_for_stack(){
 }
 
 add_hy2_link(){
-  local server="$1" name="$2" raw="$3" server_uri mport_param="" hop_range="" stack="v4"
+  local server="$1" name="$2" raw="$3" server_uri mport_param="" hop_range="" stack="v4" pin_param="" cert_fp
   server_uri=$(format_uri_host "$server")
   [[ "$server" == v6.* || "$server" == *:* ]] && stack="v6"
   hop_range="$(hy2_hop_range_for_stack "$stack")"
   if [[ -n "$hop_range" ]]; then
     mport_param="&mport=${hop_range/:/-}"
   fi
-  echo "hysteria2://${HY2_AUTH}@${server_uri}:${HY2_PORT:-443}?sni=${BASE_DOMAIN}&insecure=0&alpn=h3${mport_param}#$(uri_encode "$name")" >> "$raw"
+  cert_fp="$(certificate_sha256_fingerprint 2>/dev/null || true)"
+  if [[ -n "$cert_fp" ]]; then
+    # Hysteria2 URI 标准支持 pinSHA256；这里用 leaf 证书 SHA256 指纹做客户端证书 pin。
+    pin_param="&pinSHA256=$(uri_encode "$cert_fp")"
+  fi
+  echo "hysteria2://${HY2_AUTH}@${server_uri}:${HY2_PORT:-443}?sni=${BASE_DOMAIN}&insecure=0&alpn=h3${pin_param}${mport_param}#$(uri_encode "$name")" >> "$raw"
 }
 
 ready_key_to_inbound_tag(){
@@ -3410,7 +3511,7 @@ node_ready(){
       jq -e --arg tag "$tag" --arg auth "${HY2_AUTH:-}" --argjson port "${HY2_PORT}" '
           .inbounds[]?
           | select(.tag == $tag and .port == $port)
-          | select(any(.settings.clients[]?; .auth == $auth))
+          | select(any(.settings.users[]?; .auth == $auth))
         ' "$XRAY_CONFIG" >/dev/null 2>&1
       ;;
     V4_VISION_READY|V6_VISION_READY)
@@ -3443,7 +3544,8 @@ node_ready(){
 
 generate_mihomo_reference(){
   load_state
-  local f="$SUB_DIR/mihomo-reference.yaml"
+  local f="$SUB_DIR/mihomo-reference.yaml" cert_fp=""
+  cert_fp="$(certificate_sha256_fingerprint 2>/dev/null || true)"
   cat > "$f" <<EOF2
 # 仅供参考：对外订阅仍只发布 base64。
 # 建议使用 Clash Verge Rev / Mihomo 新版内核测试 XHTTP。
@@ -3555,11 +3657,14 @@ EOF2
     alpn:
       - h3
 EOF2
+      [[ -n "$cert_fp" ]] && cat >> "$f" <<EOF2
+    fingerprint: "$cert_fp"
+EOF2
       local hop_range_v4
       hop_range_v4="$(hy2_hop_range_for_stack v4)"
       [[ -n "$hop_range_v4" ]] && cat >> "$f" <<EOF2
     ports: ${hop_range_v4/:/-}
-    hop-interval: 30
+    hop-interval: 15-30
 EOF2
     fi
     if [[ -n "${PUBLIC_IPV6:-}" && "${IPV6_PROTOCOLS:-0}" == *3* ]] && node_ready V6_HY2_READY; then
@@ -3574,11 +3679,14 @@ EOF2
     alpn:
       - h3
 EOF2
+      [[ -n "$cert_fp" ]] && cat >> "$f" <<EOF2
+    fingerprint: "$cert_fp"
+EOF2
       local hop_range_v6
       hop_range_v6="$(hy2_hop_range_for_stack v6)"
       [[ -n "$hop_range_v6" ]] && cat >> "$f" <<EOF2
     ports: ${hop_range_v6/:/-}
-    hop-interval: 30
+    hop-interval: 15-30
 EOF2
     fi
   fi
@@ -3655,7 +3763,25 @@ generate_subscription(){
   # COMPATIBILITY FIX: avoid GNU-specific sed -i and base64 -w0.
   local raw_cleaned; raw_cleaned=$(mktemp_file "${raw}.clean.XXXXXX")
   sed '/^$/d' "$raw" > "$raw_cleaned" && mv -f "$raw_cleaned" "$raw"
+
+  awk '
+    NF && $0 !~ /^(vless|hysteria2):\/\// {
+      print "非法订阅行：" $0 > "/dev/stderr"
+      bad=1
+    }
+    END { exit bad }
+  ' "$raw" || die "raw 订阅包含非 Mihomo 目标协议，拒绝生成 b64 订阅。"
+
+  local sub_line_count
+  sub_line_count=$(grep -cE '^(vless|hysteria2)://' "$raw" 2>/dev/null || true)
+  [[ "$sub_line_count" =~ ^[0-9]+$ ]] || sub_line_count=0
+  (( sub_line_count > 0 )) || die "没有生成任何可用节点，拒绝发布空订阅。请先检查 Xray 配置生成、节点 ready 状态、证书、DNS 和端口放行。"
+
   base64 "$raw" | tr -d '\n' > "$b64"
+  local b64_decoded; b64_decoded=$(mktemp_file "${b64}.decode.XXXXXX")
+  base64 -d "$b64" > "$b64_decoded" 2>/dev/null || die "b64 订阅无法解码，拒绝发布。"
+  cmp -s "$raw" "$b64_decoded" || die "b64 解码结果与 raw 订阅不一致，拒绝发布。"
+
   local nginx_group
   nginx_group="$(detect_nginx_group)"
   ensure_web_subscription_permissions
@@ -4602,9 +4728,13 @@ deployment_summary(){
   protocol_enabled 1 && echo "  XHTTP+REALITY: TCP ${XHTTP_REALITY_PORT:-2443}"
   protocol_enabled 2 && echo "  XHTTP+TLS+CDN: TCP ${CDN_PORT:-443} -> 127.0.0.1:${XHTTP_CDN_LOCAL_PORT:-31301}"
   protocol_enabled 3 && echo "  Xray Hysteria2: UDP ${HY2_PORT:-443}，ALPN h3"
+  protocol_enabled 3 && echo "  HY2 H3 伪装: file -> ${WEB_ROOT}"
   protocol_enabled 4 && echo "  REALITY+Vision: TCP ${REALITY_VISION_PORT:-3443}"
   protocol_enabled 5 && echo "  XHTTP+TLS+CDN 入口扩展: TCP ${CDN_PORT:-443} -> 127.0.0.1:${XHTTP_CDN_LOCAL_PORT:-31301}"
-  [[ -n "${HY2_HOP_RANGE:-}" ]] && echo "  HY2 端口跳跃: UDP ${HY2_HOP_RANGE/:/-} -> ${HY2_PORT:-443}"
+  if [[ -n "${HY2_HOP_RANGE:-}" ]]; then
+    echo "  HY2 端口跳跃: UDP ${HY2_HOP_RANGE/:/-} -> UDP ${HY2_PORT:-443}"
+    echo "  请确认云安全组放行 UDP ${HY2_PORT:-443} 和 UDP ${HY2_HOP_RANGE/:/-}"
+  fi
   echo "Xray 运行用户: ${XRAY_USER}"
   echo "出口策略: $(normalize_ip_outbound_mode "${IP_OUTBOUND_MODE:-}")"
   if [[ "$(normalize_ip_outbound_mode "${IP_OUTBOUND_MODE:-}")" == "auto" ]]; then
@@ -4736,7 +4866,7 @@ install_full(){
   assert_deploy_stack_ready
   create_dns_records
   issue_certificate
-  choose_reality_target
+  ensure_reality_target_if_needed
   generate_xray_config
   configure_nginx
   configure_hy2_hopping_prompt
@@ -5447,7 +5577,7 @@ main_menu(){
       6) setup_cloudflare; create_dns_records; pause ;;
       7) issue_certificate; pause ;;
       8) asn_report; pause ;;
-      9) asn_report; select_ip_stack_strategy; select_protocols; assert_deploy_stack_ready; create_dns_records; choose_reality_target; ensure_hy2_certificate_ready; generate_xray_config; configure_nginx; restart_services; regenerate_subscriptions_after_change; deployment_healthcheck; pause ;;
+      9) asn_report; select_ip_stack_strategy; select_protocols; assert_deploy_stack_ready; create_dns_records; ensure_reality_target_if_needed; ensure_hy2_certificate_ready; generate_xray_config; configure_nginx; restart_services; regenerate_subscriptions_after_change; deployment_healthcheck; pause ;;
       10) configure_nginx; pause ;;
       11) bestcf_menu ;;
       12) configure_hy2_hopping_prompt; pause ;;
