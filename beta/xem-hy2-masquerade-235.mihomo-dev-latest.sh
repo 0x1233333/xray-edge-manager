@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Xray Edge Manager / Xray Anti-Block Manager
-# v0.0.36-rc22-production-ready-p1 — strict BASE/v4/v6 DNS role model, cert reuse, GitHub Raw safe run, WARP auto generation, production preflight/postflight
+# v0.0.36-rc22-production-ready-p2 — Mihomo dev kernel target, auto self-install for timers, strict BASE/v4/v6 DNS role model, cert reuse, WARP auto generation, production preflight/postflight
 #
 # Features:
 # - Xray-core only, no Docker, no sing-box
@@ -953,6 +953,7 @@ update_geodata(){
 install_self_to_local_bin(){
   need_root
   mkdir -p /usr/local/bin
+
   if [[ -f "${BASH_SOURCE[0]:-}" && "${BASH_SOURCE[0]}" != /dev/fd/* && "${BASH_SOURCE[0]}" != /proc/* ]]; then
     local src_self dst_self
     src_self="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")"
@@ -966,19 +967,20 @@ install_self_to_local_bin(){
     log "已安装本地命令：/usr/local/bin/xem"
     return 0
   fi
-  # SECURITY FIX: do not silently download and install self from remote.
-  # Require explicit user confirmation, and support SHA256 pin verification.
+
+  # bash <(curl ...) 场景无法可靠复制 /dev/fd。
+  # 安装代理流程需要 /usr/local/bin/xem：HY2 跳跃恢复、BestCF timer、geodata timer、源站防火墙等都依赖它。
+  # 因此这里不做二次交互确认；保留 https 限制、bash -n 语法检查和可选 SHA256 pin。
+  [[ "$SCRIPT_RAW_URL" == https://* ]] || die "SCRIPT_RAW_URL 必须是 https 地址，当前：$SCRIPT_RAW_URL"
+
   warn "当前可能是 bash <(curl ...) 方式运行，无法可靠复制自身。"
-  warn "将从仓库下载一次用于固化本地命令：$SCRIPT_RAW_URL"
-  warn "这意味着你信任该远程地址提供的脚本内容。测试分支/ fork 请用 XEM_SCRIPT_RAW_URL 覆盖。"
-  warn "可设置 XEM_SELF_SHA256 进行强校验。"
-  warn "首次部署中 HY2 跳跃、BestCF 定时任务、源站防火墙等功能需要 /usr/local/bin/xem。"
-  if [[ "${XEM_TRUST_REMOTE_SELF:-0}" != "1" ]]; then
-    confirm "是否继续从远程下载并安装本脚本？你已经在执行该 Raw 脚本，直接回车 = Y" "Y" || die "已取消远程安装。请手动下载脚本后执行 install -m 755 xem.sh /usr/local/bin/xem"
-  fi
+  warn "将自动从仓库下载并固化本地命令：$SCRIPT_RAW_URL"
+  warn "如需固定版本，请用 XEM_SCRIPT_RAW_URL 指向 tag/commit raw；如需强校验，可设置 XEM_SELF_SHA256。"
+
   local tmp_script
   tmp_script="$(mktemp_file "$APP_DIR/tmp/xem-self.XXXXXX.sh")"
   curl -fsSL --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time 60 "$SCRIPT_RAW_URL" -o "$tmp_script" || die "下载本地命令失败。"
+
   if command -v perl >/dev/null 2>&1; then
     # Normalize common copy/paste damage before installing the persistent local command.
     # This does not make a CRLF GitHub Raw script executable on first launch, but it
@@ -987,8 +989,9 @@ install_self_to_local_bin(){
   else
     sed -i 's/\r$//' "$tmp_script" 2>/dev/null || true
   fi
+
   bash -n "$tmp_script" || die "下载的脚本语法检查失败，拒绝安装。请确认 GitHub 仓库中的 xem.sh 使用 LF 换行。"
-  # SHA256 pin verification if configured
+
   if [[ -n "${XEM_SELF_SHA256:-}" ]]; then
     local expected_self actual_self
     expected_self="${XEM_SELF_SHA256,,}"
@@ -996,8 +999,8 @@ install_self_to_local_bin(){
     [[ "$actual_self" == "$expected_self" ]] || die "脚本 SHA256 校验失败，拒绝安装。expected=$expected_self actual=$actual_self"
     log "脚本 SHA256 pin 校验通过。"
   fi
-  mv -f "$tmp_script" /usr/local/bin/xem
-  chmod +x /usr/local/bin/xem
+
+  install -m 755 "$tmp_script" /usr/local/bin/xem
   log "已安装本地命令：/usr/local/bin/xem"
 }
 
@@ -3459,7 +3462,7 @@ hy2_hop_range_for_stack(){
 }
 
 add_hy2_link(){
-  local server="$1" name="$2" raw="$3" server_uri mport_param="" hop_range="" stack="v4" pin_param="" cert_fp
+  local server="$1" name="$2" raw="$3" server_uri mport_param="" hop_range="" stack="v4" pin_param="" cert_fp cert_fp_uri
   server_uri=$(format_uri_host "$server")
   [[ "$server" == v6.* || "$server" == *:* ]] && stack="v6"
   hop_range="$(hy2_hop_range_for_stack "$stack")"
@@ -3468,8 +3471,10 @@ add_hy2_link(){
   fi
   cert_fp="$(certificate_sha256_fingerprint 2>/dev/null || true)"
   if [[ -n "$cert_fp" ]]; then
-    # Hysteria2 URI 标准支持 pinSHA256；这里用 leaf 证书 SHA256 指纹做客户端证书 pin。
-    pin_param="&pinSHA256=$(uri_encode "$cert_fp")"
+    # b64 URI 中使用无冒号小写 SHA256，避免部分导入器把 OpenSSL 冒号格式解析失败。
+    cert_fp_uri="${cert_fp//:/}"
+    cert_fp_uri="${cert_fp_uri,,}"
+    pin_param="&pinSHA256=$(uri_encode "$cert_fp_uri")"
   fi
   echo "hysteria2://${HY2_AUTH}@${server_uri}:${HY2_PORT:-443}?sni=${BASE_DOMAIN}&insecure=0&alpn=h3${pin_param}${mport_param}#$(uri_encode "$name")" >> "$raw"
 }
@@ -3547,8 +3552,8 @@ generate_mihomo_reference(){
   local f="$SUB_DIR/mihomo-reference.yaml" cert_fp=""
   cert_fp="$(certificate_sha256_fingerprint 2>/dev/null || true)"
   cat > "$f" <<EOF2
-# 仅供参考：对外订阅仍只发布 base64。
-# 建议使用 Clash Verge Rev / Mihomo 新版内核测试 XHTTP。
+# Mihomo 开发版内核原生 YAML 参考；对外主订阅仍只发布 base64。
+# b64 是主入口；YAML 用来核对 Mihomo 原生字段，尤其 XHTTP 与 HY2 端口跳跃。
 proxies:
 EOF2
   if protocol_enabled 1; then
@@ -4855,6 +4860,7 @@ deployment_healthcheck(){
 install_full(){
   need_root
   install_deps
+  install_self_to_local_bin
   install_or_upgrade_xray
   update_geodata
   prepare_base_domain_for_install
@@ -5531,7 +5537,7 @@ main_menu(){
   load_state
   while true; do
     echo
-    echo "===== Xray Edge Manager v0.0.36-rc22-production-ready ====="
+    echo "===== Xray Edge Manager v0.0.36-rc22-production-ready-p2 ====="
     echo "1. 首次部署向导，推荐"
     echo "2. 安装/升级基础依赖"
     echo "3. 安装/升级 Xray-core"
