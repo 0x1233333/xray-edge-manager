@@ -1,3 +1,253 @@
+#!/usr/bin/env bash
+# Xray Edge Manager / Xray Anti-Block Manager
+# v1.0-patched — 21 bug fixes, REALITY hardening, provider-based targets
+#
+# Features:
+# - Xray-core only, no Docker, no sing-box
+# - Per-stack protocol selection: IPv4 and IPv6 can independently select 0/1/2/3/4/5 or combinations like 123
+# - Domains:
+#   BASE_DOMAIN       = CDN / camouflage site / subscription
+#   v4.BASE_DOMAIN    = IPv4 direct
+#   v6.BASE_DOMAIN    = IPv6 direct
+# - Protocols:
+#   1 = VLESS + XHTTP + REALITY direct
+#   2 = VLESS + XHTTP + TLS + CDN via Nginx
+#   3 = Xray Hysteria2 UDP high-speed backup
+#   4 = VLESS + REALITY + Vision backup direct
+#   5 = VLESS + XHTTP + TLS + CDN extra CDN/BestCF entry using the same CDN inbound
+# - NAT-aware: PUBLIC IP is used for DNS; BIND IP is used for Xray listen.
+# - Public subscription is copied to /var/www, not read from /root by Nginx.
+#
+# No personal domains, emails, IPs, or tokens are embedded in this script.
+
+set -Eeuo pipefail
+
+# Global temp cleanup registry. Any temp file/dir registered here will be
+# removed on normal exit or interruption. Missing paths are ignored.
+declare -a GLOBAL_TEMP_FILES=()
+cleanup_resources(){
+  local tmp
+  for tmp in "${GLOBAL_TEMP_FILES[@]:-}"; do
+    [[ -n "$tmp" && -e "$tmp" ]] && rm -rf -- "$tmp" 2>/dev/null || true
+  done
+}
+trap cleanup_resources EXIT INT TERM HUP QUIT
+
+APP_DIR="/root/.xray-edge-manager"
+STATE_FILE="$APP_DIR/state.env"
+CF_ENV="$APP_DIR/cloudflare.env"
+CF_CRED="$APP_DIR/cloudflare.ini"
+SUB_DIR="$APP_DIR/subscription"
+REMOTES_FILE="$SUB_DIR/remotes.conf"
+BESTCF_DIR="$APP_DIR/bestcf"
+BACKUP_DIR="$APP_DIR/backups"
+DEBUG_DIR="$APP_DIR/debug"
+XRAY_CONFIG="/usr/local/etc/xray/config.json"
+NGINX_SITE="/etc/nginx/conf.d/xray-edge-manager.conf"
+WEB_ROOT="/var/www/xray-edge-manager"
+SYSCTL_FILE="/etc/sysctl.d/99-xray-edge-manager.conf"
+LEGACY_APP_DIR="/root/.xray-anti-block"
+LEGACY_NGINX_SITE="/etc/nginx/conf.d/xray-anti-block.conf"
+LEGACY_WEB_ROOT="/var/www/xray-anti-block"
+FODDER_BASE_URL="https://raw.githubusercontent.com/mack-a/v2ray-agent/master/fodder/blog/unable"
+CERT_DEPLOY_HOOK="/usr/local/etc/xray/xem-cert-hook.sh"
+LOCK_FILE="/run/xray-edge-manager.lock"
+
+CF_HTTPS_PORTS="443 2053 2083 2087 2096 8443"
+DEFAULT_HY2_HOP_RANGE="20000:20100"
+SCRIPT_RAW_URL="https://raw.githubusercontent.com/0x1233333/xray-edge-manager/main/xem.sh"
+XRAY_CORE_RELEASE_API="https://api.github.com/repos/XTLS/Xray-core/releases"
+XRAY_INSTALL_SCRIPT_URL="https://github.com/XTLS/Xray-install/raw/main/install-release.sh"
+BESTCF_RELEASE_API="https://api.github.com/repos/DustinWin/BestCF/releases/tags/bestcf"
+BESTCF_ASSETS="cmcc-ip.txt cucc-ip.txt ctcc-ip.txt bestcf-ip.txt proxy-ip.txt bestcf-domain.txt"
+CURL_CONNECT_TIMEOUT=5
+CURL_MAX_TIME=20
+REMOTE_SUB_MAX_BYTES="${XEM_REMOTE_SUB_MAX_BYTES:-2097152}"
+# Sanitize: must be a positive integer >= 1024, otherwise reset to default.
+[[ "$REMOTE_SUB_MAX_BYTES" =~ ^[0-9]+$ ]] && [[ "$REMOTE_SUB_MAX_BYTES" -ge 1024 ]] || REMOTE_SUB_MAX_BYTES=2097152
+
+mkdir -p "$APP_DIR" "$APP_DIR/tmp" "$SUB_DIR" "$BESTCF_DIR" "$BACKUP_DIR" "$DEBUG_DIR"
+# SECURITY FIX: ensure APP_DIR and its tmp subdir are only accessible by root,
+# even if the parent directory permissions are more permissive.
+chmod 700 "$APP_DIR" "$APP_DIR/tmp" 2>/dev/null || true
+
+log()  { echo -e "\033[32m[OK]\033[0m $*"; }
+info() { echo -e "\033[36m[INFO]\033[0m $*"; }
+warn() { echo -e "\033[33m[WARN]\033[0m $*"; }
+err()  { echo -e "\033[31m[ERR]\033[0m $*"; }
+die()  { err "$*"; exit 1; }
+pause(){ read -r -p "按回车继续..." _ || true; }
+need_root(){ [[ "${EUID:-$(id -u)}" -eq 0 ]] || die "请使用 root 运行。"; }
+
+ensure_dir_or_die(){
+  local dir="$1"
+  [[ -n "$dir" ]] || return 0
+  if [[ -e "$dir" && ! -d "$dir" ]]; then
+    die "运行路径被同名文件占用，拒绝自动删除：$dir"
+  fi
+  mkdir -p "$dir" || die "创建运行目录失败：$dir"
+}
+
+ensure_runtime_dirs(){
+  # Keep runtime directories present even if an earlier failed run, cleanup task,
+  # or manual rm removed APP_DIR/tmp while the script is still being used.
+  local dir
+  for dir in "$APP_DIR" "$APP_DIR/tmp" "$SUB_DIR" "$BESTCF_DIR" "$BACKUP_DIR" "$DEBUG_DIR"; do
+    ensure_dir_or_die "$dir"
+  done
+  chmod 700 "$APP_DIR" "$APP_DIR/tmp" 2>/dev/null || true
+}
+
+
+register_temp_path(){
+  local tmp="$1"
+  [[ -n "$tmp" ]] && GLOBAL_TEMP_FILES+=("$tmp")
+}
+
+mktemp_parent_from_args(){
+  local arg
+  for arg in "$@"; do
+    [[ "$arg" == -* ]] && continue
+    dirname "$arg"
+    return 0
+  done
+  echo ""
+}
+
+mktemp_file(){
+  local tmp parent
+  ensure_runtime_dirs
+  parent="$(mktemp_parent_from_args "$@")"
+  [[ -n "$parent" ]] && ensure_dir_or_die "$parent"
+  tmp="$(mktemp "$@")" || die "创建临时文件失败。"
+  register_temp_path "$tmp"
+  echo "$tmp"
+}
+
+mktemp_dir(){
+  local tmp parent
+  ensure_runtime_dirs
+  parent="$(mktemp_parent_from_args "$@")"
+  [[ -n "$parent" ]] && ensure_dir_or_die "$parent"
+  tmp="$(mktemp -d "$@")" || die "创建临时目录失败。"
+  register_temp_path "$tmp"
+  echo "$tmp"
+}
+
+acquire_lock(){
+  exec 9>"$LOCK_FILE"
+  if ! flock -n 9; then
+    err "检测到另一个 xray-edge-manager 实例正在运行，请稍后再试。"
+    exit 1
+  fi
+}
+
+safe_source_env_file(){
+  local file="$1" line key val n=0
+  [[ -f "$file" ]] || return 0
+
+  # Do not read symlinks. State files contain credentials and are expected to
+  # be regular files under APP_DIR.
+  [[ ! -L "$file" ]] || die "拒绝读取符号链接状态文件：$file"
+  chmod 600 "$file" 2>/dev/null || true
+
+  # SECURITY FIX: do NOT source the file. Instead parse key=value lines and
+  # assign them via declare. This eliminates any possibility of shell injection
+  # through crafted state file values (ANSI-C quoting, $'...' escapes, etc.).
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    n=$((n + 1))
+    [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+    [[ "$line" =~ ^[[:space:]]*# ]] && continue
+    [[ "$line" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] || die "状态文件格式非法：$file:$n"
+    key="${line%%=*}"
+    [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "状态文件键名非法：$file:$n"
+
+    # Extract value: strip the key= prefix
+    val="${line#*=}"
+    # Remove surrounding single quotes if present (from bash %q output)
+    if [[ "$val" =~ ^\$?\'.*\'$ ]]; then
+      # $'...' or '...' quoted value — strip to literal content.
+      # For safety we reject $'...' (ANSI-C) which can encode arbitrary bytes.
+      if [[ "$val" == \$\'* ]]; then
+        die "状态文件包含 ANSI-C 引号，拒绝加载：$file:$n"
+      fi
+      val="${val#\'}"  # remove leading '
+      val="${val%\'}"
+      # remove trailing '
+    fi
+
+    # Final safety check: reject values with shell metacharacters
+    case "$val" in
+      *'$('*|*'`'*|*';'*|*'&'*|*'|'*|*'<'*|*'>'*)
+        die "状态文件包含不安全字符，拒绝加载：$file:$n"
+        ;;
+    esac
+
+    # Safely assign to global scope via declare -g (bash 4.2+)
+    declare -g "$key=$val"
+  done < "$file"
+}
+
+load_state(){
+  safe_source_env_file "$STATE_FILE"
+  safe_source_env_file "$CF_ENV"
+  return 0
+}
+
+save_kv(){
+  local file="$1" key="$2" value="$3" q tmp
+  [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "非法配置键名：$key"
+  mkdir -p "$(dirname "$file")"
+  touch "$file"
+  chmod 600 "$file" 2>/dev/null || true
+  printf -v q '%q' "$value"
+
+  tmp="$(mktemp_file "${file}.tmp.XXXXXX")"
+  # SECURITY FIX: use exact key match to prevent FOO matching FOOBAR=xxx.
+  # Match only lines where key= starts at position 1 AND the next char after
+  # the key name is '=' (not another alphanumeric/underscore).
+  awk -v k="$key" -v v="$q" '
+    BEGIN { found = 0; pat = k "=" }
+    substr($0, 1, length(pat)) == pat {
+      print k "=" v
+      found = 1
+      next
+    }
+    { print }
+    END {
+      if (!found) print k "=" v
+    }
+  ' "$file" > "$tmp" || { rm -f "$tmp"; die "写入临时状态文件失败：$tmp"; }
+  chmod 600 "$tmp" 2>/dev/null || true
+  mv -f "$tmp" "$file"
+}
+
+ask(){
+  local prompt="$1" default="${2:-}" ans msg
+  if [[ -n "$default" ]]; then msg="$prompt [$default]: "; else msg="$prompt: "; fi
+  if [[ -r /dev/tty && -w /dev/tty ]]; then
+    printf '%s' "$msg" > /dev/tty
+    IFS= read -r ans < /dev/tty || true
+  else
+    printf '%s' "$msg" >&2
+    IFS= read -r ans || true
+  fi
+  if [[ -n "$default" ]]; then echo "${ans:-$default}"; else echo "$ans"; fi
+}
+
+confirm(){
+  local prompt="$1" default="${2:-N}" ans
+  ans=$(ask "$prompt" "$default")
+  [[ "$ans" =~ ^[Yy]$ ]]
+}
+
+rand_hex(){ openssl rand -hex "${1:-8}"; }
+rand_token(){ openssl rand -hex 16; }
+rand_path(){ echo "/$(openssl rand -hex 6)/xhttp"; }
+
+# SECURITY FIX: validate that subscription tokens are safe 32-char hex strings,
+# preventing path traversal if the state file is tampered with.
+# If invalid, auto-regenerate instead of dying — better UX for existing installs.
 
 choose_reality_target(){
   load_state
