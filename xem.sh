@@ -2091,8 +2091,8 @@ validate_state_or_regen(){
   fi
 
   if [[ -n "${REALITY_TARGET:-}" ]] && ! validate_hostname "$REALITY_TARGET"; then
-    warn "REALITY_TARGET 非法，已重置为 www.microsoft.com：$REALITY_TARGET"
-    save_kv "$STATE_FILE" REALITY_TARGET "www.microsoft.com"
+    warn "REALITY_TARGET 非法，已重置为 www.ebay.com：$REALITY_TARGET"
+    save_kv "$STATE_FILE" REALITY_TARGET "www.ebay.com"
   fi
   if [[ -n "${XHTTP_REALITY_PATH:-}" ]] && ! valid_safe_xray_path "$XHTTP_REALITY_PATH"; then
     warn "XHTTP_REALITY_PATH 非法，已重新生成。"
