@@ -3356,6 +3356,23 @@ deployment_healthcheck(){
   fi
 }
 
+install_deps(){
+  need_root
+  info "安装/更新系统依赖..."
+  local pkgs=""
+  if command -v apt-get >/dev/null 2>&1; then
+    apt-get update -qq || true
+    pkgs="curl wget unzip tar xz-utils qrencode jq openssl iptables dnsutils net-tools lsof"
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq $pkgs 2>&1 | tail -5 || warn "部分软件包安装失败，请手动检查。"
+  elif command -v yum >/dev/null 2>&1; then
+    pkgs="curl wget unzip tar qrencode jq openssl iptables bind-utils net-tools lsof"
+    yum install -y -q $pkgs 2>&1 | tail -3 || warn "部分软件包安装失败，请手动检查。"
+  else
+    warn "无法识别的包管理器，请手动安装依赖：curl wget unzip tar jq openssl"
+  fi
+  log "系统依赖检查完成。"
+}
+
 install_full(){
   need_root
   install_deps
