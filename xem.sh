@@ -3458,6 +3458,19 @@ select_protocols(){
   log "IPv4=$ipv4_proto IPv6=$ipv6_proto"
 }
 
+validate_hostname(){
+  local h="$1" len="${#1}"
+  [[ "$len" -ge 1 && "$len" -le 253 ]] || return 1
+  [[ "$h" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] || return 1
+  [[ "$h" != *".."* && "$h" != ".-"* && "$h" != "-."* && "$h" != *"." ]] || return 1
+  local p; IFS='.' read -ra p <<< "$h"
+  for part in "${p[@]}"; do
+    [[ "$part" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$ ]] || return 1
+  done
+  return 0
+}
+
+
 prepare_base_domain_for_install(){
   need_root; load_state
   if [[ -z "${BASE_DOMAIN:-}" ]]; then
@@ -4340,3 +4353,8 @@ esac
 need_root
 acquire_lock
 main_menu "$@"
+
+valid_port(){
+  local p="$1"
+  [[ "$p" =~ ^[0-9]+$ && "$p" -ge 1 && "$p" -le 65535 ]]
+}
