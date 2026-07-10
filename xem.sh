@@ -1296,6 +1296,22 @@ inspect_generated_xray_config(){
   [[ ! -s "$report" ]]
 }
 
+detect_public_ips(){
+  local ipv4 ipv6
+  ipv4=$(curl -sS --max-time 5 https://ipapi.co/ip/ 2>/dev/null || curl -sS --max-time 5 https://api.ipify.org 2>/dev/null || true)
+  ipv6=$(curl -sS --max-time 5 https://api6.ipify.org 2>/dev/null || true)
+  if [[ -n "$ipv4" ]]; then
+    save_kv "$STATE_FILE" PUBLIC_IPV4 "$ipv4"
+    [[ -n "${BASE_DOMAIN:-}" ]] && save_kv "$STATE_FILE" DOMAIN_V4 "${BASE_DOMAIN}"
+  fi
+  if [[ -n "$ipv6" ]]; then
+    save_kv "$STATE_FILE" PUBLIC_IPV6 "$ipv6"
+    [[ -n "${BASE_DOMAIN:-}" ]] && save_kv "$STATE_FILE" DOMAIN_V6 "v6.${BASE_DOMAIN}"
+  fi
+  log "公网 IP: IPv4=${ipv4:-无} IPv6=${ipv6:-无}"
+}
+
+
 generate_xray_config(){
   need_root
   load_state
