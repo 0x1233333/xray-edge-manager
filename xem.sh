@@ -44,6 +44,8 @@ trap 'cleanup_and_exit 143' TERM
 
 APP_DIR="/root/.xray-edge-manager"
 STATE_FILE="$APP_DIR/state.env"
+# REALITY_BLACKLIST: domains whose TLS cert chains exceed 8192-byte xray REALITY buffer
+REALITY_BLACKLIST=("www.microsoft.com" "microsoft.com" "login.microsoftonline.com")
 CF_ENV="$APP_DIR/cloudflare.env"
 CF_CRED="$APP_DIR/cloudflare.ini"
 SUB_DIR="$APP_DIR/subscription"
@@ -1866,32 +1868,32 @@ real_target_list_by_region(){
   echo ""
   echo "  已拉黑: ${REALITY_BLACKLIST[*]}"
   echo "  避开: 小厂商域名 / Cloudflare / GFW干扰 / 新闻-视频-IM / Apple-Microsoft / 国内域名"
-  echo ""
-}
-validate_reality_target(){
-  # Hardcoded REALITY buffer limit: 8192 bytes in xray's tls.go.
-  # Domains known to exceed this (8273+ bytes): microsoft.com, login.microsoftonline.com.
-  # These are permanently blacklisted. Verify cert-size for any new target.
-  REALITY_BLACKLIST=(
-    "www.microsoft.com"
-    "microsoft.com"
-    "login.microsoftonline.com"
-  )
-  local target="$1" domain cert_size bytes_in_cert
-  domain="${target%%:*}"
-  # Blacklist check
+  validate_reality_target(){
+    [[ -z "${1:-}" ]] && return 1
+    local lower_target domain bytes_in_cert
+    lower_target=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+  domain="${lower_target%%:*}"
+  # Blacklist check (case-insensitive via lower_target)
+  local lower_bl
   for bl in "${REALITY_BLACKLIST[@]}"; do
-    [[ "$domain" == "$bl" ]] && { warn "REALITY target $domain 在黑名单中（证书链超过 8192 字节 REALITY 缓冲区），请换一个。"; return 1; }
+    lower_bl=$(printf '%s' "$bl" | tr '[:upper:]' '[:lower:]')
+    [[ "$lower_target" == "$lower_bl" ]] && { warn "REALITY target $domain 在黑名单中（证书链超过 8192 字节 REALITY 缓冲区），请换一个。"; return 1; }
   done
-  # Cert-size check
+  # Cert-size check (full chain, fail-closed)
   if command -v openssl >/dev/null 2>&1; then
-    # fetch full cert chain and count bytes in the 0d0a-encoded PEM between BEGIN/END CERTIFICATE
-    bytes_in_cert=$(echo | timeout 8 openssl s_client -connect "${domain}:443" -servername "$domain" 2>/dev/null \
+    bytes_in_cert=$(echo | timeout 8 openssl s_client -connect "${domain}:443" -servername "$domain" -showcerts 2>/dev/null \
       | sed -n "/BEGIN CERTIFICATE/,/END CERTIFICATE/p" | wc -c 2>/dev/null || true)
-    if [[ -n "$bytes_in_cert" && "$bytes_in_cert" -gt 7800 ]]; then
+    if [[ -z "$bytes_in_cert" || "$bytes_in_cert" -eq 0 ]]; then
+      warn "无法探测 $domain 证书大小（端口不可达或探测失败），请选择其他目标。"
+      return 1
+    fi
+    if [[ "$bytes_in_cert" -gt 7800 ]]; then
       warn "REALITY target $domain 证书链约 ${bytes_in_cert} 字节，接近 8192 字节上限，风险高。"
       return 1
     fi
+  else
+    warn "openssl 未安装，无法验证 $domain 证书大小，请手动确认后重试。"
+    return 1
   fi
   return 0
 }
