@@ -3486,42 +3486,121 @@ configure_node_name(){
   log "节点名称: $NODE_NAME"
 }
 
+build_default_protocols_from_stack_strategy(){
+  load_state
+  local p=""
+  [[ "${IPV4_PROTOCOLS:-0}" == *1* || "${IPV6_PROTOCOLS:-0}" == *1* ]] && p="${p}1"
+  [[ "${IPV4_PROTOCOLS:-0}" == *2* || "${IPV6_PROTOCOLS:-0}" == *2* ]] && p="${p}2"
+  [[ "${IPV4_PROTOCOLS:-0}" == *3* || "${IPV6_PROTOCOLS:-0}" == *3* ]] && p="${p}3"
+  [[ "${IPV4_PROTOCOLS:-0}" == *4* || "${IPV6_PROTOCOLS:-0}" == *4* ]] && p="${p}4"
+  [[ "${IPV4_PROTOCOLS:-0}" == *5* || "${IPV6_PROTOCOLS:-0}" == *5* ]] && p="${p}5"
+  [[ -z "$p" ]] && p="0"
+  echo "$p"
+}
+select_ip_stack_strategy(){
+  load_state
+  local ip4 ip6 v4_protos v6_protos default_p
+  detect_public_ips
+  ip4="${PUBLIC_IPV4:-}"
+  ip6="${PUBLIC_IPV6:-}"
+
+  echo
+  echo "===== IPv4 / IPv6 独立协议组合 ====="
+  echo "IPv4 和 IPv6 各自输入协议组合，例如 IPv4=123，IPv6=13。"
+  echo "0=不生成该栈节点；1=XHTTP+REALITY直连；2=XHTTP+TLS+CDN；3=Hysteria2 UDP；4=REALITY+Vision；5=CDN/BestCF入口扩展。"
+  echo "直接按回车会使用方括号里的默认/当前值。"
+
+  if [[ -n "$ip4" ]]; then
+    v4_protos=$(select_one_stack_protocols "IPv4" "${IPV4_PROTOCOLS:-}" "123")
+    save_kv "$STATE_FILE" IPV4_PROTOCOLS "$v4_protos"
+  else
+    save_kv "$STATE_FILE" IPV4_PROTOCOLS "0"
+    warn "未检测到 IPv4，IPv4 协议组合设为 0。"
+  fi
+  if [[ -n "$ip6" ]]; then
+    v6_protos=$(select_one_stack_protocols "IPv6" "${IPV6_PROTOCOLS:-}" "123")
+    save_kv "$STATE_FILE" IPV6_PROTOCOLS "$v6_protos"
+  else
+    save_kv "$STATE_FILE" IPV6_PROTOCOLS "0"
+    warn "未检测到 IPv6，IPv6 协议组合设为 0。"
+  fi
+  default_p=$(build_default_protocols_from_stack_strategy)
+  save_kv "$STATE_FILE" PROTOCOLS "$default_p"
+  if [[ "$default_p" == *2* || "$default_p" == *5* ]]; then save_kv "$STATE_FILE" ENABLE_CDN "1"; else save_kv "$STATE_FILE" ENABLE_CDN "0"; fi
+  log "协议策略已保存：IPv4=${v4_protos:-0} IPv6=${v6_protos:-0} 实际需要=${default_p}"
+}
 select_protocols(){
   load_state
-  local ipv4_proto="${IPV4_PROTOCOLS:-123}" ipv6_proto="${IPV6_PROTOCOLS:-0}" bestcf_yn="${BESTCF_ENABLED:-0}"
+  local p port
+  p=$(build_default_protocols_from_stack_strategy)
+  save_kv "$STATE_FILE" PROTOCOLS "$p"
   echo ""
-  echo "========== 协议选择说明 =========="
-  echo "1=REALITY    — 伪装目标站点，防探测"
-  echo "2=CDN/TLS    — 通过 Cloudflare CDN 转发"
-  echo "3=Hysteria2  — UDP 协议，弱网优化"
-  echo "组合示例: 123=全部启用, 12=REALITY+CDN, 13=REALITY+HY2"
+  echo "========== 协议组合说明 =========="
+  echo "1=XHTTP+REALITY直连  2=XHTTP+TLS+CDN(自己域名)"
+  echo "3=Hysteria2 UDP       4=REALITY+Vision"
+  echo "5=BestCF优选CDN(优选域名/IP,不占自己域名)"
+  echo ""
+  echo "组合示例: 123=全部三协议, 125=REALITY+CDN+BestCF"
+  echo "         15=只有REALITY和BestCF, 23=只有CDN+HY2"
+  echo "当前 IPv4 组合: ${IPV4_PROTOCOLS:-123}  IPv6: ${IPV6_PROTOCOLS:-0}"
   echo "================================="
   echo ""
-  ipv4_proto=$(ask "IPv4 协议组合" "$ipv4_proto")
 
-  echo ""
-  echo "IPv6 协议: 1/2/3 与 IPv4 相同含义, 0=不启用 IPv6"
-  ipv6_proto=$(ask "IPv6 协议组合（0=关闭IPv6）" "$ipv6_proto")
-
-  # 如果选了 CDN(2), 询问 BestCF 优选
-  if echo "$ipv4_proto$ipv6_proto" | grep -q "2"; then
-    echo ""
-    echo "CDN 已选择。CDN 支持两种模式："
-    echo "  普通 CDN — 通过 Cloudflare 代理转发（需开启小云朵）"
-    echo "  BestCF   — 优选 CDN IP，延迟更低（需额外部署 BestCF 定时任务）"
-    echo ""
-    bestcf_yn=$(ask "是否启用 BestCF 优选 CDN? [y/N]" "$([[ "$bestcf_yn" == "1" ]] && echo "y" || echo "N")")
-    case "$bestcf_yn" in
-      [Yy]*) bestcf_yn=1; save_kv "$STATE_FILE" BESTCF_ENABLED "1"; log "BestCF 已启用。";;
-      *) bestcf_yn=0; save_kv "$STATE_FILE" BESTCF_ENABLED "0";;
-    esac
+  if [[ "$p" == *2* || "$p" == *5* ]]; then
+    save_kv "$STATE_FILE" ENABLE_CDN "1"
+    port=$(ask "CDN/订阅/伪装站 HTTPS 端口 (443/2053/2083/2087/2096/8443)" "${CDN_PORT:-443}")
+    valid_port "$port" || die "端口无效。"
+    is_cf_https_port "$port" || die "端口必须是 Cloudflare 可代理端口。"
+    save_kv "$STATE_FILE" CDN_PORT "$port"
+    CDN_PORT="$port"
+  else
+    save_kv "$STATE_FILE" ENABLE_CDN "0"
+    port=$(ask "订阅/伪装站 HTTPS 端口 (直连用)" "${CDN_PORT:-443}")
+    valid_port "$port" || die "端口无效。"
+    is_cf_https_port "$port" || die "订阅端口必须是 Cloudflare 可代理端口。"
+    save_kv "$STATE_FILE" CDN_PORT "$port"
+    CDN_PORT="$port"
   fi
 
-  save_kv "$STATE_FILE" IPV4_PROTOCOLS "$ipv4_proto"
-  save_kv "$STATE_FILE" IPV6_PROTOCOLS "$ipv6_proto"
-  log "协议: IPv4=$ipv4_proto IPv6=$ipv6_proto BestCF=${bestcf_yn}"
+  # 协议 5 = BestCF 优选 CDN
+  if [[ "$p" == *5* ]]; then
+    if [[ "${BESTCF_ENABLED:-0}" != "1" ]]; then
+      save_kv "$STATE_FILE" BESTCF_ENABLED "1"
+      save_kv "$STATE_FILE" BESTCF_MODE "domain"
+      save_kv "$STATE_FILE" BESTCF_PER_CATEGORY_LIMIT "1"
+      save_kv "$STATE_FILE" BESTCF_TOTAL_LIMIT "1"
+      log "BestCF 已自动开启：生成 1 个优选域名节点。"
+    fi
+  fi
+
+  if [[ "$p" == *1* ]]; then
+    port=$(ask "XHTTP+REALITY 直连 TCP 端口 (推荐 2443,不能等于 ${CDN_PORT:-443})" "${XHTTP_REALITY_PORT:-2443}")
+    valid_port "$port" || die "端口无效。"
+    [[ "$port" != "${CDN_PORT:-443}" ]] || die "端口 ${CDN_PORT:-443} 需留给 Nginx 订阅。"
+    save_kv "$STATE_FILE" XHTTP_REALITY_PORT "$port"
+  fi
+
+  if [[ "$p" == *4* ]]; then
+    port=$(ask "REALITY+Vision 直连 TCP 端口 (推荐 3443)" "${REALITY_VISION_PORT:-3443}")
+    valid_port "$port" || die "端口无效。"
+    [[ "$port" != "${CDN_PORT:-443}" ]] || die "端口 ${CDN_PORT:-443} 需留给 Nginx 订阅。"
+    save_kv "$STATE_FILE" REALITY_VISION_PORT "$port"
+  fi
+
+  if [[ "$p" == *3* ]]; then
+    port=$(ask "Hysteria2 UDP 监听端口 (推荐 443,可与 Nginx TCP 443 共存)" "${HY2_PORT:-443}")
+    valid_port "$port" || die "端口无效。"
+    save_kv "$STATE_FILE" HY2_PORT "$port"
+  fi
+
+  log "协议组合: $p (CDN端口=${CDN_PORT:-443}, BestCF=${BESTCF_ENABLED:-0})"
 }
 
+is_cf_https_port(){
+  local p="$1" x
+  for x in $CF_HTTPS_PORTS; do [[ "$p" == "$x" ]] && return 0; done
+  return 1
+}
 validate_hostname(){
   local h="$1" len="${#1}"
   [[ "$len" -ge 1 && "$len" -le 253 ]] || return 1
@@ -4431,10 +4510,7 @@ valid_port(){
   local p="$1"
   [[ "$p" =~ ^[0-9]+$ && "$p" -ge 1 && "$p" -le 65535 ]]
 }
-
-select_ip_stack_strategy(){
-  load_state
-  local ipv4="${IPV4_ENABLED:-1}" ipv6="${IPV6_ENABLED:-0}"
+..." ipv6="${IPV6_ENABLED:-0}"
   if [[ -z "${IPV4_ENABLED:-}" ]]; then
     ipv4=$(ask "是否启用 IPv4? [Y/n]" "Y")
     [[ "$ipv4" =~ ^[Nn] ]] && ipv4=0 || ipv4=1
