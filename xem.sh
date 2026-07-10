@@ -3488,15 +3488,38 @@ configure_node_name(){
 
 select_protocols(){
   load_state
-  local ipv4_proto="${IPV4_PROTOCOLS:-123}" ipv6_proto="${IPV6_PROTOCOLS:-0}"
-  echo "请选择 IPv4 协议组合："
-  echo "1=REALITY 2=CDN/TLS 3=Hysteria2 | 例: 123=全部, 12=REALITY+CDN"
+  local ipv4_proto="${IPV4_PROTOCOLS:-123}" ipv6_proto="${IPV6_PROTOCOLS:-0}" bestcf_yn="${BESTCF_ENABLED:-0}"
+  echo ""
+  echo "========== 协议选择说明 =========="
+  echo "1=REALITY    — 伪装目标站点，防探测"
+  echo "2=CDN/TLS    — 通过 Cloudflare CDN 转发"
+  echo "3=Hysteria2  — UDP 协议，弱网优化"
+  echo "组合示例: 123=全部启用, 12=REALITY+CDN, 13=REALITY+HY2"
+  echo "================================="
+  echo ""
   ipv4_proto=$(ask "IPv4 协议组合" "$ipv4_proto")
-  echo "请选择 IPv6 协议组合（0=关闭 IPv6）"
-  ipv6_proto=$(ask "IPv6 协议组合" "$ipv6_proto")
+
+  echo ""
+  echo "IPv6 协议: 1/2/3 与 IPv4 相同含义, 0=不启用 IPv6"
+  ipv6_proto=$(ask "IPv6 协议组合（0=关闭IPv6）" "$ipv6_proto")
+
+  # 如果选了 CDN(2), 询问 BestCF 优选
+  if echo "$ipv4_proto$ipv6_proto" | grep -q "2"; then
+    echo ""
+    echo "CDN 已选择。CDN 支持两种模式："
+    echo "  普通 CDN — 通过 Cloudflare 代理转发（需开启小云朵）"
+    echo "  BestCF   — 优选 CDN IP，延迟更低（需额外部署 BestCF 定时任务）"
+    echo ""
+    bestcf_yn=$(ask "是否启用 BestCF 优选 CDN? [y/N]" "$([[ "$bestcf_yn" == "1" ]] && echo "y" || echo "N")")
+    case "$bestcf_yn" in
+      [Yy]*) bestcf_yn=1; save_kv "$STATE_FILE" BESTCF_ENABLED "1"; log "BestCF 已启用。";;
+      *) bestcf_yn=0; save_kv "$STATE_FILE" BESTCF_ENABLED "0";;
+    esac
+  fi
+
   save_kv "$STATE_FILE" IPV4_PROTOCOLS "$ipv4_proto"
   save_kv "$STATE_FILE" IPV6_PROTOCOLS "$ipv6_proto"
-  log "IPv4=$ipv4_proto IPv6=$ipv6_proto"
+  log "协议: IPv4=$ipv4_proto IPv6=$ipv6_proto BestCF=${bestcf_yn}"
 }
 
 validate_hostname(){
