@@ -3486,6 +3486,21 @@ configure_node_name(){
   log "节点名称: $NODE_NAME"
 }
 
+select_one_stack_protocols(){
+  local label="$1" current="$2" default_mode="$3" mode normalized
+  echo >&2
+  echo "===== ${label} 协议组合选择 =====" >&2
+  echo "0. 不生成 ${label} 节点" >&2
+  echo "1. ${label} VLESS + XHTTP + REALITY，直连，默认主力" >&2
+  echo "2. ${label} VLESS + XHTTP + TLS + CDN，CDN 隐藏，使用母域名" >&2
+  echo "3. ${label} Xray Hysteria2，UDP 高速备用，实验" >&2
+  echo "4. ${label} VLESS + REALITY + Vision，可选直连备用" >&2
+  echo "5. ${label} VLESS + XHTTP + TLS + CDN 入口扩展，复用 CDN 入站，可配合 BestCF/优选域名/域名前置" >&2
+  echo "可以输入组合，例如 123、13、23、1234；直接回车 = 使用方括号里的默认/当前值。" >&2
+  mode=$(ask "请选择 ${label} 协议组合（0/1/2/3/4/5 或组合）" "${current:-$default_mode}")
+  normalized=$(normalize_stack_protocols "$mode")
+  echo "$normalized"
+}
 build_default_protocols_from_stack_strategy(){
   load_state
   local p=""
@@ -4547,12 +4562,20 @@ create_dns_records(){
     local content=""
     if echo "$name" | grep -q "^v4"; then content="$ipv4"; else content="$ipv4"; fi
     [[ -z "$content" ]] && { warn "跳过 $name: 无 IP"; continue; }
-    curl -fsS -X POST "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/dns_records"       -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json"       -d "{"type":"A","name":"$name","content":"$content","proxied":$proxied}" >/dev/null 2>&1 &&       log "DNS A $name → $content (proxy=$proxied)" || warn "DNS $name 创建失败。"
+    local json; json=$(cat <<EOF
+{"type":"A","name":"$name","content":"$content","proxied":$proxied}
+EOF
+)
+    curl -fsS -X POST "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/dns_records"       -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json"       -d "$json" >/dev/null 2>&1       && log "DNS A $name -> $content (proxy=$proxied)"       || warn "DNS $name 创建失败。"
   done
 
   if [[ -n "$ipv6" ]]; then
     local v6name="${DOMAIN_V6:-v6.$base}"
-    curl -fsS -X POST "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/dns_records"       -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json"       -d "{"type":"AAAA","name":"$v6name","content":"$ipv6","proxied":false}" >/dev/null 2>&1 &&       log "DNS AAAA $v6name → $ipv6" || warn "DNS AAAA $v6name 创建失败。"
+    local json6; json6=$(cat <<EOF
+{"type":"AAAA","name":"$v6name","content":"$ipv6","proxied":false}
+EOF
+)
+    curl -fsS -X POST "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/dns_records"       -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json"       -d "$json6" >/dev/null 2>&1       && log "DNS AAAA $v6name -> $ipv6"       || warn "DNS AAAA $v6name 创建失败。"
   fi
 }
 
