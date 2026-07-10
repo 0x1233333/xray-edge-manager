@@ -219,7 +219,7 @@ allowed_state_key(){
     V4_XHTTP_REALITY_READY|V6_XHTTP_REALITY_READY|V4_HY2_READY|V6_HY2_READY|V4_VISION_READY|V6_VISION_READY|CDN_XHTTP_READY)
       return 0
       ;;
-    DOMAIN_V4|DOMAIN_V6|IPV4_ENABLED|IPV6_ENABLED|LAST_SUBSCRIPTION_REGEN|LAST_PUBLIC_IP_DETECT)
+    DOMAIN_V4|DOMAIN_V6|IPV4_ENABLED|IPV6_ENABLED|CF_ZONE_NAME|CDN_NETWORK|HY2_SNI|WEB_ROOT|LAST_SUBSCRIPTION_NODE_COUNT|LAST_SUBSCRIPTION_REGEN|LAST_PUBLIC_IP_DETECT)
       return 0
       ;;
     CF_API_TOKEN|CF_ZONE_NAME|CF_ZONE_ID)
@@ -1138,6 +1138,24 @@ setup_cloudflare(){
   load_state
   configure_base_domain
   local token zone_name resp ok zone_id
+
+  # 如果已保存有效凭证 — 直接从文件读取,不依赖 load_state 的内存状态
+  local saved_token saved_zone saved_zone_id
+  saved_token=$(grep -s '^CF_API_TOKEN=' "$STATE_FILE" | cut -d= -f2- | tr -d '[:space:]' || true)
+  saved_zone=$(grep -s '^CF_ZONE_NAME=' "$STATE_FILE" | cut -d= -f2- | tr -d '[:space:]' || true)
+  saved_zone_id=$(grep -s '^CF_ZONE_ID=' "$STATE_FILE" | cut -d= -f2- | tr -d '[:space:]' || true)
+  if [[ -n "$saved_token" && -n "$saved_zone" && -n "$saved_zone_id" ]]; then
+    resp=$(curl -fsS --connect-timeout 5 --max-time 15 \
+      -H "Authorization: Bearer $saved_token" \
+      -G "https://api.cloudflare.com/client/v4/zones" --data-urlencode "name=$saved_zone") || { warn "CF 验证请求失败"; }
+    ok=$(echo "$resp" | jq -r '.success // empty' 2>/dev/null || true)
+    if [[ "$ok" == "true" ]]; then
+      log "Cloudflare 配置有效：zone=$saved_zone"
+      return 0
+    fi
+    warn "已保存凭证失效，重新配置"
+  fi
+
   echo "Cloudflare API Token 创建教程："
   echo "  https://github.com/0x1233333/xray-edge-manager/blob/main/examples/cloudflare-api-token.md"
   echo "请使用 Restricted API Token，不要使用 Global API Key。"
@@ -1291,6 +1309,11 @@ build_default_protocols_from_stack_strategy(){
 select_ip_stack_strategy(){
   load_state
   local ip4 ip6 v4_protos v6_protos default_p
+  # Non-interactive: skip if protocols already set
+  if [[ -n "${IPV4_PROTOCOLS:-}" && -n "${IPV6_PROTOCOLS:-}" ]]; then
+    info "使用已保存的协议组合: IPv4=${IPV4_PROTOCOLS} IPv6=${IPV6_PROTOCOLS}"
+    return 0
+  fi
   detect_public_ips
   ip4="${PUBLIC_IPV4:-}"
   ip6="${PUBLIC_IPV6:-}"
@@ -1326,6 +1349,11 @@ protocol_enabled(){ [[ "${PROTOCOLS:-0}" == *"$1"* ]]; }
 select_protocols(){
   load_state
   local p port
+  # Non-interactive: skip if PROTOCOLS + ports already set
+  if [[ -n "${PROTOCOLS:-}" && "${PROTOCOLS}" != "0" && -n "${CDN_PORT:-}" ]]; then
+    info "使用已保存的协议配置: PROTOCOLS=${PROTOCOLS} CDN_PORT=${CDN_PORT}"
+    return 0
+  fi
   p=$(build_default_protocols_from_stack_strategy)
   save_kv "$STATE_FILE" PROTOCOLS "$p"
   echo "===== 已根据 v4/v6 选择自动生成协议组合 ====="
