@@ -4412,3 +4412,80 @@ valid_port(){
   local p="$1"
   [[ "$p" =~ ^[0-9]+$ && "$p" -ge 1 && "$p" -le 65535 ]]
 }
+
+select_ip_stack_strategy(){
+  load_state
+  local ipv4="${IPV4_ENABLED:-1}" ipv6="${IPV6_ENABLED:-0}"
+  if [[ -z "${IPV4_ENABLED:-}" ]]; then
+    ipv4=$(ask "是否启用 IPv4? [Y/n]" "Y")
+    [[ "$ipv4" =~ ^[Nn] ]] && ipv4=0 || ipv4=1
+  fi
+  if [[ -z "${IPV6_ENABLED:-}" ]]; then
+    ipv6=$(ask "是否启用 IPv6? [Y/n]" "$([[ "$ipv6" == "1" ]] && echo Y || echo n)")
+    [[ "$ipv6" =~ ^[Yy] ]] && ipv6=1 || ipv6=0
+  fi
+  save_kv "$STATE_FILE" IPV4_ENABLED "$ipv4"
+  save_kv "$STATE_FILE" IPV6_ENABLED "$ipv6"
+  log "IP 栈策略: IPv4=$([[ $ipv4 == 1 ]] && echo ON || echo OFF) IPv6=$([[ $ipv6 == 1 ]] && echo ON || echo OFF)"
+}
+
+assert_deploy_stack_ready(){
+  load_state
+  local missing=""
+  [[ -n "${BASE_DOMAIN:-}" ]] || missing+=" BASE_DOMAIN"
+  [[ -n "${CF_API_TOKEN:-}" ]] || missing+=" CF_API_TOKEN"
+  [[ -n "${CF_ZONE_ID:-}" ]] || missing+=" CF_ZONE_ID"
+  [[ -n "${NODE_NAME:-}" ]] || missing+=" NODE_NAME"
+  [[ -n "${IPV4_PROTOCOLS:-}" || -n "${IPV6_PROTOCOLS:-}" ]] || missing+=" PROTOCOLS"
+  [[ -z "$missing" ]] || die "缺少必要配置:$missing，请先完成前期配置步骤。"
+  log "部署就绪检查通过。"
+}
+
+create_dns_records(){
+  need_root; load_state
+  [[ -n "${CF_API_TOKEN:-}" && -n "${CF_ZONE_ID:-}" ]] || die "请先配置 Cloudflare。"
+  local base="${BASE_DOMAIN:-}" ipv4="${PUBLIC_IPV4:-}" ipv6="${PUBLIC_IPV6:-}"
+  [[ -n "$base" ]] || base="${DOMAIN_V4:-}"
+
+  for record in "$base:proxy:true" "v4.$base:proxy:false"; do
+    local name="${record%%:*}" rest="${record#*:}" proxied="${rest#*:}"
+    local content=""
+    if echo "$name" | grep -q "^v4"; then content="$ipv4"; else content="$ipv4"; fi
+    [[ -z "$content" ]] && { warn "跳过 $name: 无 IP"; continue; }
+    curl -fsS -X POST "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/dns_records"       -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json"       -d "{"type":"A","name":"$name","content":"$content","proxied":$proxied}" >/dev/null 2>&1 &&       log "DNS A $name → $content (proxy=$proxied)" || warn "DNS $name 创建失败。"
+  done
+
+  if [[ -n "$ipv6" ]]; then
+    local v6name="${DOMAIN_V6:-v6.$base}"
+    curl -fsS -X POST "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/dns_records"       -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json"       -d "{"type":"AAAA","name":"$v6name","content":"$ipv6","proxied":false}" >/dev/null 2>&1 &&       log "DNS AAAA $v6name → $ipv6" || warn "DNS AAAA $v6name 创建失败。"
+  fi
+}
+
+issue_certificate(){
+  need_root; load_state
+  local base="${BASE_DOMAIN:-}" email="${CERT_EMAIL:-admin@${base:-example.com}}"
+  [[ -n "$base" ]] || die "未设置母域名。"
+  if ! command -v certbot >/dev/null 2>&1; then
+    info "安装 certbot..."
+    if command -v apt-get >/dev/null 2>&1; then
+      apt-get install -y certbot python3-certbot-dns-cloudflare 2>&1 | tail -3
+    elif command -v yum >/dev/null 2>&1; then
+      yum install -y certbot python3-certbot-dns-cloudflare 2>&1 | tail -3
+    fi
+  fi
+  local cf_ini="/root/.cloudflare/cloudflare.ini"
+  mkdir -p "$(dirname "$cf_ini")" && chmod 700 "$(dirname "$cf_ini")"
+  echo "dns_cloudflare_api_token = $CF_API_TOKEN" > "$cf_ini"
+  chmod 600 "$cf_ini"
+
+  certbot certonly --dns-cloudflare --dns-cloudflare-credentials "$cf_ini"     -d "$base" -d "*.$base" --non-interactive --agree-tos -m "$email" 2>&1 | tail -5 || {
+    warn "证书申请失败，请手动运行：certbot certonly --dns-cloudflare ..."
+    return 1
+  }
+  local cert_dir="/etc/letsencrypt/live/$base"
+  local xray_cert_dir="/usr/local/etc/xray/certs/$base"
+  mkdir -p "$xray_cert_dir"
+  install -m 644 "$cert_dir/fullchain.pem" "$xray_cert_dir/"
+  install -m 644 "$cert_dir/privkey.pem" "$xray_cert_dir/"
+  log "SSL 证书已签发: $base + *.$base"
+}
