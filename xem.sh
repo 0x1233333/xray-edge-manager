@@ -3435,16 +3435,41 @@ setup_cloudflare(){
     if echo "$verify" | grep -q '"success":true'; then log "Cloudflare 配置有效。"; else die "CF API Token 验证失败。"; fi
   else
     if [[ -z "${CF_API_TOKEN:-}" ]]; then
-      CF_API_TOKEN=$(ask "请输入 Cloudflare API Token" "")
+      CF_API_TOKEN=$(ask "请输入 Cloudflare API Token (Zone:DNS:Edit 权限)" "")
       save_kv "$STATE_FILE" CF_API_TOKEN "$CF_API_TOKEN"
     fi
     if [[ -z "${CF_ZONE_ID:-}" ]]; then
       local zone=""
       while [[ -z "$zone" ]]; do
-        local domain; domain=$(ask "请输入域名 (如 example.com)" "")
+        local suggest="" domain
+        # 从 BASE_DOMAIN 自动提取根域名(如 jparm.0x0000.top → 0x0000.top)
+        if [[ -n "${BASE_DOMAIN:-}" ]]; then
+          local parts; IFS='.' read -ra parts <<< "$BASE_DOMAIN"
+          if [[ "${#parts[@]}" -ge 2 ]]; then
+            suggest="${parts[-2]}.${parts[-1]}"
+          fi
+        fi
+        echo ""
+        echo "========== Cloudflare 域名说明 =========="
+        echo "这里需要填 Cloudflare 上的 DNS zone 名称(根域名),不是刚才的母域名。"
+        echo "母域名: ${BASE_DOMAIN:-未设置}"
+        echo "根域名: ${suggest:-请填写}"
+        echo "示例: 如果母域名是 jparm.0x0000.top,根域名就是 0x0000.top"
+        echo "============================================="
+        echo ""
+        domain=$(ask "请输入 Cloudflare 根域名(zone)" "${suggest:-}")
         zone=$(curl -fsS -H "Authorization: Bearer $CF_API_TOKEN" "https://api.cloudflare.com/client/v4/zones?name=$domain" 2>&1)
         CF_ZONE_ID=$(echo "$zone" | jq -r '.result[0].id // empty' 2>/dev/null)
-        if [[ -z "$CF_ZONE_ID" ]]; then warn "未找到域名 $domain 的 zone。"; else save_kv "$STATE_FILE" CF_ZONE_ID "$CF_ZONE_ID"; fi
+        if [[ -z "$CF_ZONE_ID" ]]; then
+          warn "未找到域名 $domain 的 zone。"
+          echo "请检查:"
+          echo "  1. 域名 $domain 是否已添加到 Cloudflare (NS 指向 CF)"
+          echo "  2. API Token 是否有该 zone 的 Zone:DNS:Edit 权限"
+          echo "  3. 如果母域名是 $BASE_DOMAIN,根域名应该是 ${suggest:-xx},不是 $BASE_DOMAIN"
+        else
+          save_kv "$STATE_FILE" CF_ZONE_ID "$CF_ZONE_ID"
+          log "已找到 zone: $domain (ID: ${CF_ZONE_ID:0:12}...)"
+        fi
       done
     fi
     log "Cloudflare 配置完成。"
@@ -3491,9 +3516,22 @@ prepare_base_domain_for_install(){
   need_root; load_state
   if [[ -z "${BASE_DOMAIN:-}" ]]; then
     local domain
-    domain=$(ask "请输入母域名 (如 vps.example.com)" "")
+    echo ""
+    echo "========== 母域名说明 =========="
+    echo "母域名(BASE_DOMAIN)是节点的主域名,脚本会自动派生子域名:"
+    echo "  BASE_DOMAIN         → 订阅/CDN入口 (你填的域名)"
+    echo "  v4.BASE_DOMAIN      → IPv4 直连入口"
+    echo "  v6.BASE_DOMAIN      → IPv6 直连入口"
+    echo "示例: 如果你有域名叫 example.com 托管在 Cloudflare,"
+    echo "      母域名可以填 node.example.com 或 jparm.0x0000.top"
+    echo "      要求: 该域名(或母域名)必须在 Cloudflare 有 DNS zone。"
+    echo "============================================"
+    echo ""
+    domain=$(ask "请输入母域名 (如 jparm.0x0000.top)" "")
+
     while ! validate_hostname "$domain"; do
-      warn "域名格式不正确。"; domain=$(ask "请重新输入" "")
+      warn "母域名格式不正确，请输入完整域名(如 jparm.0x0000.top)。"
+      domain=$(ask "请重新输入母域名" "")
     done
     save_kv "$STATE_FILE" BASE_DOMAIN "$domain"
     BASE_DOMAIN="$domain"
