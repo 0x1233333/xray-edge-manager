@@ -219,9 +219,6 @@ allowed_state_key(){
     V4_XHTTP_REALITY_READY|V6_XHTTP_REALITY_READY|V4_HY2_READY|V6_HY2_READY|V4_VISION_READY|V6_VISION_READY|CDN_XHTTP_READY)
       return 0
       ;;
-    DOMAIN_V4|DOMAIN_V6|IPV4_ENABLED|IPV6_ENABLED|LAST_SUBSCRIPTION_REGEN|LAST_PUBLIC_IP_DETECT)
-      return 0
-      ;;
     CF_API_TOKEN|CF_ZONE_NAME|CF_ZONE_ID)
       return 0
       ;;
@@ -1819,84 +1816,62 @@ ensure_certificate_for_nginx(){
   fi
   sync_xray_certificate
 }
+
 real_target_list_by_region(){
-  # Only recommend large global companies. Small provider domains (vultr, linode,
-  # hetzner, ovh, digitalocean, ibm) are NOT used — they draw DPI attention.
-  # Oracle/AWS machines → their own domains (perfect camouflage).
-  # All other providers → generic large-company list.
-  # No Apple, Microsoft, Cloudflare, news, video, IM, GFW-blocked, Chinese domains.
-  local region="${1:-AS}" _org="${2:-}"
-
-  case "$_org" in
-    *Oracle*|*OCI*)
-      echo "  🟠 Oracle Cloud → 推荐 Oracle 系"
-      echo "     1. www.oracle.com       (4.3KB)"
-      echo "     2. cloud.oracle.com     (5.2KB)"
-      echo "     3. docs.oracle.com      (2.1KB)"
-      echo "     4. developer.oracle.com (2.6KB)"
-      ;;
-    *Amazon*|*AWS*)
-      echo "  🟡 AWS → 推荐 Amazon 系"
-      echo "     1. www.amazon.com       (2.6KB)"
-      echo "     2. aws.amazon.com       (2.2KB)"
-      echo "     3. docs.aws.amazon.com  (2.0KB)"
-      ;;
-    *)
-      echo "  🌏 通用推荐（全球大公司，国内可直连，非敏感）"
-      echo "     1. www.ebay.com         (3.1KB，全球拍卖)"
-      echo "     2. www.oracle.com       (4.3KB，Oracle Cloud)"
-      echo "     3. www.amazon.com       (2.6KB，全球电商)"
-      echo "     4. www.adobe.com        (1.9KB，Adobe)"
-      echo "     5. www.salesforce.com   (1.9KB，企业 CRM)"
-      echo "     6. www.visa.com         (1.5KB，支付网络)"
-      echo "     7. www.stanford.edu     (1.3KB，斯坦福)"
-      echo "     8. www.mit.edu          (3.0KB，MIT)"
-      ;;
-  esac
-
-  # Region supplements
+  local region="${1:-AS}" org="${2:-}" target_info=""
+  echo ""
+  echo "=== 推荐的 REALITY 伪装目标 ==="
+  echo "检测到: 区域=${region} 提供商=${org:-未知}"
+  echo ""
   case "$region" in
     JP|Japan*)
-      echo ""
-      echo "  区域补充（日本）: yahoo.co.jp(5.1KB) / amazon.co.jp(2.3KB) / rakuten(5.6KB) / mercari(2.2KB)"
+      echo "  🇯🇵 日本推荐: yahoo.co.jp / amazon.co.jp / rakuten / mercari / hatena / cloudflare / oracle"
       ;;
     KR|Korea*)
-      echo ""
-      echo "  区域补充（韩国）: naver(4.0KB) / kakao(2.2KB) / samsung(4.0KB)"
+      echo "  🇰🇷 韩国推荐: naver / kakao / coupang / samsung / daum / cloudflare / ebay"
+      ;;
+    HK|Hong*)
+      echo "  🇭🇰 香港推荐: cloudflare / ebay / oracle / adobe / amazon / baidu"
+      ;;
+    CN)
+      echo "  🇨🇳 中国推荐: baidu / cloudflare / ebay / oracle / adobe"
+      ;;
+    US|United*)
+      echo "  🇺🇸 美国推荐: cloudflare / ebay / oracle / amazon / adobe / salesforce / visa / stanford"
+      ;;
+    *)
+      echo "  🌏 通用推荐: ebay / oracle / amazon / adobe / salesforce / visa / stanford / MIT"
       ;;
   esac
   echo ""
   echo "  已拉黑: ${REALITY_BLACKLIST[*]}"
   echo "  避开: 小厂商域名 / Cloudflare / GFW干扰 / 新闻-视频-IM / Apple-Microsoft / 国内域名"
-  validate_reality_target(){
-    [[ -z "${1:-}" ]] && return 1
-    local lower_target domain bytes_in_cert
-    lower_target=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+  echo ""
+}
+
+validate_reality_target(){
+  [[ -z "${1:-}" ]] && return 1
+  local lower_target domain bytes_in_cert lower_bl
+  lower_target=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
   domain="${lower_target%%:*}"
-  # Blacklist check (case-insensitive via lower_target)
-  local lower_bl
   for bl in "${REALITY_BLACKLIST[@]}"; do
     lower_bl=$(printf '%s' "$bl" | tr '[:upper:]' '[:lower:]')
-    [[ "$lower_target" == "$lower_bl" ]] && { warn "REALITY target $domain 在黑名单中（证书链超过 8192 字节 REALITY 缓冲区），请换一个。"; return 1; }
+    [[ "$lower_target" == "$lower_bl" ]] && { warn "$domain 在黑名单中(证书 >8192)", return 1; }
   done
-  # Cert-size check (full chain, fail-closed)
   if command -v openssl >/dev/null 2>&1; then
-    bytes_in_cert=$(echo | timeout 8 openssl s_client -connect "${domain}:443" -servername "$domain" -showcerts 2>/dev/null \
-      | sed -n "/BEGIN CERTIFICATE/,/END CERTIFICATE/p" | wc -c 2>/dev/null || true)
+    bytes_in_cert=$(echo | timeout 8 openssl s_client -connect "${domain}:443" -servername "$domain" -showcerts 2>/dev/null       | sed -n "/BEGIN CERTIFICATE/,/END CERTIFICATE/p" | wc -c 2>/dev/null || true)
     if [[ -z "$bytes_in_cert" || "$bytes_in_cert" -eq 0 ]]; then
-      warn "无法探测 $domain 证书大小（端口不可达或探测失败），请选择其他目标。"
-      return 1
+      warn "无法探测 $domain 证书大小(端口不可达)，请换一个目标。"; return 1
     fi
     if [[ "$bytes_in_cert" -gt 7800 ]]; then
-      warn "REALITY target $domain 证书链约 ${bytes_in_cert} 字节，接近 8192 字节上限，风险高。"
-      return 1
+      warn "$domain 证书链 ${bytes_in_cert} 字节，接近8192上限。"; return 1
     fi
   else
-    warn "openssl 未安装，无法验证 $domain 证书大小，请手动确认后重试。"
-    return 1
+    warn "openssl 未安装，无法验证证书大小。"; return 1
   fi
   return 0
 }
+
 choose_reality_target(){
   load_state
   local c target _asn_country="" _asn_org=""
@@ -1908,34 +1883,34 @@ choose_reality_target(){
     _asn_org=$(curl -sS --max-time 5 https://ipapi.co/org/ 2>/dev/null || true)
   fi
   real_target_list_by_region "${_asn_country:-AS}" "${_asn_org:-}"
-  echo "快速选择:"
+  echo "============================================================"
+  echo ""
+  echo "快捷选择:"
   echo " 1. www.ebay.com           (全球拍卖，国内可访问，证书 3.1KB)"
-  echo " 2. www.adobe.com          (Adobe 全家桶，证书 1.9KB)"
-  echo " 3. www.salesforce.com     (企业 CRM，证书 1.9KB)"
+  echo " 2. www.oracle.com         (Oracle Cloud，证书 4.3KB)"
+  echo " 3. www.amazon.com         (全球电商，证书 2.6KB)"
   echo " 4. 手动输入（自动验证证书大小+黑名单）"
-  c=$(ask "请选择" "1")
+  c=$(ask "请选择 REALITY 伪装目标 [1-4]" "1")
   case "$c" in
     1) target="www.ebay.com" ;;
-    2) target="www.adobe.com" ;;
-    3) target="www.salesforce.com" ;;
-    *) target=$(ask "请输入 REALITY target 域名" "${REALITY_TARGET:-www.ebay.com}") ;;
+    2) target="www.oracle.com" ;;
+    3) target="www.amazon.com" ;;
+    *) target=$(ask "请输入 REALITY target 域名" "${REALITY_TARGET:-www.ebay.com}")
+       while ! validate_hostname "${target%%:*}"; do
+         warn "域名格式不正确。"; target=$(ask "请重新输入" "www.ebay.com")
+       done ;;
   esac
-  target=$(printf '%s' "$target" | tr -d '[:space:]')
-  while ! validate_hostname "$target"; do
-    warn "REALITY target 域名格式不合格：$target"
-    target=$(ask "请重新输入 REALITY target 域名" "www.ebay.com")
-    target=$(printf '%s' "$target" | tr -d '[:space:]')
-  done
   if ! validate_reality_target "$target"; then
-    local _force=$(ask "证书过大或域名被拉黑，是否仍要使用 $target？可能无法连接 [y/N]" "N")
-    if [[ ! "$_force" =~ ^[Yy]$ ]]; then
-      warn "已取消。"; return 1
-    fi
-    warn "已强制使用 $target。"
+    warn "$target 未通过验证（黑名单或证书过大），请重新选择。"
+    target=$(ask "请重新输入 REALITY target 域名" "www.ebay.com")
+    while ! validate_hostname "${target%%:*}" || ! validate_reality_target "$target"; do
+      warn "域名不正确或未通过验证。"; target=$(ask "请重新输入" "www.ebay.com")
+    done
   fi
   save_kv "$STATE_FILE" REALITY_TARGET "$target"
-  log "REALITY target: $target"
+  log "REALITY 伪装目标已设置为 $target"
 }
+
 
 validate_x25519_key(){
   local k="$1"
