@@ -4404,10 +4404,6 @@ case "${1:-}" in
     ;;
 esac
 
-need_root
-acquire_lock
-main_menu "$@"
-
 valid_port(){
   local p="$1"
   [[ "$p" =~ ^[0-9]+$ && "$p" -ge 1 && "$p" -le 65535 ]]
@@ -4489,3 +4485,8 @@ issue_certificate(){
   install -m 644 "$cert_dir/privkey.pem" "$xray_cert_dir/"
   log "SSL 证书已签发: $base + *.$base"
 }
+
+need_root
+acquire_lock
+main_menu "$@"
+
