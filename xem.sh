@@ -16,7 +16,7 @@
 #   4 = VLESS + REALITY + Vision backup direct
 #   5 = VLESS + XHTTP + TLS + CDN extra CDN/BestCF entry using the same CDN inbound
 # - NAT-aware: PUBLIC IP is used for DNS; BIND IP is used for Xray listen.
-# - Public subscription is copied to /var/www, not read from /root by Nginx.
+# - Public subscription is copied to /usr/local/etc/xray/www, not read from /root by Nginx.
 #
 # No personal domains, emails, IPs, or tokens are embedded in this script.
 
@@ -65,7 +65,7 @@ XRAY_USER="xray"
 XRAY_GROUP="xray"
 XRAY_CERT_DIR="/usr/local/etc/xray/certs"
 NGINX_SITE="/etc/nginx/conf.d/xray-edge-manager.conf"
-WEB_ROOT="/var/www/xray-edge-manager"
+WEB_ROOT="/usr/local/etc/xray/www"
 SYSCTL_FILE="/etc/sysctl.d/99-xray-edge-manager.conf"
 LEGACY_APP_DIR="/root/.xray-anti-block"
 LEGACY_NGINX_SITE="/etc/nginx/conf.d/xray-anti-block.conf"
@@ -604,8 +604,7 @@ ensure_web_subscription_permissions(){
   # RC10 HARDENING: umask 077 is correct for secrets, but web path parents
   # must remain searchable by the Nginx worker. If /var/www is first created
   # by this script, explicitly normalize it to the standard web permission.
-  mkdir -p /var/www "$WEB_ROOT" "$WEB_ROOT/sub"
-  chmod 755 /var/www 2>/dev/null || true
+  mkdir -p "$WEB_ROOT" "$WEB_ROOT/sub"
   chmod 755 "$WEB_ROOT" 2>/dev/null || true
 
   # Keep subscription files non-world-readable. Nginx can read them via group.
@@ -3525,7 +3524,7 @@ EOF2
       cat >> "$f" <<EOF2
   - name: ${NODE_NAME:-node}-v4-XHTTP-REALITY
     type: vless
-    server: v4.${BASE_DOMAIN}
+    server: ${PUBLIC_IPV4}
     port: ${XHTTP_REALITY_PORT}
     uuid: ${UUID}
     udp: true
@@ -3548,7 +3547,7 @@ EOF2
       cat >> "$f" <<EOF2
   - name: ${NODE_NAME:-node}-v6-XHTTP-REALITY
     type: vless
-    server: v6.${BASE_DOMAIN}
+    server: ${PUBLIC_IPV6}
     port: ${XHTTP_REALITY_PORT}
     uuid: ${UUID}
     udp: true
@@ -3618,7 +3617,7 @@ EOF2
       cat >> "$f" <<EOF2
   - name: ${NODE_NAME:-node}-v4-HY2-UDP${HY2_PORT:-443}
     type: hysteria2
-    server: v4.${BASE_DOMAIN}
+    server: ${PUBLIC_IPV4}
     port: ${HY2_PORT:-443}
     password: ${HY2_AUTH}
     sni: ${BASE_DOMAIN}
@@ -3637,7 +3636,7 @@ EOF2
       cat >> "$f" <<EOF2
   - name: ${NODE_NAME:-node}-v6-HY2-UDP${HY2_PORT:-443}
     type: hysteria2
-    server: v6.${BASE_DOMAIN}
+    server: ${PUBLIC_IPV6}
     port: ${HY2_PORT:-443}
     password: ${HY2_AUTH}
     sni: ${BASE_DOMAIN}
@@ -3650,6 +3649,47 @@ EOF2
       [[ -n "$hop_range_v6" ]] && cat >> "$f" <<EOF2
     ports: ${hop_range_v6/:/-}
     hop-interval: 30
+EOF2
+    fi
+  fi
+
+  if protocol_enabled 4; then
+    if [[ -n "${PUBLIC_IPV4:-}" && "${IPV4_PROTOCOLS:-0}" == *4* ]] && node_ready V4_VISION_READY; then
+      cat >> "$f" <<EOF2
+  - name: ${NODE_NAME:-node}-v4-REALITY-Vision
+    type: vless
+    server: ${PUBLIC_IPV4}
+    port: ${REALITY_VISION_PORT}
+    uuid: ${UUID}
+    udp: true
+    tls: true
+    servername: ${REALITY_TARGET}
+    client-fingerprint: chrome
+    encryption: ""
+    network: tcp
+    flow: xtls-rprx-vision
+    reality-opts:
+      public-key: ${REALITY_PUBLIC_KEY}
+      short-id: ${SHORT_ID}
+EOF2
+    fi
+    if [[ -n "${PUBLIC_IPV6:-}" && "${IPV6_PROTOCOLS:-0}" == *4* ]] && node_ready V6_VISION_READY; then
+      cat >> "$f" <<EOF2
+  - name: ${NODE_NAME:-node}-v6-REALITY-Vision
+    type: vless
+    server: ${PUBLIC_IPV6}
+    port: ${REALITY_VISION_PORT}
+    uuid: ${UUID}
+    udp: true
+    tls: true
+    servername: ${REALITY_TARGET}
+    client-fingerprint: chrome
+    encryption: ""
+    network: tcp
+    flow: xtls-rprx-vision
+    reality-opts:
+      public-key: ${REALITY_PUBLIC_KEY}
+      short-id: ${SHORT_ID}
 EOF2
     fi
   fi
@@ -3691,8 +3731,8 @@ generate_subscription(){
   : > "$raw"
 
   if protocol_enabled 1; then
-    [[ -n "${PUBLIC_IPV4:-}" && "${IPV4_PROTOCOLS:-0}" == *1* ]] && node_ready V4_XHTTP_REALITY_READY && add_vless_xhttp_reality_link "v4.${BASE_DOMAIN}" "${NODE_NAME:-node}-v4-XHTTP-REALITY" "$raw"
-    [[ -n "${PUBLIC_IPV6:-}" && "${IPV6_PROTOCOLS:-0}" == *1* ]] && node_ready V6_XHTTP_REALITY_READY && add_vless_xhttp_reality_link "v6.${BASE_DOMAIN}" "${NODE_NAME:-node}-v6-XHTTP-REALITY" "$raw"
+    [[ -n "${PUBLIC_IPV4:-}" && "${IPV4_PROTOCOLS:-0}" == *1* ]] && node_ready V4_XHTTP_REALITY_READY && add_vless_xhttp_reality_link "${PUBLIC_IPV4}" "${NODE_NAME:-node}-v4-XHTTP-REALITY" "$raw"
+    [[ -n "${PUBLIC_IPV6:-}" && "${IPV6_PROTOCOLS:-0}" == *1* ]] && node_ready V6_XHTTP_REALITY_READY && add_vless_xhttp_reality_link "${PUBLIC_IPV6}" "${NODE_NAME:-node}-v6-XHTTP-REALITY" "$raw"
   fi
 
   if protocol_enabled 2 && node_ready CDN_XHTTP_READY; then
@@ -3714,13 +3754,13 @@ generate_subscription(){
   fi
 
   if protocol_enabled 3; then
-    [[ -n "${PUBLIC_IPV4:-}" && "${IPV4_PROTOCOLS:-0}" == *3* ]] && node_ready V4_HY2_READY && add_hy2_link "v4.${BASE_DOMAIN}" "${NODE_NAME:-node}-v4-HY2-UDP${HY2_PORT:-443}" "$raw"
-    [[ -n "${PUBLIC_IPV6:-}" && "${IPV6_PROTOCOLS:-0}" == *3* ]] && node_ready V6_HY2_READY && add_hy2_link "v6.${BASE_DOMAIN}" "${NODE_NAME:-node}-v6-HY2-UDP${HY2_PORT:-443}" "$raw"
+    [[ -n "${PUBLIC_IPV4:-}" && "${IPV4_PROTOCOLS:-0}" == *3* ]] && node_ready V4_HY2_READY && add_hy2_link "${PUBLIC_IPV4}" "${NODE_NAME:-node}-v4-HY2-UDP${HY2_PORT:-443}" "$raw"
+    [[ -n "${PUBLIC_IPV6:-}" && "${IPV6_PROTOCOLS:-0}" == *3* ]] && node_ready V6_HY2_READY && add_hy2_link "${PUBLIC_IPV6}" "${NODE_NAME:-node}-v6-HY2-UDP${HY2_PORT:-443}" "$raw"
   fi
 
   if protocol_enabled 4; then
-    [[ -n "${PUBLIC_IPV4:-}" && "${IPV4_PROTOCOLS:-0}" == *4* ]] && node_ready V4_VISION_READY && add_reality_vision_link "v4.${BASE_DOMAIN}" "${NODE_NAME:-node}-v4-REALITY-Vision" "$raw"
-    [[ -n "${PUBLIC_IPV6:-}" && "${IPV6_PROTOCOLS:-0}" == *4* ]] && node_ready V6_VISION_READY && add_reality_vision_link "v6.${BASE_DOMAIN}" "${NODE_NAME:-node}-v6-REALITY-Vision" "$raw"
+    [[ -n "${PUBLIC_IPV4:-}" && "${IPV4_PROTOCOLS:-0}" == *4* ]] && node_ready V4_VISION_READY && add_reality_vision_link "${PUBLIC_IPV4}" "${NODE_NAME:-node}-v4-REALITY-Vision" "$raw"
+    [[ -n "${PUBLIC_IPV6:-}" && "${IPV6_PROTOCOLS:-0}" == *4* ]] && node_ready V6_VISION_READY && add_reality_vision_link "${PUBLIC_IPV6}" "${NODE_NAME:-node}-v6-REALITY-Vision" "$raw"
   fi
 
   # COMPATIBILITY FIX: avoid GNU-specific sed -i and base64 -w0.
@@ -4046,7 +4086,7 @@ configure_cf_origin_firewall_prompt(){
 
 handle_firewall_ports(){
   load_state
-  local tcp_ports=() udp_ports=()
+  local tcp_ports=(80) udp_ports=()
   tcp_ports+=("${CDN_PORT:-443}")
   [[ "${PROTOCOLS:-0}" == *1* ]] && tcp_ports+=("${XHTTP_REALITY_PORT:-2443}")
   [[ "${PROTOCOLS:-0}" == *4* ]] && tcp_ports+=("${REALITY_VISION_PORT:-3443}")
