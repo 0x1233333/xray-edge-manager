@@ -3373,6 +3373,106 @@ install_deps(){
   log "系统依赖检查完成。"
 }
 
+install_or_upgrade_xray(){
+  local mode="${XEM_XRAY_INSTALL_MODE:-}" arch
+  arch=$(uname -m)
+  case "$arch" in aarch64|arm64) arch="arm64" ;; x86_64|amd64) arch="64" ;; *) arch="64" ;; esac
+  if [[ -z "$mode" ]]; then
+    echo "请选择安装方式："; echo "1. 官方脚本（推荐）"; echo "2. 直接下载"
+    mode=$(ask "请选择" "1")
+  fi
+  case "$mode" in
+    1|release)
+      bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install 2>&1 | tail -5 || die "Xray 安装失败。"
+      ;;
+    2|direct)
+      local ver=$(curl -fsSL https://api.github.com/repos/XTLS/Xray-core/releases/latest | grep '"tag_name"' | cut -d'"' -f4 || echo "v26.6.27")
+      ver="${ver#v}"
+      local tmp_dir=$(mktemp_dir "$APP_DIR/tmp/xray-install.XXXXXX")
+      cd "$tmp_dir"
+      curl -fsSL -o xray.zip "https://github.com/XTLS/Xray-core/releases/download/v${ver}/Xray-linux-${arch}-v8a.zip" 2>&1 | tail -3 || die "下载失败。"
+      unzip -oq xray.zip
+      install -m 755 xray /usr/local/bin/xray
+      install -m 644 geoip.dat /usr/local/share/xray/ 2>/dev/null || true
+      install -m 644 geosite.dat /usr/local/share/xray/ 2>/dev/null || true
+      cd / && rm -rf "$tmp_dir"
+      ;;
+  esac
+  command -v xray >/dev/null 2>&1 && log "Xray $(xray version|head -1) 安装成功。" || die "Xray 安装失败。"
+}
+
+update_geodata(){
+  info "更新 geoip.dat / geosite.dat..."
+  local geo_dir="/usr/local/share/xray"
+  mkdir -p "$geo_dir"
+  curl -fsSL -o "$geo_dir/geoip.dat" "https://github.com/v2fly/geoip/releases/latest/download/geoip.dat" 2>&1 | tail -1 || warn "geoip.dat 下载失败。"
+  curl -fsSL -o "$geo_dir/geosite.dat" "https://github.com/v2fly/domain-list-community/releases/latest/download/dlc.dat" 2>&1 | tail -1 || warn "geosite.dat 下载失败。"
+  [[ -f "$geo_dir/geosite.dat" ]] && mv -f "$geo_dir/geosite.dat" "$geo_dir/geosite.dat" 2>/dev/null || true
+  log "geoip.dat / geosite.dat 更新完成。"
+}
+
+setup_cloudflare(){
+  need_root; load_state
+  if [[ -n "${CF_API_TOKEN:-}" && -n "${CF_ZONE_ID:-}" ]]; then
+    local verify
+    verify=$(curl -fsS -H "Authorization: Bearer $CF_API_TOKEN" "https://api.cloudflare.com/client/v4/user/tokens/verify" 2>&1)
+    if echo "$verify" | grep -q '"success":true'; then log "Cloudflare 配置有效。"; else die "CF API Token 验证失败。"; fi
+  else
+    if [[ -z "${CF_API_TOKEN:-}" ]]; then
+      CF_API_TOKEN=$(ask "请输入 Cloudflare API Token" "")
+      save_kv "$STATE_FILE" CF_API_TOKEN "$CF_API_TOKEN"
+    fi
+    if [[ -z "${CF_ZONE_ID:-}" ]]; then
+      local zone=""
+      while [[ -z "$zone" ]]; do
+        local domain; domain=$(ask "请输入域名 (如 example.com)" "")
+        zone=$(curl -fsS -H "Authorization: Bearer $CF_API_TOKEN" "https://api.cloudflare.com/client/v4/zones?name=$domain" 2>&1)
+        CF_ZONE_ID=$(echo "$zone" | jq -r '.result[0].id // empty' 2>/dev/null)
+        if [[ -z "$CF_ZONE_ID" ]]; then warn "未找到域名 $domain 的 zone。"; else save_kv "$STATE_FILE" CF_ZONE_ID "$CF_ZONE_ID"; fi
+      done
+    fi
+    log "Cloudflare 配置完成。"
+  fi
+}
+
+configure_node_name(){
+  load_state
+  if [[ -z "${NODE_NAME:-}" ]]; then
+    local default="${BASE_DOMAIN%%.*}"
+    NODE_NAME=$(ask "节点名称" "$default")
+    save_kv "$STATE_FILE" NODE_NAME "$NODE_NAME"
+  fi
+  log "节点名称: $NODE_NAME"
+}
+
+select_protocols(){
+  load_state
+  local ipv4_proto="${IPV4_PROTOCOLS:-123}" ipv6_proto="${IPV6_PROTOCOLS:-0}"
+  echo "请选择 IPv4 协议组合："
+  echo "1=REALITY 2=CDN/TLS 3=Hysteria2 | 例: 123=全部, 12=REALITY+CDN"
+  ipv4_proto=$(ask "IPv4 协议组合" "$ipv4_proto")
+  echo "请选择 IPv6 协议组合（0=关闭 IPv6）"
+  ipv6_proto=$(ask "IPv6 协议组合" "$ipv6_proto")
+  save_kv "$STATE_FILE" IPV4_PROTOCOLS "$ipv4_proto"
+  save_kv "$STATE_FILE" IPV6_PROTOCOLS "$ipv6_proto"
+  log "IPv4=$ipv4_proto IPv6=$ipv6_proto"
+}
+
+prepare_base_domain_for_install(){
+  need_root; load_state
+  if [[ -z "${BASE_DOMAIN:-}" ]]; then
+    local domain
+    domain=$(ask "请输入母域名 (如 vps.example.com)" "")
+    while ! validate_hostname "$domain"; do
+      warn "域名格式不正确。"; domain=$(ask "请重新输入" "")
+    done
+    save_kv "$STATE_FILE" BASE_DOMAIN "$domain"
+    BASE_DOMAIN="$domain"
+    load_state
+  fi
+  log "BASE_DOMAIN=$BASE_DOMAIN"
+}
+
 install_full(){
   need_root
   install_deps
