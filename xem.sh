@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # Xray Edge Manager / Xray Anti-Block Manager
-# v1.0-patched — 21 bug fixes, REALITY hardening, provider-based targets
+# v0.0.36-rc22-production-ready — strict BASE/v4/v6 DNS role model, cert reuse, GitHub Raw safe run, WARP auto generation, production preflight/postflight
 #
 # Features:
 # - Xray-core only, no Docker, no sing-box
 # - Per-stack protocol selection: IPv4 and IPv6 can independently select 0/1/2/3/4/5 or combinations like 123
-# - Domains:
-#   BASE_DOMAIN       = CDN / camouflage site / subscription
-#   v4.BASE_DOMAIN    = IPv4 direct
-#   v6.BASE_DOMAIN    = IPv6 direct
+# - Domain role model:
+#   BASE_DOMAIN       = public subscription URL + camouflage site + CDN transit entry only
+#   v4.BASE_DOMAIN    = IPv4 direct nodes only; managed DNS type: A only
+#   v6.BASE_DOMAIN    = IPv6 direct nodes only; managed DNS type: AAAA only
 # - Protocols:
 #   1 = VLESS + XHTTP + REALITY direct
 #   2 = VLESS + XHTTP + TLS + CDN via Nginx
@@ -21,17 +21,26 @@
 # No personal domains, emails, IPs, or tokens are embedded in this script.
 
 set -Eeuo pipefail
+umask 077
 
 # Global temp cleanup registry. Any temp file/dir registered here will be
 # removed on normal exit or interruption. Missing paths are ignored.
 declare -a GLOBAL_TEMP_FILES=()
+declare -a NGINX_DEFAULT_BACKUPS=()
 cleanup_resources(){
   local tmp
   for tmp in "${GLOBAL_TEMP_FILES[@]:-}"; do
     [[ -n "$tmp" && -e "$tmp" ]] && rm -rf -- "$tmp" 2>/dev/null || true
   done
 }
-trap cleanup_resources EXIT INT TERM HUP QUIT
+cleanup_and_exit(){
+  local code="$1"
+  cleanup_resources
+  exit "$code"
+}
+trap cleanup_resources EXIT
+trap 'cleanup_and_exit 130' INT HUP QUIT
+trap 'cleanup_and_exit 143' TERM
 
 APP_DIR="/root/.xray-edge-manager"
 STATE_FILE="$APP_DIR/state.env"
@@ -39,10 +48,20 @@ CF_ENV="$APP_DIR/cloudflare.env"
 CF_CRED="$APP_DIR/cloudflare.ini"
 SUB_DIR="$APP_DIR/subscription"
 REMOTES_FILE="$SUB_DIR/remotes.conf"
+WARP_OUTBOUND_FILE_DEFAULT="$APP_DIR/warp-outbound.json"
+WARP_DIR="$APP_DIR/warp"
+WARP_REG_BIN="$WARP_DIR/warp-reg"
+WARP_REG_CONFIG="$WARP_DIR/config"
+WARP_REG_RELEASE_BASE="https://github.com/badafans/warp-reg/releases/download/v1.0"
+WARP_ENDPOINT_IPV4_DEFAULT="${XEM_WARP_ENDPOINT_IPV4:-162.159.192.1:2408}"
+WARP_ENDPOINT_IPV6_DEFAULT="${XEM_WARP_ENDPOINT_IPV6:-[2606:4700:d0::a29f:c001]:2408}"
 BESTCF_DIR="$APP_DIR/bestcf"
 BACKUP_DIR="$APP_DIR/backups"
 DEBUG_DIR="$APP_DIR/debug"
 XRAY_CONFIG="/usr/local/etc/xray/config.json"
+XRAY_USER="xray"
+XRAY_GROUP="xray"
+XRAY_CERT_DIR="/usr/local/etc/xray/certs"
 NGINX_SITE="/etc/nginx/conf.d/xray-edge-manager.conf"
 WEB_ROOT="/var/www/xray-edge-manager"
 SYSCTL_FILE="/etc/sysctl.d/99-xray-edge-manager.conf"
@@ -54,8 +73,14 @@ CERT_DEPLOY_HOOK="/usr/local/etc/xray/xem-cert-hook.sh"
 LOCK_FILE="/run/xray-edge-manager.lock"
 
 CF_HTTPS_PORTS="443 2053 2083 2087 2096 8443"
+CF_IPS_V4_URL="https://www.cloudflare.com/ips-v4"
+CF_IPS_V6_URL="https://www.cloudflare.com/ips-v6"
+CF_ORIGIN_CHAIN="XEM_CF_ORIGIN"
 DEFAULT_HY2_HOP_RANGE="20000:20100"
-SCRIPT_RAW_URL="https://raw.githubusercontent.com/0x1233333/xray-edge-manager/main/xem.sh"
+# When this script is run through bash <(curl ...), it cannot safely copy
+# itself from /dev/fd. Use this URL for later self-install/timer jobs.
+# Override with XEM_SCRIPT_RAW_URL when testing a branch, fork, or tagged release.
+SCRIPT_RAW_URL="${XEM_SCRIPT_RAW_URL:-https://raw.githubusercontent.com/0x1233333/xray-edge-manager/main/xem.sh}"
 XRAY_CORE_RELEASE_API="https://api.github.com/repos/XTLS/Xray-core/releases"
 XRAY_INSTALL_SCRIPT_URL="https://github.com/XTLS/Xray-install/raw/main/install-release.sh"
 BESTCF_RELEASE_API="https://api.github.com/repos/DustinWin/BestCF/releases/tags/bestcf"
@@ -65,19 +90,40 @@ CURL_MAX_TIME=20
 REMOTE_SUB_MAX_BYTES="${XEM_REMOTE_SUB_MAX_BYTES:-2097152}"
 # Sanitize: must be a positive integer >= 1024, otherwise reset to default.
 [[ "$REMOTE_SUB_MAX_BYTES" =~ ^[0-9]+$ ]] && [[ "$REMOTE_SUB_MAX_BYTES" -ge 1024 ]] || REMOTE_SUB_MAX_BYTES=2097152
+SUB_TOKEN_HEX_BYTES="${XEM_SUB_TOKEN_HEX_BYTES:-32}"
+# New installs use 64 hex chars by default. Existing 32-char tokens remain valid.
+[[ "$SUB_TOKEN_HEX_BYTES" =~ ^[0-9]+$ ]] && [[ "$SUB_TOKEN_HEX_BYTES" -ge 16 ]] && [[ "$SUB_TOKEN_HEX_BYTES" -le 64 ]] || SUB_TOKEN_HEX_BYTES=32
 
-mkdir -p "$APP_DIR" "$APP_DIR/tmp" "$SUB_DIR" "$BESTCF_DIR" "$BACKUP_DIR" "$DEBUG_DIR"
+# Must check root before touching /root. Otherwise a normal user sees a raw
+# mkdir/chmod permission failure instead of the intended diagnostic.
+if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+  echo -e "\033[31m[ERR]\033[0m 请使用 root 运行。" >&2
+  exit 1
+fi
+
+mkdir -p "$APP_DIR" "$APP_DIR/tmp" "$SUB_DIR" "$WARP_DIR" "$BESTCF_DIR" "$BACKUP_DIR" "$DEBUG_DIR"
 # SECURITY FIX: ensure APP_DIR and its tmp subdir are only accessible by root,
 # even if the parent directory permissions are more permissive.
-chmod 700 "$APP_DIR" "$APP_DIR/tmp" 2>/dev/null || true
+chmod 700 "$APP_DIR" "$APP_DIR/tmp" "$WARP_DIR" 2>/dev/null || true
 
-log()  { echo -e "\033[32m[OK]\033[0m $*"; }
-info() { echo -e "\033[36m[INFO]\033[0m $*"; }
-warn() { echo -e "\033[33m[WARN]\033[0m $*"; }
-err()  { echo -e "\033[31m[ERR]\033[0m $*"; }
+log()  { echo -e "\033[32m[OK]\033[0m $*" >&2; }
+info() { echo -e "\033[36m[INFO]\033[0m $*" >&2; }
+warn() { echo -e "\033[33m[WARN]\033[0m $*" >&2; }
+err()  { echo -e "\033[31m[ERR]\033[0m $*" >&2; }
 die()  { err "$*"; exit 1; }
 pause(){ read -r -p "按回车继续..." _ || true; }
 need_root(){ [[ "${EUID:-$(id -u)}" -eq 0 ]] || die "请使用 root 运行。"; }
+
+require_cmds(){
+  local c missing=0
+  for c in "$@"; do
+    if ! command -v "$c" >/dev/null 2>&1; then
+      err "缺少依赖：$c"
+      missing=1
+    fi
+  done
+  [[ "$missing" -eq 0 ]] || die "请先执行菜单 2 安装基础依赖，或手动安装上述命令。"
+}
 
 ensure_dir_or_die(){
   local dir="$1"
@@ -92,10 +138,10 @@ ensure_runtime_dirs(){
   # Keep runtime directories present even if an earlier failed run, cleanup task,
   # or manual rm removed APP_DIR/tmp while the script is still being used.
   local dir
-  for dir in "$APP_DIR" "$APP_DIR/tmp" "$SUB_DIR" "$BESTCF_DIR" "$BACKUP_DIR" "$DEBUG_DIR"; do
+  for dir in "$APP_DIR" "$APP_DIR/tmp" "$SUB_DIR" "$WARP_DIR" "$BESTCF_DIR" "$BACKUP_DIR" "$DEBUG_DIR"; do
     ensure_dir_or_die "$dir"
   done
-  chmod 700 "$APP_DIR" "$APP_DIR/tmp" 2>/dev/null || true
+  chmod 700 "$APP_DIR" "$APP_DIR/tmp" "$WARP_DIR" 2>/dev/null || true
 }
 
 
@@ -142,6 +188,44 @@ acquire_lock(){
   fi
 }
 
+allowed_state_key(){
+  case "$1" in
+    BASE_DOMAIN|NODE_NAME|PUBLIC_IPV4|PUBLIC_IPV6|BIND_IPV4|BIND_IPV6)
+      return 0
+      ;;
+    IPV4_PROTOCOLS|IPV6_PROTOCOLS|PROTOCOLS|ENABLE_CDN|CDN_PORT)
+      return 0
+      ;;
+    XHTTP_REALITY_PORT|REALITY_VISION_PORT|HY2_PORT|XHTTP_CDN_LOCAL_PORT)
+      return 0
+      ;;
+    UUID|REALITY_PRIVATE_KEY|REALITY_PUBLIC_KEY|SHORT_ID|XHTTP_REALITY_PATH|XHTTP_CDN_PATH|HY2_AUTH)
+      return 0
+      ;;
+    SUB_TOKEN|MERGED_SUB_TOKEN|CERT_EMAIL|REALITY_TARGET|ENABLE_IP_STACK_BINDING|IP_OUTBOUND_MODE|WARP_OUTBOUND_FILE)
+      return 0
+      ;;
+    BESTCF_ENABLED|BESTCF_MODE|BESTCF_PER_CATEGORY_LIMIT|BESTCF_TOTAL_LIMIT)
+      return 0
+      ;;
+    HY2_HOP_RANGE|HY2_HOP_TO_PORT|HY2_HOP_RANGE_V4|HY2_HOP_RANGE_V6|HY2_HOP_TO_PORT_V4|HY2_HOP_TO_PORT_V6|HY2_HOP_V4_READY|HY2_HOP_V6_READY|ENABLE_CF_ORIGIN_FIREWALL)
+      return 0
+      ;;
+    LAST_XRAY_BACKUP|LAST_NGINX_BACKUP|LAST_SYSCTL_BACKUP)
+      return 0
+      ;;
+    V4_XHTTP_REALITY_READY|V6_XHTTP_REALITY_READY|V4_HY2_READY|V6_HY2_READY|V4_VISION_READY|V6_VISION_READY|CDN_XHTTP_READY)
+      return 0
+      ;;
+    CF_API_TOKEN|CF_ZONE_NAME|CF_ZONE_ID)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
 safe_source_env_file(){
   local file="$1" line key val n=0
   [[ -f "$file" ]] || return 0
@@ -183,6 +267,11 @@ safe_source_env_file(){
         ;;
     esac
 
+    if ! allowed_state_key "$key"; then
+      warn "状态文件包含未知键，已忽略：$file:$n key=$key"
+      continue
+    fi
+
     # Safely assign to global scope via declare -g (bash 4.2+)
     declare -g "$key=$val"
   done < "$file"
@@ -195,29 +284,35 @@ load_state(){
 }
 
 save_kv(){
-  local file="$1" key="$2" value="$3" q tmp
+  local file="$1" key="$2" value="$3" tmp
   [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "非法配置键名：$key"
+
+  # SECURITY/HARDENING: state.env is parsed by our strict loader, not sourced.
+  # Keep values single-line and free of control characters / shell metacharacters.
+  # This also prevents accidental capture of colored warn/info output into state
+  # values from corrupting state.env as ANSI-C quoted multi-line strings.
+  if printf '%s' "$value" | LC_ALL=C grep -q '[[:cntrl:]]'; then
+    die "配置值包含控制字符，拒绝写入状态文件：$key"
+  fi
+  case "$value" in
+    *'$('|*'`'*|*';'*|*'&'*|*'|'*|*'<'*|*'>'*)
+      die "配置值包含不安全字符，拒绝写入状态文件：$key"
+      ;;
+  esac
+
   mkdir -p "$(dirname "$file")"
   touch "$file"
   chmod 600 "$file" 2>/dev/null || true
-  printf -v q '%q' "$value"
 
   tmp="$(mktemp_file "${file}.tmp.XXXXXX")"
-  # SECURITY FIX: use exact key match to prevent FOO matching FOOBAR=xxx.
-  # Match only lines where key= starts at position 1 AND the next char after
-  # the key name is '=' (not another alphanumeric/underscore).
-  awk -v k="$key" -v v="$q" '
-    BEGIN { found = 0; pat = k "=" }
-    substr($0, 1, length(pat)) == pat {
-      print k "=" v
-      found = 1
-      next
-    }
-    { print }
-    END {
-      if (!found) print k "=" v
-    }
+  # Remove the existing exact key line via awk, then append the new value using
+  # printf. Do not pass the value through awk -v; awk interprets backslash
+  # escapes such as \E, which can corrupt ANSI/control-containing values.
+  awk -v k="$key" '
+    BEGIN { pat = k "=" }
+    substr($0, 1, length(pat)) != pat { print }
   ' "$file" > "$tmp" || { rm -f "$tmp"; die "写入临时状态文件失败：$tmp"; }
+  printf '%s=%s\n' "$key" "$value" >> "$tmp" || { rm -f "$tmp"; die "追加状态文件失败：$tmp"; }
   chmod 600 "$tmp" 2>/dev/null || true
   mv -f "$tmp" "$file"
 }
@@ -225,13 +320,19 @@ save_kv(){
 ask(){
   local prompt="$1" default="${2:-}" ans msg
   if [[ -n "$default" ]]; then msg="$prompt [$default]: "; else msg="$prompt: "; fi
-  if [[ -r /dev/tty && -w /dev/tty ]]; then
-    printf '%s' "$msg" > /dev/tty
-    IFS= read -r ans < /dev/tty || true
+
+  # Robust interactive input: some non-interactive shells report /dev/tty as
+  # present but fail when opening it. Open it once and fall back cleanly to
+  # stdin/stderr, avoiding noisy "/dev/tty: No such device" diagnostics.
+  if { exec 3<>/dev/tty; } 2>/dev/null; then
+    printf '%s' "$msg" >&3 || true
+    IFS= read -r ans <&3 || ans=""
+    exec 3<&- 3>&- || true
   else
-    printf '%s' "$msg" >&2
-    IFS= read -r ans || true
+    printf '%s' "$msg" >&2 || true
+    IFS= read -r ans || ans=""
   fi
+
   if [[ -n "$default" ]]; then echo "${ans:-$default}"; else echo "$ans"; fi
 }
 
@@ -242,53 +343,1477 @@ confirm(){
 }
 
 rand_hex(){ openssl rand -hex "${1:-8}"; }
-rand_token(){ openssl rand -hex 16; }
+rand_token(){ openssl rand -hex "${1:-$SUB_TOKEN_HEX_BYTES}"; }
 rand_path(){ echo "/$(openssl rand -hex 6)/xhttp"; }
 
-# SECURITY FIX: validate that subscription tokens are safe 32-char hex strings,
+# SECURITY FIX: validate that subscription tokens are safe hex strings,
 # preventing path traversal if the state file is tampered with.
+# Keep old 32-char tokens valid, while new installs default to 64 chars.
 # If invalid, auto-regenerate instead of dying — better UX for existing installs.
-
-choose_reality_target(){
-  load_state
-  local c target _asn_country="" _asn_org=""
-  if command -v asn >/dev/null 2>&1; then
-    _asn_country=$(asn -j 2>/dev/null | jq -r ".country_name // empty" 2>/dev/null || true)
-    _asn_org=$(asn -j 2>/dev/null | jq -r ".org // empty" 2>/dev/null || true)
-  elif command -v curl >/dev/null 2>&1; then
-    _asn_country=$(curl -sS --max-time 5 https://ipapi.co/country/ 2>/dev/null || true)
-    _asn_org=$(curl -sS --max-time 5 https://ipapi.co/org/ 2>/dev/null || true)
-  fi
-  real_target_list_by_region "${_asn_country:-AS}" "${_asn_org:-}"
-  echo "快速选择:"
-  echo " 1. www.ebay.com           (全球拍卖，国内可访问，证书 3.1KB)"
-  echo " 2. www.adobe.com          (Adobe 全家桶，证书 1.9KB)"
-  echo " 3. www.salesforce.com     (企业 CRM，证书 1.9KB)"
-  echo " 4. 手动输入（自动验证证书大小+黑名单）"
-  c=$(ask "请选择" "1")
-  case "$c" in
-    1) target="www.ebay.com" ;;
-    2) target="www.adobe.com" ;;
-    3) target="www.salesforce.com" ;;
-    *) target=$(ask "请输入 REALITY target 域名" "${REALITY_TARGET:-www.ebay.com}") ;;
-  esac
-  target=$(printf '%s' "$target" | tr -d '[:space:]')
-  while ! validate_hostname "$target"; do
-    warn "REALITY target 域名格式不合格：$target"
-    target=$(ask "请重新输入 REALITY target 域名" "www.ebay.com")
-    target=$(printf '%s' "$target" | tr -d '[:space:]')
-  done
-  if ! validate_reality_target "$target"; then
-    local _force=$(ask "证书过大或域名被拉黑，是否仍要使用 $target？可能无法连接 [y/N]" "N")
-    if [[ ! "$_force" =~ ^[Yy]$ ]]; then
-      warn "已取消。"; return 1
+validate_or_regen_token(){
+  local key="$1" current="${!1:-}"
+  if [[ ! "$current" =~ ^[a-f0-9]{32,128}$ ]]; then
+    if [[ -n "$current" ]]; then
+      warn "${key} 格式非法（应为32-128位十六进制），已自动重新生成。"
     fi
-    warn "已强制使用 $target。"
+    save_kv "$STATE_FILE" "$key" "$(rand_token)"
+    load_state
   fi
-  save_kv "$STATE_FILE" REALITY_TARGET "$target"
-  log "REALITY target: $target"
 }
 
+valid_port(){
+  local p="$1"
+  [[ "$p" =~ ^[0-9]+$ ]] && [[ "$p" -ge 1 ]] && [[ "$p" -le 65535 ]]
+}
+
+is_cf_https_port(){
+  local p="$1" x
+  for x in $CF_HTTPS_PORTS; do [[ "$p" == "$x" ]] && return 0; done
+  return 1
+}
+
+version_ge(){
+  local current="$1" minimum="$2" first
+  [[ -n "$current" && -n "$minimum" ]] || return 1
+  if command -v dpkg >/dev/null 2>&1; then
+    dpkg --compare-versions "$current" ge "$minimum"
+    return $?
+  fi
+  if command -v sort >/dev/null 2>&1; then
+    first=$(printf '%s\n%s\n' "$minimum" "$current" | sort -V | head -n1)
+    [[ "$first" == "$minimum" ]]
+    return $?
+  fi
+  return 1
+}
+
+validate_base_domain(){
+  local d="$1"
+  [[ -n "$d" && ${#d} -le 253 ]] || return 1
+  [[ "$d" == *.*.* ]] || return 1
+  [[ "$d" != *..* ]] || return 1
+  [[ "$d" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.){2,}[A-Za-z]{2,}$ ]] || return 1
+}
+
+validate_hostname(){
+  local d="$1"
+  [[ -n "$d" && ${#d} -le 253 ]] || return 1
+  [[ "$d" != *..* ]] || return 1
+  [[ "$d" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,}$ ]] || return 1
+}
+
+valid_ipv4_literal(){
+  local ip="$1" IFS=. a b c d
+  [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+  read -r a b c d <<< "$ip"
+  for n in "$a" "$b" "$c" "$d"; do
+    [[ "$n" =~ ^[0-9]+$ ]] || return 1
+    (( 10#$n >= 0 && 10#$n <= 255 )) || return 1
+  done
+}
+
+valid_ipv6_literal(){
+  local ip="$1"
+  [[ -n "$ip" && "$ip" == *:* ]] || return 1
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "$ip" <<'PYV6' >/dev/null 2>&1
+import ipaddress, sys
+try:
+    ipaddress.IPv6Address(sys.argv[1])
+except Exception:
+    raise SystemExit(1)
+PYV6
+    return $?
+  fi
+  # Fallback without python3: conservative textual validation.
+  # Reject obviously malformed literals such as empty groups beyond one "::",
+  # non-hex chars, too many groups, or groups longer than 4 hex chars.
+  [[ "$ip" =~ ^[0-9A-Fa-f:]+$ ]] || return 1
+  [[ "$ip" != *:::* ]] || return 1
+  if [[ "$ip" == *::*::* ]]; then return 1; fi
+  local rest="$ip" group count=0
+  rest="${rest//::/:}"
+  IFS=':' read -r -a _v6_groups <<< "$rest"
+  for group in "${_v6_groups[@]}"; do
+    [[ -z "$group" ]] && continue
+    [[ "$group" =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
+    count=$((count + 1))
+  done
+  [[ "$count" -le 8 ]]
+}
+
+public_ipv4(){
+  curl -4 -fsS --max-time 8 https://api.ipify.org 2>/dev/null || \
+  curl -4 -fsS --max-time 8 https://ifconfig.co/ip 2>/dev/null || true
+}
+
+public_ipv6(){
+  curl -6 -fsS --max-time 8 https://api64.ipify.org 2>/dev/null || \
+  curl -6 -fsS --max-time 8 https://ifconfig.co/ip 2>/dev/null || true
+}
+
+detect_public_ips(){
+  local cur4 cur6 old4="${PUBLIC_IPV4:-}" old6="${PUBLIC_IPV6:-}"
+
+  # Do not trust historical state blindly. If an older version captured HTML,
+  # curl errors, ANSI noise, or any non-IP text, clear it before fallback use.
+  if [[ -n "$old4" ]] && ! valid_ipv4_literal "$old4"; then
+    warn "旧 PUBLIC_IPV4 不是合法 IPv4，已清空：$old4"
+    save_kv "$STATE_FILE" PUBLIC_IPV4 ""
+    old4=""
+  fi
+  if [[ -n "$old6" ]] && ! valid_ipv6_literal "$old6"; then
+    warn "旧 PUBLIC_IPV6 不是合法 IPv6，已清空：$old6"
+    save_kv "$STATE_FILE" PUBLIC_IPV6 ""
+    old6=""
+  fi
+
+  cur4="$(public_ipv4 | tr -d '[:space:]' || true)"
+  cur6="$(public_ipv6 | tr -d '[:space:]' || true)"
+
+  if [[ -n "$cur4" ]] && ! valid_ipv4_literal "$cur4"; then
+    warn "公网 IPv4 检测结果不是合法 IP，已丢弃：$cur4"
+    cur4=""
+  fi
+  if [[ -n "$cur6" ]] && ! valid_ipv6_literal "$cur6"; then
+    warn "公网 IPv6 检测结果不是合法 IP，已丢弃：$cur6"
+    cur6=""
+  fi
+
+  if [[ -n "$cur4" ]]; then
+    save_kv "$STATE_FILE" PUBLIC_IPV4 "$cur4"
+  elif [[ -n "$old4" ]]; then
+    warn "无法重新检测 IPv4，继续使用旧值：$old4"
+  fi
+
+  if [[ -n "$cur6" ]]; then
+    save_kv "$STATE_FILE" PUBLIC_IPV6 "$cur6"
+  elif [[ -n "$old6" ]]; then
+    warn "无法重新检测 IPv6，继续使用旧值：$old6"
+  fi
+  load_state
+}
+
+local_ipv4_for_bind(){
+  local public_ip="$1" src
+  if [[ -n "$public_ip" ]] && ip -4 addr show | grep -Fqw "$public_ip"; then
+    echo "$public_ip"; return 0
+  fi
+  [[ -n "$public_ip" ]] && warn "公网 IPv4 不在本机网卡上，可能是 NAT 环境：$public_ip"
+  src=$(ip -4 route get 8.8.8.8 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')
+  if [[ -n "$src" ]]; then
+    warn "IPv4 listen 使用本机实际出口地址：$src"
+    echo "$src"
+  else
+    warn "无法确定本机 IPv4 出口地址，listen 回退 0.0.0.0"
+    echo "0.0.0.0"
+  fi
+}
+
+local_ipv6_for_bind(){
+  local public_ip="$1" src
+  if [[ -n "$public_ip" ]] && ip -6 addr show scope global | grep -Fqw "$public_ip"; then
+    echo "$public_ip"; return 0
+  fi
+  [[ -n "$public_ip" ]] && warn "公网 IPv6 不在本机网卡上，可能是 NAT/特殊路由环境：$public_ip"
+  src=$(ip -6 route get 2001:4860:4860::8888 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')
+  if [[ -n "$src" ]]; then
+    warn "IPv6 listen 使用本机实际出口地址：$src"
+    echo "$src"
+  else
+    warn "无法确定本机 IPv6 出口地址，将跳过需要 IPv6 精确监听的入站。"
+    echo ""
+  fi
+}
+
+get_proc_by_port(){
+  local proto="$1" port="$2"
+  ss -H -lpn "$proto" "sport = :$port" 2>/dev/null | awk '{print $NF; exit}'
+}
+
+nginx_conf_user_field(){
+  local field="$1"
+  awk -v f="$field" '
+    $1 == "user" {
+      gsub(";", "", $2)
+      gsub(";", "", $3)
+      if (f == "user") print $2
+      else if (f == "group") print $3
+      exit
+    }
+  ' /etc/nginx/nginx.conf 2>/dev/null || true
+}
+
+detect_nginx_user(){
+  local u
+  u="$(nginx_conf_user_field user)"
+  if [[ -n "$u" ]] && id -u "$u" >/dev/null 2>&1; then
+    echo "$u"
+    return 0
+  fi
+
+  u="$(ps -eo user=,comm= 2>/dev/null | awk '$2 == "nginx" && $1 != "root" {print $1; exit}' || true)"
+  if [[ -n "$u" ]] && id -u "$u" >/dev/null 2>&1; then
+    echo "$u"
+    return 0
+  fi
+
+  if id -u www-data >/dev/null 2>&1; then
+    echo "www-data"
+  elif id -u nginx >/dev/null 2>&1; then
+    echo "nginx"
+  else
+    echo "root"
+  fi
+}
+
+detect_nginx_group(){
+  local g u
+  g="$(nginx_conf_user_field group)"
+  if [[ -n "$g" ]] && getent group "$g" >/dev/null 2>&1; then
+    echo "$g"
+    return 0
+  fi
+
+  u="$(detect_nginx_user)"
+  g="$(id -gn "$u" 2>/dev/null || true)"
+  if [[ -n "$g" ]] && getent group "$g" >/dev/null 2>&1; then
+    echo "$g"
+    return 0
+  fi
+
+  if getent group www-data >/dev/null 2>&1; then
+    echo "www-data"
+  elif getent group nginx >/dev/null 2>&1; then
+    echo "nginx"
+  else
+    echo "root"
+  fi
+}
+
+ensure_web_subscription_permissions(){
+  local ng ngx_user
+  ngx_user="$(detect_nginx_user)"
+  ng="$(detect_nginx_group)"
+
+  # RC10 HARDENING: umask 077 is correct for secrets, but web path parents
+  # must remain searchable by the Nginx worker. If /var/www is first created
+  # by this script, explicitly normalize it to the standard web permission.
+  mkdir -p /var/www "$WEB_ROOT" "$WEB_ROOT/sub"
+  chmod 755 /var/www 2>/dev/null || true
+  chmod 755 "$WEB_ROOT" 2>/dev/null || true
+
+  # Keep subscription files non-world-readable. Nginx can read them via group.
+  chmod 750 "$WEB_ROOT/sub" 2>/dev/null || true
+  chown root:"$ng" "$WEB_ROOT/sub" 2>/dev/null || true
+  if find "$WEB_ROOT/sub" -mindepth 1 -maxdepth 1 -type f -print -quit 2>/dev/null | grep -q .; then
+    find "$WEB_ROOT/sub" -mindepth 1 -maxdepth 1 -type f -exec chown root:"$ng" {} + 2>/dev/null || true
+    find "$WEB_ROOT/sub" -mindepth 1 -maxdepth 1 -type f -exec chmod 640 {} + 2>/dev/null || true
+  fi
+  info "订阅目录权限使用 Nginx worker：user=${ngx_user} group=${ng}"
+}
+
+
+install_deps(){
+  need_root
+  command -v apt-get >/dev/null 2>&1 || die "当前脚本自动安装依赖仅支持 Debian/Ubuntu apt 系。"
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update
+  apt-get install -y \
+    curl wget jq openssl ca-certificates gnupg lsb-release \
+    nginx certbot python3-certbot-dns-cloudflare \
+    whois iproute2 iputils-ping iptables nftables tcpdump unzip tar sed grep coreutils perl xxd \
+    cron socat util-linux conntrack logrotate
+  log "基础依赖安装完成。"
+}
+
+
+install_xray_logrotate(){
+  if [[ -d /etc/logrotate.d ]]; then
+    cat >/etc/logrotate.d/xray <<'EOF2'
+/var/log/xray/*.log {
+    daily
+    maxsize 20M
+    rotate 7
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+    create 0640 xray xray
+}
+EOF2
+  else
+    warn "未找到 /etc/logrotate.d，跳过 Xray 日志轮转配置。"
+  fi
+}
+
+ensure_xray_user(){
+  if ! getent group "$XRAY_GROUP" >/dev/null 2>&1; then
+    groupadd --system "$XRAY_GROUP" 2>/dev/null || true
+  fi
+  if ! id -u "$XRAY_USER" >/dev/null 2>&1; then
+    useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin \
+      --gid "$XRAY_GROUP" "$XRAY_USER" 2>/dev/null || true
+  fi
+  id -u "$XRAY_USER" >/dev/null 2>&1 || die "创建 Xray 专用用户失败：$XRAY_USER"
+}
+
+install_xray_systemd_restart_policy(){
+  mkdir -p /etc/systemd/system/xray.service.d
+  cat >/etc/systemd/system/xray.service.d/10-xem-restart.conf <<'EOF2'
+[Unit]
+StartLimitIntervalSec=0
+
+[Service]
+Restart=on-failure
+RestartSec=5s
+EOF2
+}
+
+install_xray_systemd_hardening_policy(){
+  mkdir -p /etc/systemd/system/xray.service.d
+  cat >/etc/systemd/system/xray.service.d/20-xem-hardening.conf <<EOF2
+[Service]
+User=${XRAY_USER}
+Group=${XRAY_GROUP}
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+ReadWritePaths=/var/log/xray /run/xray
+EOF2
+}
+
+sync_xray_certificate(){
+  load_state
+  [[ -n "${BASE_DOMAIN:-}" ]] || return 0
+  if ! validate_base_domain "$BASE_DOMAIN"; then
+    warn "BASE_DOMAIN 非法，跳过证书同步：$BASE_DOMAIN"
+    return 0
+  fi
+  local live_dir="/etc/letsencrypt/live/${BASE_DOMAIN}" dst="${XRAY_CERT_DIR}/${BASE_DOMAIN}"
+  [[ -f "$live_dir/fullchain.pem" && -f "$live_dir/privkey.pem" ]] || return 0
+  ensure_xray_user
+  install -d -m 750 -o root -g "$XRAY_GROUP" "$dst"
+  install -m 640 -o root -g "$XRAY_GROUP" "$live_dir/fullchain.pem" "$dst/fullchain.pem"
+  install -m 640 -o root -g "$XRAY_GROUP" "$live_dir/privkey.pem" "$dst/privkey.pem"
+  log "已同步 Xray 可读证书副本：$dst"
+}
+
+ensure_xray_service(){
+  need_root
+  command -v xray >/dev/null 2>&1 || die "未找到 xray 二进制文件，请先安装/升级 Xray-core。"
+  ensure_xray_user
+  install -d -m 755 /usr/local/etc/xray /usr/local/share/xray /etc/systemd/system
+  install -d -m 755 -o "$XRAY_USER" -g "$XRAY_GROUP" /var/log/xray
+  install -d -m 750 -o root -g "$XRAY_GROUP" "$XRAY_CERT_DIR"
+
+  install_xray_logrotate
+
+  # Some uninstall/reinstall paths can leave the xray binary installed while the
+  # systemd unit has been removed. Recreate a minimal service unit if needed.
+  if [[ ! -f /etc/systemd/system/xray.service ]] && ! systemctl list-unit-files --type=service 2>/dev/null | awk '{print $1}' | grep -qx 'xray.service'; then
+    warn "未检测到 xray.service，正在自动重建 systemd 服务。"
+    cat >/etc/systemd/system/xray.service <<'EOF2'
+[Unit]
+Description=Xray Service
+Documentation=https://github.com/xtls
+After=network.target nss-lookup.target
+StartLimitIntervalSec=0
+
+[Service]
+ExecStart=/usr/local/bin/xray run -config /usr/local/etc/xray/config.json
+Restart=on-failure
+RestartSec=5s
+RestartPreventExitStatus=23
+LimitNPROC=10000
+LimitNOFILE=1000000
+RuntimeDirectory=xray
+RuntimeDirectoryMode=0755
+
+[Install]
+WantedBy=multi-user.target
+EOF2
+  fi
+
+  # Always add a drop-in so official installer generated services also get the
+  # anti-crash restart policy without replacing their full unit file.
+  install_xray_systemd_restart_policy
+  install_xray_systemd_hardening_policy
+  sync_xray_certificate
+
+  systemctl daemon-reload
+  systemctl enable xray >/dev/null 2>&1 || true
+}
+
+xray_test_config(){
+  local config="$1" xray_bin
+  xray_bin="$(command -v xray 2>/dev/null || true)"
+  [[ -n "$xray_bin" ]] || die "未找到 xray 二进制文件。"
+  if command -v runuser >/dev/null 2>&1 && id -u "$XRAY_USER" >/dev/null 2>&1; then
+    runuser -u "$XRAY_USER" -- "$xray_bin" run -test -config "$config"
+  else
+    "$xray_bin" run -test -config "$config"
+  fi
+}
+
+xray_release_asset_name(){
+  case "$(uname -m)" in
+    x86_64|amd64) echo "Xray-linux-64.zip" ;;
+    i386|i686) echo "Xray-linux-32.zip" ;;
+    aarch64|arm64|armv8*) echo "Xray-linux-arm64-v8a.zip" ;;
+    armv7l|armv7*) echo "Xray-linux-arm32-v7a.zip" ;;
+    armv6l|armv6*) echo "Xray-linux-arm32-v6.zip" ;;
+    armv5tel|armv5*) echo "Xray-linux-arm32-v5.zip" ;;
+    mips64le) echo "Xray-linux-mips64le.zip" ;;
+    mips64) echo "Xray-linux-mips64.zip" ;;
+    mipsle) echo "Xray-linux-mips32le.zip" ;;
+    mips) echo "Xray-linux-mips32.zip" ;;
+    ppc64le) echo "Xray-linux-ppc64le.zip" ;;
+    ppc64) echo "Xray-linux-ppc64.zip" ;;
+    riscv64) echo "Xray-linux-riscv64.zip" ;;
+    s390x) echo "Xray-linux-s390x.zip" ;;
+    *) return 1 ;;
+  esac
+}
+
+extract_sha256_from_dgst(){
+  local dgst="$1"
+  # Avoid `grep | head` under `set -o pipefail`; SIGPIPE can make the
+  # whole script exit silently. The digest file is trusted only after this
+  # explicit 64-hex extraction succeeds.
+  grep -Eio -m1 '[a-f0-9]{64}' "$dgst" 2>/dev/null || true
+}
+
+install_or_upgrade_xray_release_verified(){
+  need_root
+  ensure_runtime_dirs
+  local asset release_json release_obj tag asset_url dgst_url tmp zip dgst expected actual extract_dir xray_bin dat f
+
+  asset="$(xray_release_asset_name)" || die "当前架构暂不支持自动匹配 Xray 官方 Release：$(uname -m)"
+  # SECURITY FIX: use APP_DIR instead of /tmp to avoid symlink race in multi-user systems.
+  tmp="$(mktemp_dir "$APP_DIR/tmp/xray-release.XXXXXX")"
+  zip="$tmp/$asset"
+  dgst="$tmp/$asset.dgst"
+  extract_dir="$tmp/extract"
+
+  info "从 XTLS/Xray-core 官方 Release 获取资产列表。"
+  release_json="$tmp/releases.json"
+  curl -fL --retry 3 --retry-delay 2 --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time 60 \
+    -H "Accept: application/vnd.github+json" \
+    -o "$release_json" "$XRAY_CORE_RELEASE_API?per_page=50" || die "获取 Xray-core 官方 Release 列表失败。"
+
+  local allow_prerelease release_filter
+  allow_prerelease="${XEM_XRAY_ALLOW_PRERELEASE:-1}"
+  [[ "$allow_prerelease" == "1" ]] || allow_prerelease=0
+  if [[ "$allow_prerelease" == "1" ]]; then
+    release_filter='map(select(.draft|not))'
+    warn "Xray-core 安装允许官方 prerelease：用于跟进最新 Xray 抗审查协议特性；仍会使用官方 .dgst 校验 ZIP。"
+  else
+    release_filter='map(select((.draft|not) and (.prerelease|not)))'
+  fi
+
+  # Select one release object first, then take ZIP and .dgst from the same
+  # release. Do not use `jq ... | head -n1` under pipefail: when GitHub returns
+  # many releases, head may close the pipe early and jq exits with SIGPIPE,
+  # causing a silent script exit before any die() message is printed.
+  release_obj=$(jq -c --arg asset "$asset" --argjson allow_pre "$allow_prerelease" '
+    (if $allow_pre == 1 then map(select(.draft|not)) else map(select((.draft|not) and (.prerelease|not))) end) |
+    map(select(any(.assets[]?; .name == $asset) and any(.assets[]?; .name == ($asset + ".dgst")))) |
+    .[0] // empty
+  ' "$release_json") || die "解析 Xray-core Release JSON 失败。"
+
+  [[ -n "$release_obj" && "$release_obj" != "null" ]] || die "未在 Xray-core 官方 Release 中找到 $asset 及其 .dgst 校验文件。"
+
+  tag=$(jq -r '.tag_name // empty' <<<"$release_obj") || die "解析 Xray-core Release tag 失败。"
+  asset_url=$(jq -r --arg asset "$asset" '.assets[]? | select(.name == $asset) | .browser_download_url' <<<"$release_obj") || die "解析 Xray ZIP 下载地址失败。"
+  dgst_url=$(jq -r --arg asset "$asset" '.assets[]? | select(.name == ($asset + ".dgst")) | .browser_download_url' <<<"$release_obj") || die "解析 Xray digest 下载地址失败。"
+
+  [[ -n "$tag" && -n "$asset_url" && -n "$dgst_url" && "$asset_url" != "null" && "$dgst_url" != "null" ]] || die "未在 Xray-core 官方 Release 中找到 $asset 及其 .dgst 校验文件。"
+
+  info "准备安装 Xray-core ${tag}：$asset"
+  info "下载官方 ZIP 与同 Release digest 文件。"
+  curl -fL --retry 3 --retry-delay 2 --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time 180 -o "$zip" "$asset_url" || die "下载 Xray 官方 ZIP 失败。"
+  curl -fL --retry 3 --retry-delay 2 --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time 60 -o "$dgst" "$dgst_url" || die "下载 Xray 官方 digest 失败。"
+
+  expected="$(extract_sha256_from_dgst "$dgst")"
+  [[ -n "$expected" ]] || die "无法从官方 digest 文件提取 SHA256。"
+  actual="$(sha256sum "$zip" | awk '{print $1}')"
+  if [[ "${actual,,}" != "${expected,,}" ]]; then
+    err "Xray 官方 ZIP SHA256 校验失败。"
+    err "expected=$expected"
+    err "actual=$actual"
+    die "拒绝安装，可能是下载损坏或链路被替换。"
+  fi
+  log "Xray 官方 ZIP SHA256 校验通过。"
+
+  mkdir -p "$extract_dir"
+  unzip -oq "$zip" -d "$extract_dir" || die "解压 Xray ZIP 失败。"
+  xray_bin="$(find "$extract_dir" -type f -name xray -print -quit)"
+  [[ -n "$xray_bin" && -f "$xray_bin" ]] || die "Xray ZIP 中未找到 xray 二进制。"
+
+  install -d /usr/local/bin /usr/local/etc/xray /usr/local/share/xray /var/log/xray
+  install -m 755 "$xray_bin" /usr/local/bin/xray
+  for dat in geoip.dat geosite.dat; do
+    f="$(find "$extract_dir" -type f -name "$dat" -print -quit || true)"
+    [[ -n "$f" && -f "$f" ]] && install -m 644 "$f" "/usr/local/share/xray/$dat"
+  done
+
+  ensure_xray_service
+  log "Xray-core $tag 已从官方 Release 安装/升级完成。"
+  xray version || true
+}
+
+install_or_upgrade_xray_script_fallback(){
+  need_root
+  local installer expected actual
+  if [[ "${XEM_ALLOW_XRAY_SCRIPT_FALLBACK:-0}" != "1" ]]; then
+    die "远程 Xray-install 脚本执行模式已默认禁用。请使用 Release ZIP 校验安装；如确需备用模式，请显式设置 XEM_ALLOW_XRAY_SCRIPT_FALLBACK=1。"
+  fi
+  warn "即将从 XTLS/Xray-install 官方仓库下载并执行 Xray 安装脚本。"
+  warn "这是官方脚本备用模式；如需强校验脚本本身，可设置 XEM_XRAY_INSTALL_SHA256。"
+  if [[ "${XEM_TRUST_REMOTE_XRAY_INSTALL:-0}" != "1" ]]; then
+    confirm "是否继续执行官方 Xray-install 脚本？" "N" || die "已取消远程安装。"
+  fi
+
+  # SECURITY FIX: use APP_DIR instead of /tmp to avoid symlink race.
+  installer="$(mktemp_file "$APP_DIR/tmp/xray-install.XXXXXX.sh")"
+  curl -fL --retry 3 --retry-delay 2 --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time 120 -o "$installer" "$XRAY_INSTALL_SCRIPT_URL" || die "下载 Xray 官方安装脚本失败。"
+  bash -n "$installer" || die "下载的 Xray 安装脚本语法检查失败，拒绝执行。"
+
+  if [[ -n "${XEM_XRAY_INSTALL_SHA256:-}" ]]; then
+    expected="${XEM_XRAY_INSTALL_SHA256,,}"
+    actual="$(sha256sum "$installer" | awk '{print tolower($1)}')"
+    [[ "$actual" == "$expected" ]] || die "Xray-install 脚本 SHA256 不匹配，拒绝执行。"
+    log "Xray-install 脚本 SHA256 pin 校验通过。"
+  fi
+
+  bash "$installer" install -u root
+  ensure_xray_service
+  log "Xray 官方安装脚本执行完成。"
+  xray version || true
+}
+
+install_or_upgrade_xray(){
+  need_root
+  local mode
+  mode="${XEM_XRAY_INSTALL_MODE:-}"
+  if [[ -z "$mode" ]]; then
+    echo "===== Xray-core 安装方式 ====="
+    echo "1. 官方 Xray-core Release ZIP + 官方 .dgst SHA256 校验，推荐"
+    echo "2. 官方 Xray-install 脚本，默认禁用；仅设置 XEM_ALLOW_XRAY_SCRIPT_FALLBACK=1 后可用"
+    mode=$(ask "请选择" "1")
+  fi
+
+  case "$mode" in
+    1|release|zip) install_or_upgrade_xray_release_verified ;;
+    2|script) install_or_upgrade_xray_script_fallback ;;
+    *) die "未知 Xray 安装方式：$mode" ;;
+  esac
+}
+
+update_geodata(){
+  need_root
+  local tmp status geoip_url geosite_url
+  tmp="$(mktemp_dir "$APP_DIR/tmp/geodata.XXXXXX")"
+  status=0
+  geoip_url="https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat"
+  geosite_url="https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat"
+
+  info "安全更新 geoip.dat / geosite.dat：只下载数据文件和 sha256，不执行远程脚本。"
+
+  # Use a subshell for cd isolation but rely on global GLOBAL_TEMP_FILES for cleanup.
+  # No internal trap needed — mktemp_dir already registered $tmp for cleanup on exit.
+  (
+    cd "$tmp" &&
+    curl -fL --retry 3 --retry-delay 2 --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time 120 -o geoip.dat "$geoip_url" &&
+    curl -fL --retry 3 --retry-delay 2 --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time 120 -o geoip.dat.sha256sum "$geoip_url.sha256sum" &&
+    curl -fL --retry 3 --retry-delay 2 --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time 120 -o geosite.dat "$geosite_url" &&
+    curl -fL --retry 3 --retry-delay 2 --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time 120 -o geosite.dat.sha256sum "$geosite_url.sha256sum" &&
+    sha256sum -c geoip.dat.sha256sum &&
+    sha256sum -c geosite.dat.sha256sum &&
+    install -d /usr/local/share/xray &&
+    install -m 644 geoip.dat /usr/local/share/xray/geoip.dat.new &&
+    install -m 644 geosite.dat /usr/local/share/xray/geosite.dat.new &&
+    mv -f /usr/local/share/xray/geoip.dat.new /usr/local/share/xray/geoip.dat &&
+    mv -f /usr/local/share/xray/geosite.dat.new /usr/local/share/xray/geosite.dat
+  ) || status=$?
+
+  if [[ "$status" -eq 0 ]]; then
+    log "geodata 已安全更新。"
+  else
+    warn "geodata 下载或 sha256 校验失败，已保留原文件。"
+  fi
+  return 0
+}
+
+install_self_to_local_bin(){
+  need_root
+  mkdir -p /usr/local/bin
+  if [[ -f "${BASH_SOURCE[0]:-}" && "${BASH_SOURCE[0]}" != /dev/fd/* && "${BASH_SOURCE[0]}" != /proc/* ]]; then
+    local src_self dst_self
+    src_self="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")"
+    dst_self="$(readlink -m /usr/local/bin/xem 2>/dev/null || printf '%s' /usr/local/bin/xem)"
+    if [[ "$src_self" == "$dst_self" ]]; then
+      chmod 755 /usr/local/bin/xem 2>/dev/null || true
+      log "当前脚本已是 /usr/local/bin/xem，跳过自我复制。"
+      return 0
+    fi
+    install -m 755 "${BASH_SOURCE[0]}" /usr/local/bin/xem
+    log "已安装本地命令：/usr/local/bin/xem"
+    return 0
+  fi
+  # SECURITY FIX: do not silently download and install self from remote.
+  # Require explicit user confirmation, and support SHA256 pin verification.
+  warn "当前可能是 bash <(curl ...) 方式运行，无法可靠复制自身。"
+  warn "将从仓库下载一次用于固化本地命令：$SCRIPT_RAW_URL"
+  warn "这意味着你信任该远程地址提供的脚本内容。测试分支/ fork 请用 XEM_SCRIPT_RAW_URL 覆盖。"
+  warn "可设置 XEM_SELF_SHA256 进行强校验。"
+  warn "首次部署中 HY2 跳跃、BestCF 定时任务、源站防火墙等功能需要 /usr/local/bin/xem。"
+  if [[ "${XEM_TRUST_REMOTE_SELF:-0}" != "1" ]]; then
+    confirm "是否继续从远程下载并安装本脚本？你已经在执行该 Raw 脚本，直接回车 = Y" "Y" || die "已取消远程安装。请手动下载脚本后执行 install -m 755 xem.sh /usr/local/bin/xem"
+  fi
+  local tmp_script
+  tmp_script="$(mktemp_file "$APP_DIR/tmp/xem-self.XXXXXX.sh")"
+  curl -fsSL --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time 60 "$SCRIPT_RAW_URL" -o "$tmp_script" || die "下载本地命令失败。"
+  if command -v perl >/dev/null 2>&1; then
+    # Normalize common copy/paste damage before installing the persistent local command.
+    # This does not make a CRLF GitHub Raw script executable on first launch, but it
+    # prevents a normalized bootstrap from installing a broken persistent copy.
+    perl -C -pi -e 's/\x{00A0}/ /g; s/\r$//g' "$tmp_script" 2>/dev/null || true
+  else
+    sed -i 's/\r$//' "$tmp_script" 2>/dev/null || true
+  fi
+  bash -n "$tmp_script" || die "下载的脚本语法检查失败，拒绝安装。请确认 GitHub 仓库中的 xem.sh 使用 LF 换行。"
+  # SHA256 pin verification if configured
+  if [[ -n "${XEM_SELF_SHA256:-}" ]]; then
+    local expected_self actual_self
+    expected_self="${XEM_SELF_SHA256,,}"
+    actual_self="$(sha256sum "$tmp_script" | awk '{print tolower($1)}')"
+    [[ "$actual_self" == "$expected_self" ]] || die "脚本 SHA256 校验失败，拒绝安装。expected=$expected_self actual=$actual_self"
+    log "脚本 SHA256 pin 校验通过。"
+  fi
+  mv -f "$tmp_script" /usr/local/bin/xem
+  chmod +x /usr/local/bin/xem
+  log "已安装本地命令：/usr/local/bin/xem"
+}
+
+enable_geodata_timer(){
+  install_self_to_local_bin
+  cat >/etc/systemd/system/xem-geodata-update.service <<'EOF2'
+[Unit]
+Description=Safely update Xray geodata via local Xray Edge Manager
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/xem --geodata-update
+EOF2
+  cat >/etc/systemd/system/xem-geodata-update.timer <<'EOF2'
+[Unit]
+Description=Run safe Xray geodata update weekly during off-peak hours
+
+[Timer]
+OnCalendar=Mon *-*-* 04:00:00
+RandomizedDelaySec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF2
+  systemctl daemon-reload
+  systemctl enable --now xem-geodata-update.timer
+  log "geodata 安全自动更新已启用：每周一凌晨 4-5 点期间执行。"
+}
+
+disable_geodata_timer(){
+  systemctl disable --now xem-geodata-update.timer 2>/dev/null || true
+  rm -f /etc/systemd/system/xem-geodata-update.service /etc/systemd/system/xem-geodata-update.timer
+  systemctl daemon-reload 2>/dev/null || true
+  log "geodata 自动更新已关闭。"
+}
+
+configure_base_domain(){
+  load_state
+  local force="${1:-0}" d
+  if [[ "$force" != "1" && -n "${BASE_DOMAIN:-}" ]] && validate_base_domain "$BASE_DOMAIN"; then
+    info "已使用当前母域名：$BASE_DOMAIN"; return 0
+  fi
+  while true; do
+    d=$(ask "请输入母域名，必须三段式或以上，例如 node.example.com" "${BASE_DOMAIN:-}")
+    d=$(printf '%s' "$d" | tr -d '[:space:]')
+    if validate_base_domain "$d"; then
+      save_kv "$STATE_FILE" BASE_DOMAIN "$d"
+      log "母域名已设置：$d"
+      break
+    fi
+    warn "域名不合格。必须类似 node.example.com，不能是 example.com 这种二段根域。"
+  done
+}
+
+sanitize_node_name(){
+  local name="$1"
+  name=$(printf '%s' "$name" | tr -cd 'A-Za-z0-9_.-' | sed 's/^[-_.]*//; s/[-_.]*$//')
+  # Keep YAML/subscription names short and deterministic.
+  [[ ${#name} -gt 64 ]] && name="${name:0:64}"
+  [[ -n "$name" ]] || name="node"
+  echo "$name"
+}
+
+configure_node_name(){
+  load_state
+  local default_name name
+  if [[ -n "${BASE_DOMAIN:-}" ]]; then
+    default_name="${BASE_DOMAIN%%.*}"
+  else
+    default_name="node"
+  fi
+  name=$(ask "请输入节点名称，用于订阅中区分机器，例如 jp1/us1/oracle-tokyo" "${NODE_NAME:-$default_name}")
+  name=$(sanitize_node_name "$name")
+  save_kv "$STATE_FILE" NODE_NAME "$name"
+  log "节点名称已设置：$name"
+}
+
+prepare_base_domain_for_install(){
+  load_state
+  if [[ -n "${BASE_DOMAIN:-}" ]] && validate_base_domain "$BASE_DOMAIN"; then
+    echo "检测到本机历史母域名：$BASE_DOMAIN"
+    print_domain_role_model
+    echo "1. 复用这个母域名，适合重复调试安装，推荐"
+    echo "2. 重新输入母域名"
+    local c; c=$(ask "请选择" "1")
+    case "$c" in
+      1) info "继续使用当前母域名：$BASE_DOMAIN" ;;
+      2) configure_base_domain 1 ;;
+      *) warn "无效选择，继续使用当前母域名：$BASE_DOMAIN" ;;
+    esac
+  else
+    configure_base_domain 1
+  fi
+  load_state
+  print_domain_role_model
+}
+
+cloudflare_token_risk_check(){
+  local token="$1" ack
+  if [[ "$token" =~ ^[a-f0-9]{37}$ ]]; then
+    warn "这个 Token 看起来像 Cloudflare Global API Key。强烈不建议使用。"
+    ack=$(ask "如坚持继续，请输入 YES_I_KNOW_THE_RISK" "")
+    [[ "$ack" == "YES_I_KNOW_THE_RISK" ]] || die "已中止。请使用 Restricted API Token。"
+  fi
+}
+
+cf_api(){
+  local method="$1" endpoint="$2" data="${3:-}" resp ok
+  load_state
+  [[ -n "${CF_API_TOKEN:-}" ]] || die "未配置 CF_API_TOKEN。"
+  if [[ -n "$data" ]]; then
+    resp=$(curl -fsS --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time "$CURL_MAX_TIME" \
+      -X "$method" "https://api.cloudflare.com/client/v4$endpoint" \
+      -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json" --data "$data") || return 1
+  else
+    resp=$(curl -fsS --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time "$CURL_MAX_TIME" \
+      -X "$method" "https://api.cloudflare.com/client/v4$endpoint" \
+      -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json") || return 1
+  fi
+  ok=$(echo "$resp" | jq -r '.success // empty' 2>/dev/null || true)
+  if [[ "$ok" != "true" ]]; then
+    err "Cloudflare API 调用失败：$method $endpoint"
+    echo "$resp" >&2
+    return 1
+  fi
+  echo "$resp"
+}
+
+setup_cloudflare(){
+  require_cmds curl jq
+  load_state
+  configure_base_domain
+  local token zone_name resp ok zone_id
+  echo "Cloudflare API Token 创建教程："
+  echo "  https://github.com/0x1233333/xray-edge-manager/blob/main/examples/cloudflare-api-token.md"
+  echo "请使用 Restricted API Token，不要使用 Global API Key。"
+  token=$(ask "请输入 Cloudflare Restricted API Token，需 Zone:Read + DNS:Edit" "${CF_API_TOKEN:-}")
+  token=$(printf '%s' "$token" | tr -d '[:space:]')
+  [[ -n "$token" ]] || die "API Token 不能为空。"
+  cloudflare_token_risk_check "$token"
+  save_kv "$CF_ENV" CF_API_TOKEN "$token"
+  safe_source_env_file "$CF_ENV"
+
+  zone_name=$(ask "请输入 Cloudflare Zone Name，例如 example.com" "${CF_ZONE_NAME:-}")
+  zone_name=$(printf '%s' "$zone_name" | tr -d '[:space:]')
+  [[ -n "$zone_name" ]] || die "Zone Name 不能为空。"
+  save_kv "$CF_ENV" CF_ZONE_NAME "$zone_name"
+
+  resp=$(curl -fsS --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time "$CURL_MAX_TIME" -G "https://api.cloudflare.com/client/v4/zones" \
+    -H "Authorization: Bearer $token" --data-urlencode "name=$zone_name") || die "Cloudflare API 查询失败或超时。"
+  ok=$(echo "$resp" | jq -r '.success')
+  [[ "$ok" == "true" ]] || die "Cloudflare API 返回失败：$resp"
+  zone_id=$(echo "$resp" | jq -r '.result[0].id // empty')
+  [[ -n "$zone_id" ]] || die "未查到 Zone ID。请确认 Zone Name 正确，且 Token 的 Zone Resources 包含该域名。"
+  save_kv "$CF_ENV" CF_ZONE_ID "$zone_id"
+  safe_source_env_file "$CF_ENV"
+  cf_api GET "/zones/$zone_id/dns_records?per_page=1" >/dev/null || die "Token 无法读取 DNS 记录。"
+  log "Cloudflare 已配置并通过权限测试：zone=$zone_name id=$zone_id"
+}
+
+managed_dns_type_allowed(){
+  case "$1" in A|AAAA) return 0 ;; *) return 1 ;; esac
+}
+
+managed_dns_name_allowed(){
+  local name="$1"
+  load_state
+  [[ -n "${BASE_DOMAIN:-}" ]] || return 1
+  case "$name" in
+    "$BASE_DOMAIN"|"v4.$BASE_DOMAIN"|"v6.$BASE_DOMAIN") return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+assert_managed_dns_scope(){
+  local name="$1" type="$2"
+  managed_dns_type_allowed "$type" || die "拒绝操作非 A/AAAA DNS 类型：$type $name"
+  managed_dns_name_allowed "$name" || die "拒绝操作母域名范围外 DNS：$type $name"
+}
+
+print_domain_role_model(){
+  load_state
+  echo "===== 域名角色模型 ====="
+  echo "BASE: ${BASE_DOMAIN:-未设置}        -> 订阅链接 / 伪装站 / CDN 中转入口，只管理 A/AAAA，proxied=true"
+  echo "v4:   v4.${BASE_DOMAIN:-未设置}     -> IPv4 直连节点，只使用 A，proxied=false"
+  echo "v6:   v6.${BASE_DOMAIN:-未设置}     -> IPv6 直连节点，只使用 AAAA，proxied=false"
+  echo "边界：不管理 CNAME/TXT/CAA/HTTPS/SVCB/MX/NS，也不管理其它子域名。"
+}
+
+warn_cf_dns_exclusive_domain(){
+  if [[ "${XEM_CF_DNS_EXCLUSIVE_WARNED:-0}" != "1" ]]; then
+    warn "Cloudflare DNS 最小权限模式：仅管理 BASE/v4/v6 三个名称的 A/AAAA。"
+    warn "BASE 用作订阅链接、伪装站、CDN 中转；v4 只做 IPv4 直连；v6 只做 IPv6 直连。"
+    warn "不会删除 TXT/CNAME/CAA/HTTPS/SVCB/MX/NS，也不会删除其它子域名。"
+    export XEM_CF_DNS_EXCLUSIVE_WARNED=1
+  fi
+}
+
+cf_upsert_record(){
+  require_cmds curl jq
+  local name="$1" type="$2" content="$3" proxied="$4" list rec_id payload id
+  local ids=()
+  load_state
+  [[ -n "${CF_API_TOKEN:-}" && -n "${CF_ZONE_ID:-}" ]] || die "Cloudflare API 未完整配置。"
+  [[ -n "$content" ]] || { warn "$name $type 内容为空，跳过。"; return 0; }
+  assert_managed_dns_scope "$name" "$type"
+  warn_cf_dns_exclusive_domain
+  info "Upsert DNS: $type $name -> $content proxied=$proxied"
+  list=$(curl -fsS --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time "$CURL_MAX_TIME" -G "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/dns_records" \
+    -H "Authorization: Bearer $CF_API_TOKEN" \
+    --data-urlencode "type=$type" --data-urlencode "name=$name" --data-urlencode "per_page=100") || return 1
+  echo "$list" | jq -e '.success == true' >/dev/null || { err "Cloudflare DNS 记录查询失败：$type $name"; echo "$list" >&2; return 1; }
+
+  mapfile -t ids < <(echo "$list" | jq -r '.result[]?.id // empty')
+  rec_id=$(echo "$list" | jq -r --arg content "$content" '[.result[]? | select(.content == $content) | .id][0] // empty')
+  [[ -z "$rec_id" && "${#ids[@]}" -gt 0 ]] && rec_id="${ids[0]}"
+
+  payload=$(jq -nc --arg type "$type" --arg name "$name" --arg content "$content" --argjson proxied "$proxied" \
+    '{type:$type,name:$name,content:$content,ttl:1,proxied:$proxied}')
+
+  if [[ -n "$rec_id" ]]; then
+    cf_api PATCH "/zones/$CF_ZONE_ID/dns_records/$rec_id" "$payload" >/dev/null
+  else
+    cf_api POST "/zones/$CF_ZONE_ID/dns_records" "$payload" >/dev/null
+  fi
+
+  # Only collapse duplicate records for the exact managed name/type. This never
+  # touches CNAME/TXT/CAA/HTTPS/SVCB/MX/NS or unrelated subdomains.
+  for id in "${ids[@]}"; do
+    [[ -n "$id" && "$id" != "$rec_id" ]] || continue
+    warn "删除重复 A/AAAA 记录：$type $name id=$id"
+    cf_api DELETE "/zones/$CF_ZONE_ID/dns_records/$id" >/dev/null || warn "删除重复 DNS 记录失败：$id"
+  done
+}
+
+stack_protocols_has(){ [[ "$1" == *"$2"* ]]; }
+stack_has_xhttp_reality(){ [[ "$1" == *"1"* ]]; }
+stack_has_cdn(){ [[ "$1" == *"2"* || "$1" == *"5"* ]]; }
+stack_has_hy2(){ [[ "$1" == *"3"* ]]; }
+stack_has_vision(){ [[ "$1" == *"4"* ]]; }
+stack_has_direct_protocol(){ [[ "$1" == *"1"* || "$1" == *"3"* || "$1" == *"4"* ]]; }
+
+normalize_stack_protocols(){
+  local p="$1" out=""
+  p="${p//,/}"; p="${p// /}"
+  [[ "$p" == "0" || -z "$p" ]] && { echo "0"; return 0; }
+  [[ "$p" == *1* ]] && out="${out}1"
+  [[ "$p" == *2* ]] && out="${out}2"
+  [[ "$p" == *3* ]] && out="${out}3"
+  [[ "$p" == *4* ]] && out="${out}4"
+  [[ "$p" == *5* ]] && out="${out}5"
+  [[ -z "$out" ]] && out="0"
+  echo "$out"
+}
+
+select_one_stack_protocols(){
+  local label="$1" current="$2" default_mode="$3" mode normalized
+  echo >&2
+  echo "===== ${label} 协议组合选择 =====" >&2
+  echo "0. 不生成 ${label} 节点" >&2
+  echo "1. ${label} VLESS + XHTTP + REALITY，直连，默认主力" >&2
+  echo "2. ${label} VLESS + XHTTP + TLS + CDN，CDN 隐藏，使用母域名" >&2
+  echo "3. ${label} Xray Hysteria2，UDP 高速备用，实验" >&2
+  echo "4. ${label} VLESS + REALITY + Vision，可选直连备用" >&2
+  echo "5. ${label} VLESS + XHTTP + TLS + CDN 入口扩展，复用 CDN 入站，可配合 BestCF/优选域名/域名前置" >&2
+  echo "可以输入组合，例如 123、13、23、1234；直接回车 = 使用方括号里的默认/当前值。" >&2
+  mode=$(ask "请选择 ${label} 协议组合（0/1/2/3/4/5 或组合）" "${current:-$default_mode}")
+  normalized=$(normalize_stack_protocols "$mode")
+  echo "$normalized"
+}
+
+build_default_protocols_from_stack_strategy(){
+  load_state
+  local p=""
+  [[ "${IPV4_PROTOCOLS:-0}" == *1* || "${IPV6_PROTOCOLS:-0}" == *1* ]] && p="${p}1"
+  [[ "${IPV4_PROTOCOLS:-0}" == *2* || "${IPV6_PROTOCOLS:-0}" == *2* ]] && p="${p}2"
+  [[ "${IPV4_PROTOCOLS:-0}" == *3* || "${IPV6_PROTOCOLS:-0}" == *3* ]] && p="${p}3"
+  [[ "${IPV4_PROTOCOLS:-0}" == *4* || "${IPV6_PROTOCOLS:-0}" == *4* ]] && p="${p}4"
+  [[ "${IPV4_PROTOCOLS:-0}" == *5* || "${IPV6_PROTOCOLS:-0}" == *5* ]] && p="${p}5"
+  [[ -z "$p" ]] && p="0"
+  echo "$p"
+}
+
+select_ip_stack_strategy(){
+  load_state
+  local ip4 ip6 v4_protos v6_protos default_p
+  detect_public_ips
+  ip4="${PUBLIC_IPV4:-}"
+  ip6="${PUBLIC_IPV6:-}"
+
+  echo
+  echo "===== IPv4 / IPv6 独立协议组合 ====="
+  echo "IPv4 和 IPv6 各自输入协议组合，例如 IPv4=123，IPv6=13。"
+  echo "0=不生成该栈节点；1=XHTTP+REALITY直连；2=XHTTP+TLS+CDN；3=Hysteria2 UDP；4=REALITY+Vision；5=CDN/BestCF入口扩展。"
+  echo "直接按回车会使用方括号里的默认/当前值。"
+
+  if [[ -n "$ip4" ]]; then
+    v4_protos=$(select_one_stack_protocols "IPv4" "${IPV4_PROTOCOLS:-}" "123")
+    save_kv "$STATE_FILE" IPV4_PROTOCOLS "$v4_protos"
+  else
+    save_kv "$STATE_FILE" IPV4_PROTOCOLS "0"
+    warn "未检测到 IPv4，IPv4 协议组合设为 0。"
+  fi
+  if [[ -n "$ip6" ]]; then
+    v6_protos=$(select_one_stack_protocols "IPv6" "${IPV6_PROTOCOLS:-}" "123")
+    save_kv "$STATE_FILE" IPV6_PROTOCOLS "$v6_protos"
+  else
+    save_kv "$STATE_FILE" IPV6_PROTOCOLS "0"
+    warn "未检测到 IPv6，IPv6 协议组合设为 0。"
+  fi
+  default_p=$(build_default_protocols_from_stack_strategy)
+  save_kv "$STATE_FILE" PROTOCOLS "$default_p"
+  if [[ "$default_p" == *2* || "$default_p" == *5* ]]; then save_kv "$STATE_FILE" ENABLE_CDN "1"; else save_kv "$STATE_FILE" ENABLE_CDN "0"; fi
+  log "协议策略已保存：IPv4=${v4_protos:-0} IPv6=${v6_protos:-0} 实际需要=${default_p}"
+}
+
+protocol_enabled(){ [[ "${PROTOCOLS:-0}" == *"$1"* ]]; }
+
+select_protocols(){
+  load_state
+  local p port
+  p=$(build_default_protocols_from_stack_strategy)
+  save_kv "$STATE_FILE" PROTOCOLS "$p"
+  echo "===== 已根据 v4/v6 选择自动生成协议组合 ====="
+  echo "IPv4: ${IPV4_PROTOCOLS:-0}"
+  echo "IPv6: ${IPV6_PROTOCOLS:-0}"
+  echo "实际需要: $p"
+
+  if [[ "$p" == *2* || "$p" == *5* ]]; then
+    save_kv "$STATE_FILE" ENABLE_CDN "1"
+    port=$(ask "CDN/订阅/伪装站 HTTPS 端口；直接回车使用默认值；只能是 443/2053/2083/2087/2096/8443" "${CDN_PORT:-443}")
+    valid_port "$port" || die "端口无效。"
+    is_cf_https_port "$port" || die "端口必须是 Cloudflare HTTPS 可代理端口：$CF_HTTPS_PORTS"
+    save_kv "$STATE_FILE" CDN_PORT "$port"
+    CDN_PORT="$port"
+  else
+    save_kv "$STATE_FILE" ENABLE_CDN "0"
+    port=$(ask "订阅/伪装站 HTTPS 端口；直连-only 也需要提供 /sub；直接回车使用默认值；只能是 443/2053/2083/2087/2096/8443" "${CDN_PORT:-443}")
+    valid_port "$port" || die "端口无效。"
+    is_cf_https_port "$port" || die "订阅/伪装站端口必须是 Cloudflare HTTPS 可代理端口：$CF_HTTPS_PORTS"
+    save_kv "$STATE_FILE" CDN_PORT "$port"
+    CDN_PORT="$port"
+  fi
+
+  # 协议 5 的意义是 CDN/BestCF 入口扩展。若用户选择 5，则自动开启 BestCF 域名模式；否则 5 会和普通 CDN 节点重复，没有实际意义。
+  if [[ "$p" == *5* ]]; then
+    if [[ "${BESTCF_ENABLED:-0}" != "1" ]]; then
+      save_kv "$STATE_FILE" BESTCF_ENABLED "1"
+      save_kv "$STATE_FILE" BESTCF_MODE "domain"
+      save_kv "$STATE_FILE" BESTCF_PER_CATEGORY_LIMIT "1"
+      save_kv "$STATE_FILE" BESTCF_TOTAL_LIMIT "1"
+      warn "检测到协议 5，已自动开启 BestCF：只生成 1 个优选域名节点；生成订阅前会自动拉取数据。"
+    fi
+  fi
+
+  if [[ "$p" == *1* ]]; then
+    port=$(ask "XHTTP + REALITY 直连 TCP 端口；直接回车使用默认值；推荐 2443，不能等于订阅/伪装站 HTTPS 端口 ${CDN_PORT:-443}" "${XHTTP_REALITY_PORT:-2443}")
+    valid_port "$port" || die "端口无效。"
+    [[ "$port" != "${CDN_PORT:-443}" ]] || die "TCP ${CDN_PORT:-443} 需要留给 Nginx 订阅/伪装站；请把 XHTTP+REALITY 改成 2443 等非 ${CDN_PORT:-443} 端口。HY2 UDP 443 不受影响。"
+    save_kv "$STATE_FILE" XHTTP_REALITY_PORT "$port"
+  fi
+
+  if [[ "$p" == *4* ]]; then
+    port=$(ask "REALITY + Vision 直连 TCP 端口；直接回车使用默认值；推荐 3443，不能等于订阅/伪装站 HTTPS 端口 ${CDN_PORT:-443}" "${REALITY_VISION_PORT:-3443}")
+    valid_port "$port" || die "端口无效。"
+    [[ "$port" != "${CDN_PORT:-443}" ]] || die "TCP ${CDN_PORT:-443} 需要留给 Nginx 订阅/伪装站；请把 REALITY+Vision 改成 3443 等非 ${CDN_PORT:-443} 端口。HY2 UDP 443 不受影响。"
+    save_kv "$STATE_FILE" REALITY_VISION_PORT "$port"
+  fi
+
+  if [[ "$p" == *3* ]]; then
+    port=$(ask "Hysteria2 UDP 监听端口；直接回车使用默认值；推荐 443；这是 UDP，可与 Nginx TCP 443 共存" "${HY2_PORT:-443}")
+    valid_port "$port" || die "端口无效。"
+    save_kv "$STATE_FILE" HY2_PORT "$port"
+    warn "Xray Hysteria2 是较新功能。如连接失败，优先检查客户端内核、UDP 放行和 Xray 版本。"
+  fi
+
+  if [[ "$p" == *1* || "$p" == *2* || "$p" == *3* || "$p" == *4* || "$p" == *5* ]]; then
+    detect_public_ips
+    echo
+    echo "===== 出口策略 ====="
+    echo "1. auto：推荐。检测到 IPv4 时，v4/v6/CDN 入站全部强制 IPv4 出口；纯 IPv6 机器则只让 Xray 用户代理流量走 WARP IPv4 出口"
+    echo "2. force-v4：v4/v6/CDN 入站全部强制 IPv4 出口；要求本机有可用 IPv4"
+    echo "3. warp-v4：v4/v6/CDN 入站全部走 Xray WireGuard/WARP 出口，并强制目标 IPv4；适合纯 IPv6 机器"
+    echo "4. stack：v4 入站走 IPv4 出口，v6 入站走 IPv6 出口（原逻辑，不推荐你的当前需求）"
+    echo "0. none：不写入站到出站路由，交给 Xray 默认 direct"
+    local outbound_choice outbound_default
+    outbound_default="${IP_OUTBOUND_MODE:-auto}"
+    # Old installs often stored stack only because ENABLE_IP_STACK_BINDING was enabled.
+    # For this branch, the safer default is auto, matching the requested policy.
+    [[ -z "${IP_OUTBOUND_MODE:-}" && "${ENABLE_IP_STACK_BINDING:-1}" == "0" ]] && outbound_default="none"
+    outbound_choice=$(ask "请选择出口策略（1/2/3/4/0 或 auto/force-v4/warp-v4/stack/none）" "$outbound_default")
+    case "$outbound_choice" in
+      1|auto|default|recommended|推荐)
+        save_kv "$STATE_FILE" IP_OUTBOUND_MODE "auto"
+        save_kv "$STATE_FILE" ENABLE_IP_STACK_BINDING "1"
+        if [[ -z "${PUBLIC_IPV4:-}" && -n "${PUBLIC_IPV6:-}" ]]; then
+          if [[ -z "${WARP_OUTBOUND_FILE:-}" ]]; then
+            save_kv "$STATE_FILE" WARP_OUTBOUND_FILE "$WARP_OUTBOUND_FILE_DEFAULT"
+          fi
+          warn "当前看起来是纯 IPv6 机器；auto 会解析为 warp-v4。"
+          ensure_warp_outbound_ready_prompt
+        fi
+        ;;
+      2|force-v4|v4|ipv4|all-v4)
+        if [[ -n "${PUBLIC_IPV4:-}" ]]; then
+          save_kv "$STATE_FILE" IP_OUTBOUND_MODE "force-v4"
+          save_kv "$STATE_FILE" ENABLE_IP_STACK_BINDING "1"
+        else
+          warn "未检测到 IPv4，force-v4 不成立；已改为 auto。纯 IPv6 机器会在生成 Xray 配置时解析为 warp-v4。"
+          save_kv "$STATE_FILE" IP_OUTBOUND_MODE "auto"
+          save_kv "$STATE_FILE" ENABLE_IP_STACK_BINDING "1"
+          if [[ -z "${WARP_OUTBOUND_FILE:-}" ]]; then save_kv "$STATE_FILE" WARP_OUTBOUND_FILE "$WARP_OUTBOUND_FILE_DEFAULT"; fi
+        fi
+        ;;
+      3|warp-v4|warp|warp4|warp-ipv4)
+        save_kv "$STATE_FILE" IP_OUTBOUND_MODE "warp-v4"
+        save_kv "$STATE_FILE" ENABLE_IP_STACK_BINDING "1"
+        if [[ -z "${WARP_OUTBOUND_FILE:-}" ]]; then
+          save_kv "$STATE_FILE" WARP_OUTBOUND_FILE "$WARP_OUTBOUND_FILE_DEFAULT"
+        fi
+        warn "已选择 warp-v4。脚本可以使用 warp-reg 自动生成 WARP outbound；也兼容手动放入 wgcf-cli generate --xray 生成的 JSON。"
+        warn "脚本生成 Xray 配置时会强制设置 tag=out-warp、domainStrategy=ForceIPv4、noKernelTun=true；不会修改系统默认路由。"
+        ensure_warp_outbound_ready_prompt
+        ;;
+      4|stack|normal|same-stack)
+        save_kv "$STATE_FILE" IP_OUTBOUND_MODE "stack"
+        save_kv "$STATE_FILE" ENABLE_IP_STACK_BINDING "1"
+        warn "已选择 stack：v6 入站会走 IPv6 出口，不符合你当前的 IPv6 兼容性目标。"
+        ;;
+      0|none|off|no)
+        save_kv "$STATE_FILE" IP_OUTBOUND_MODE "none"
+        save_kv "$STATE_FILE" ENABLE_IP_STACK_BINDING "0"
+        warn "未写入入站到出站路由；监听仍会按 v4/v6 精确绑定。"
+        ;;
+      *)
+        warn "未知出口策略：$outbound_choice，已使用 auto。"
+        save_kv "$STATE_FILE" IP_OUTBOUND_MODE "auto"
+        save_kv "$STATE_FILE" ENABLE_IP_STACK_BINDING "1"
+        ;;
+    esac
+  fi
+
+  # XHTTP+REALITY and REALITY+Vision are both TCP listeners. They must not share
+  # the same port even if Xray config generation happens to pass JSON validation.
+  if [[ "$p" == *1* && "$p" == *4* ]]; then
+    load_state
+    [[ "${XHTTP_REALITY_PORT:-2443}" != "${REALITY_VISION_PORT:-3443}" ]] || die "TCP 端口冲突：XHTTP+REALITY 与 REALITY+Vision 不能使用同一个端口。"
+  fi
+  load_state
+  log "协议组合：$p"
+}
+show_managed_dns_records(){
+  require_cmds curl jq
+  load_state
+  [[ -n "${BASE_DOMAIN:-}" ]] || return 0
+  [[ -n "${CF_API_TOKEN:-}" && -n "${CF_ZONE_ID:-}" ]] || return 0
+  local name type resp count i content proxied found=0
+  echo "===== 当前母域名范围内 A/AAAA 记录 ====="
+  for name in "$BASE_DOMAIN" "v4.$BASE_DOMAIN" "v6.$BASE_DOMAIN"; do
+    for type in A AAAA; do
+      resp=$(cf_get_record_json "$name" "$type" 2>/dev/null || true)
+      [[ -n "$resp" ]] || continue
+      count=$(echo "$resp" | jq -r '.result | length' 2>/dev/null || echo 0)
+      for ((i=0;i<count;i++)); do
+        content=$(echo "$resp" | jq -r ".result[$i].content // empty")
+        proxied=$(echo "$resp" | jq -r ".result[$i].proxied // false")
+        printf '  %-5s %-45s -> %-40s proxied=%s\n' "$type" "$name" "$content" "$proxied"
+        found=1
+      done
+    done
+  done
+  [[ "$found" == "1" ]] || echo "  未发现 BASE/v4/v6 范围内 A/AAAA 记录。"
+}
+
+managed_dns_has_records(){
+  load_state
+  [[ -n "${BASE_DOMAIN:-}" && -n "${CF_API_TOKEN:-}" && -n "${CF_ZONE_ID:-}" ]] || return 1
+  local name type resp count
+  for name in "$BASE_DOMAIN" "v4.$BASE_DOMAIN" "v6.$BASE_DOMAIN"; do
+    for type in A AAAA; do
+      resp=$(cf_get_record_json "$name" "$type" 2>/dev/null || true)
+      [[ -n "$resp" ]] || continue
+      count=$(echo "$resp" | jq -r '.result | length' 2>/dev/null || echo 0)
+      [[ "$count" -gt 0 ]] && return 0
+    done
+  done
+  return 1
+}
+
+delete_managed_a_aaaa_records(){
+  local mode="${1:-owned}" ip4="${2:-}" ip6="${3:-}" name
+  load_state
+  [[ -n "${BASE_DOMAIN:-}" ]] || { warn "BASE_DOMAIN 未设置，无法清理 DNS。"; return 0; }
+  for name in "$BASE_DOMAIN" "v4.$BASE_DOMAIN" "v6.$BASE_DOMAIN"; do
+    if [[ "$mode" == "force" ]]; then
+      cf_delete_record "$name" A "" force
+      cf_delete_record "$name" AAAA "" force
+    else
+      [[ -n "$ip4" ]] && cf_delete_record "$name" A "$ip4" owned
+      [[ -n "$ip6" ]] && cf_delete_record "$name" AAAA "$ip6" owned
+    fi
+  done
+}
+
+apply_domain_role_dns_records(){
+  load_state
+  local ip4="${1:-${PUBLIC_IPV4:-}}" ip6="${2:-${PUBLIC_IPV6:-}}"
+  [[ -n "${BASE_DOMAIN:-}" ]] && validate_base_domain "$BASE_DOMAIN" || die "BASE_DOMAIN 非法，拒绝操作 DNS。"
+
+  if [[ -n "$ip4" ]]; then
+    # BASE 是订阅/伪装/CDN 入口。存在 IPv4 就发布 A，必须走 Cloudflare 代理。
+    cf_upsert_record "$BASE_DOMAIN" A "$ip4" true
+    if stack_has_direct_protocol "${IPV4_PROTOCOLS:-0}"; then
+      # v4 只承载 IPv4 直连节点，只允许 A。
+      cf_upsert_record "v4.$BASE_DOMAIN" A "$ip4" false
+    else
+      cf_delete_record "v4.$BASE_DOMAIN" A "$ip4" owned || true
+    fi
+    # v6 子域不应有 A；只按本机 IPv4 归属校验清理历史残留。
+    cf_delete_record "v6.$BASE_DOMAIN" A "$ip4" owned || true
+  fi
+
+  if [[ -n "$ip6" ]]; then
+    # BASE 是订阅/伪装/CDN 入口。存在 IPv6 就发布 AAAA，必须走 Cloudflare 代理。
+    cf_upsert_record "$BASE_DOMAIN" AAAA "$ip6" true
+    if stack_has_direct_protocol "${IPV6_PROTOCOLS:-0}"; then
+      # v6 只承载 IPv6 直连节点，只允许 AAAA。
+      cf_upsert_record "v6.$BASE_DOMAIN" AAAA "$ip6" false
+    else
+      cf_delete_record "v6.$BASE_DOMAIN" AAAA "$ip6" owned || true
+    fi
+    # v4 子域不应有 AAAA；只按本机 IPv6 归属校验清理历史残留。
+    cf_delete_record "v4.$BASE_DOMAIN" AAAA "$ip6" owned || true
+  fi
+}
+
+
+require_public_ip_for_dns_update(){
+  local ip4="${1:-}" ip6="${2:-}"
+  if [[ -z "$ip4" && -z "$ip6" ]]; then
+    die "未检测到合法公网 IPv4/IPv6，拒绝刷新或重建 DNS，避免出现 DNS 假成功。请先检查公网出口，或确认状态文件中的 PUBLIC_IPV4/PUBLIC_IPV6。"
+  fi
+  if [[ "${IPV4_PROTOCOLS:-0}" != "0" && -z "$ip4" ]]; then
+    die "IPv4 协议已启用（IPV4_PROTOCOLS=${IPV4_PROTOCOLS:-0}），但未检测到公网 IPv4，拒绝创建不完整 DNS。请重新选择协议或修复 IPv4。"
+  fi
+  if [[ "${IPV6_PROTOCOLS:-0}" != "0" && -z "$ip6" ]]; then
+    die "IPv6 协议已启用（IPV6_PROTOCOLS=${IPV6_PROTOCOLS:-0}），但未检测到公网 IPv6，拒绝创建不完整 DNS。请重新选择协议或修复 IPv6。"
+  fi
+}
+
+assert_deploy_stack_ready(){
+  load_state
+  detect_public_ips
+  load_state
+  local ip4="${PUBLIC_IPV4:-}" ip6="${PUBLIC_IPV6:-}"
+  [[ -n "$ip4" || -n "$ip6" ]] || die "未检测到公网 IPv4/IPv6，拒绝继续生产部署。"
+  [[ "${PROTOCOLS:-0}" != "0" ]] || die "当前 v4/v6 协议组合为空（PROTOCOLS=0），拒绝生成无入站生产配置。请重新选择协议。"
+  if [[ "${IPV4_PROTOCOLS:-0}" != "0" && -z "$ip4" ]]; then
+    die "IPv4 协议已启用但没有公网 IPv4。请重新选择协议，或先修复 IPv4。"
+  fi
+  if [[ "${IPV6_PROTOCOLS:-0}" != "0" && -z "$ip6" ]]; then
+    die "IPv6 协议已启用但没有公网 IPv6。请重新选择协议，或先修复 IPv6。"
+  fi
+  log "部署栈预检通过：IPv4=${ip4:-无} IPv6=${ip6:-无} PROTOCOLS=${PROTOCOLS:-0}"
+}
+
+create_dns_records(){
+  require_cmds curl jq
+  load_state
+  validate_state_or_regen
+  load_state
+  if [[ -z "${BASE_DOMAIN:-}" ]] || ! validate_base_domain "$BASE_DOMAIN"; then
+    configure_base_domain 1
+    load_state
+  fi
+  [[ -n "${BASE_DOMAIN:-}" ]] && validate_base_domain "$BASE_DOMAIN" || die "BASE_DOMAIN 非法，拒绝操作 DNS。"
+  [[ -n "${CF_API_TOKEN:-}" && -n "${CF_ZONE_ID:-}" ]] || setup_cloudflare
+  warn_cf_dns_exclusive_domain
+  print_domain_role_model
+  detect_public_ips
+  local ip4="${PUBLIC_IPV4:-}" ip6="${PUBLIC_IPV6:-}" mode
+
+  show_managed_dns_records
+  if managed_dns_has_records; then
+    echo
+    echo "检测到当前母域名范围内已有 A/AAAA 记录。"
+    echo "1. 刷新为当前 VPS IP，并按角色收敛 BASE/v4/v6，推荐"
+    echo "2. 复用现有 DNS，不修改任何记录，适合重复调试安装"
+    echo "3. 只清理 BASE/v4/v6 的 A/AAAA 后重新创建"
+    echo "0. 取消 DNS 操作"
+    mode=$(ask "请选择" "1")
+  else
+    mode="1"
+  fi
+
+  case "$mode" in
+    1)
+      require_public_ip_for_dns_update "$ip4" "$ip6"
+      apply_domain_role_dns_records "$ip4" "$ip6"
+      ;;
+    2)
+      warn "已选择复用现有 DNS，不修改 BASE/v4/v6 的 A/AAAA。请确认它们已指向当前 VPS。"
+      ;;
+    3)
+      require_public_ip_for_dns_update "$ip4" "$ip6"
+      warn "即将仅清理 BASE/v4/v6 三个名称下的 A/AAAA，然后按当前 VPS IP 重新创建。"
+      confirm "确认执行 DNS 清场并重建？" "N" || { warn "已取消 DNS 清场。"; return 0; }
+      delete_managed_a_aaaa_records force "$ip4" "$ip6"
+      apply_domain_role_dns_records "$ip4" "$ip6"
+      ;;
+    *)
+      warn "已取消 DNS 操作。"
+      return 0
+      ;;
+  esac
+  log "DNS 处理完成：BASE=订阅/CDN/伪装；v4=IPv4 直连 A；v6=IPv6 直连 AAAA；仅操作 A/AAAA。"
+}
+
+install_cert_deploy_hook(){
+  need_root
+  mkdir -p "$(dirname "$CERT_DEPLOY_HOOK")"
+  cat > "$CERT_DEPLOY_HOOK" <<'EOF2'
+#!/usr/bin/env bash
+# Generated by Xray Edge Manager.
+# Certbot deploy hook: sync an Xray-readable cert copy, then reload services after tests.
+set -u
+
+XRAY_CERT_BASE="/usr/local/etc/xray/certs"
+XRAY_CERT_GROUP="xray"
+
+if [[ -n "${RENEWED_LINEAGE:-}" && -d "${RENEWED_LINEAGE:-}" ]]; then
+  cert_name="$(basename "$RENEWED_LINEAGE")"
+  if getent group "$XRAY_CERT_GROUP" >/dev/null 2>&1; then
+    install -d -m 750 -o root -g "$XRAY_CERT_GROUP" "$XRAY_CERT_BASE/$cert_name" 2>/dev/null || true
+    install -m 640 -o root -g "$XRAY_CERT_GROUP" "$RENEWED_LINEAGE/fullchain.pem" "$XRAY_CERT_BASE/$cert_name/fullchain.pem" 2>/dev/null || true
+    install -m 640 -o root -g "$XRAY_CERT_GROUP" "$RENEWED_LINEAGE/privkey.pem" "$XRAY_CERT_BASE/$cert_name/privkey.pem" 2>/dev/null || true
+  fi
+fi
+
+if command -v nginx >/dev/null 2>&1; then
+  if nginx -t >/dev/null 2>&1; then
+    systemctl reload nginx >/dev/null 2>&1 || systemctl restart nginx >/dev/null 2>&1 || true
+  fi
+fi
+
+if command -v xray >/dev/null 2>&1 && [[ -f /usr/local/etc/xray/config.json ]]; then
+  if command -v runuser >/dev/null 2>&1 && id -u xray >/dev/null 2>&1; then
+    runuser -u xray -- "$(command -v xray)" run -test -config /usr/local/etc/xray/config.json >/dev/null 2>&1
+    ok=$?
+  else
+    xray run -test -config /usr/local/etc/xray/config.json >/dev/null 2>&1
+    ok=$?
+  fi
+  if [[ "$ok" -eq 0 ]]; then
+    systemctl restart xray >/dev/null 2>&1 || true
+  fi
+fi
+exit 0
+EOF2
+  chmod 755 "$CERT_DEPLOY_HOOK"
+}
+
+cert_live_fullchain(){
+  load_state
+  [[ -n "${BASE_DOMAIN:-}" ]] || return 1
+  printf '/etc/letsencrypt/live/%s/fullchain.pem' "$BASE_DOMAIN"
+}
+
+cert_live_privkey(){
+  load_state
+  [[ -n "${BASE_DOMAIN:-}" ]] || return 1
+  printf '/etc/letsencrypt/live/%s/privkey.pem' "$BASE_DOMAIN"
+}
+
+certificate_exists_for_base_domain(){
+  local cert key
+  cert="$(cert_live_fullchain 2>/dev/null || true)"
+  key="$(cert_live_privkey 2>/dev/null || true)"
+  [[ -n "$cert" && -f "$cert" && -n "$key" && -f "$key" ]]
+}
+
+certificate_days_left(){
+  local cert end_epoch now_epoch
+  cert="$(cert_live_fullchain 2>/dev/null || true)"
+  [[ -n "$cert" && -f "$cert" ]] || return 1
+  end_epoch=$(openssl x509 -enddate -noout -in "$cert" 2>/dev/null | cut -d= -f2- | xargs -I{} date -d "{}" +%s 2>/dev/null) || return 1
+  now_epoch=$(date +%s)
+  echo $(( (end_epoch - now_epoch) / 86400 ))
+}
+
+certificate_matches_base_domain(){
+  local cert san_text
+  cert="$(cert_live_fullchain 2>/dev/null || true)"
+  [[ -n "$cert" && -f "$cert" ]] || return 1
+  san_text=$(openssl x509 -noout -text -in "$cert" 2>/dev/null | tr '\n' ' ')
+  [[ "$san_text" == *"DNS:${BASE_DOMAIN}"* && "$san_text" == *"DNS:*.${BASE_DOMAIN}"* ]]
+}
+
+show_existing_certificate_info(){
+  load_state
+  local cert days end issuer subject match
+  cert="$(cert_live_fullchain 2>/dev/null || true)"
+  [[ -n "$cert" && -f "$cert" ]] || { warn "未检测到已有证书：/etc/letsencrypt/live/${BASE_DOMAIN:-}/"; return 1; }
+  days="$(certificate_days_left 2>/dev/null || echo unknown)"
+  end="$(openssl x509 -enddate -noout -in "$cert" 2>/dev/null | cut -d= -f2- || true)"
+  issuer="$(openssl x509 -issuer -noout -in "$cert" 2>/dev/null | sed 's/^issuer=//' || true)"
+  subject="$(openssl x509 -subject -noout -in "$cert" 2>/dev/null | sed 's/^subject=//' || true)"
+  if certificate_matches_base_domain; then match="是"; else match="否"; fi
+  echo "===== 已有证书信息 ====="
+  echo "路径: $cert"
+  echo "域名匹配 ${BASE_DOMAIN} 和 *.${BASE_DOMAIN}: $match"
+  echo "剩余天数: $days"
+  echo "到期时间: ${end:-unknown}"
+  echo "Issuer: ${issuer:-unknown}"
+  echo "Subject: ${subject:-unknown}"
+}
+
+issue_certificate(){
+  require_cmds certbot openssl
+  load_state
+  if [[ -z "${BASE_DOMAIN:-}" ]] || ! validate_base_domain "$BASE_DOMAIN"; then
+    warn "证书申请前检测到 BASE_DOMAIN 缺失或非法，需重新设置。"
+    configure_base_domain 1
+    load_state
+  fi
+  [[ -n "${BASE_DOMAIN:-}" ]] && validate_base_domain "$BASE_DOMAIN" || die "BASE_DOMAIN 仍非法，拒绝申请证书。"
+  [[ -n "${CF_API_TOKEN:-}" ]] || setup_cloudflare
+
+  local days default_choice c
+  if certificate_exists_for_base_domain; then
+    show_existing_certificate_info || true
+    days="$(certificate_days_left 2>/dev/null || echo -9999)"
+    default_choice="1"
+    if [[ "$days" =~ ^-?[0-9]+$ ]] && [[ "$days" -lt 15 ]]; then
+      default_choice="2"
+      warn "已有证书剩余时间不足 15 天，默认建议重新申请/续签。"
+    elif ! certificate_matches_base_domain; then
+      default_choice="2"
+      warn "已有证书不同时覆盖 ${BASE_DOMAIN} 和 *.${BASE_DOMAIN}，默认建议重新申请。"
+    else
+      info "检测到可复用证书，默认不重新申请，避免触发 Let's Encrypt 频率限制。"
+    fi
+    echo "1. 复用已有证书，只同步到 Xray 可读目录，推荐重复调试安装"
+    echo "2. 重新申请/续签证书"
+    echo "0. 跳过证书处理"
+    c=$(ask "请选择" "$default_choice")
+    case "$c" in
+      1)
+        sync_xray_certificate
+        log "已复用已有证书：/etc/letsencrypt/live/$BASE_DOMAIN/"
+        return 0
+        ;;
+      0)
+        warn "已跳过证书处理。后续 CDN XHTTP/TLS 入口可能无法工作。"
+        return 0
+        ;;
+      *)
+        info "将重新申请/续签证书。"
+        ;;
+    esac
+  fi
+
+  mkdir -p "$APP_DIR"
+  install_cert_deploy_hook
+  # SECURITY FIX: set restrictive permissions BEFORE writing sensitive content,
+  # eliminating the brief window where the file was world-readable.
+  # Also use printf instead of unquoted heredoc to avoid $-expansion bugs.
+  # RC10 HARDENING: refuse symlink credential targets before writing secrets.
+  [[ ! -L "$CF_CRED" ]] || die "拒绝写入符号链接凭据文件：$CF_CRED"
+  touch "$CF_CRED"
+  chmod 600 "$CF_CRED"
+  printf '%s\n' "dns_cloudflare_api_token = $CF_API_TOKEN" > "$CF_CRED"
+  local email
+  email=$(ask "请输入证书邮箱，留空则不绑定邮箱" "${CERT_EMAIL:-}")
+  email=$(printf '%s' "$email" | tr -d '[:space:]')
+  [[ -n "$email" ]] && save_kv "$STATE_FILE" CERT_EMAIL "$email"
+  if [[ -n "$email" ]]; then
+    certbot certonly --dns-cloudflare --dns-cloudflare-credentials "$CF_CRED" \
+      --dns-cloudflare-propagation-seconds 60 -d "$BASE_DOMAIN" -d "*.$BASE_DOMAIN" \
+      --agree-tos --non-interactive --email "$email" \
+      --deploy-hook "$CERT_DEPLOY_HOOK" || die "证书申请失败。"
+  else
+    certbot certonly --dns-cloudflare --dns-cloudflare-credentials "$CF_CRED" \
+      --dns-cloudflare-propagation-seconds 60 -d "$BASE_DOMAIN" -d "*.$BASE_DOMAIN" \
+      --agree-tos --non-interactive --register-unsafely-without-email \
+      --deploy-hook "$CERT_DEPLOY_HOOK" || die "证书申请失败。"
+  fi
+  sync_xray_certificate
+  show_existing_certificate_info || true
+  log "证书申请完成：/etc/letsencrypt/live/$BASE_DOMAIN/"
+}
+
+ensure_certificate_for_nginx(){
+  load_state
+  [[ -n "${BASE_DOMAIN:-}" ]] && validate_base_domain "$BASE_DOMAIN" || die "BASE_DOMAIN 非法，无法校验证书。"
+
+  if certificate_exists_for_base_domain && certificate_matches_base_domain; then
+    sync_xray_certificate
+    return 0
+  fi
+
+  warn "未检测到可用于 Nginx/TLS 的证书，准备申请或复用证书。"
+  issue_certificate
+  load_state
+
+  if ! certificate_exists_for_base_domain; then
+    die "未发现证书文件：/etc/letsencrypt/live/${BASE_DOMAIN}/fullchain.pem 和 privkey.pem。已停止生成 Nginx 配置，避免写入不可启动配置。"
+  fi
+  if ! certificate_matches_base_domain; then
+    die "当前证书未同时覆盖 ${BASE_DOMAIN} 和 *.${BASE_DOMAIN}。已停止生成 Nginx 配置。"
+  fi
+  sync_xray_certificate
+}
 real_target_list_by_region(){
   # Only recommend large global companies. Small provider domains (vultr, linode,
   # hetzner, ovh, digitalocean, ibm) are NOT used — they draw DPI attention.
@@ -367,6 +1892,51 @@ validate_reality_target(){
   fi
   return 0
 }
+choose_reality_target(){
+  load_state
+  local c target _asn_country="" _asn_org=""
+  if command -v asn >/dev/null 2>&1; then
+    _asn_country=$(asn -j 2>/dev/null | jq -r ".country_name // empty" 2>/dev/null || true)
+    _asn_org=$(asn -j 2>/dev/null | jq -r ".org // empty" 2>/dev/null || true)
+  elif command -v curl >/dev/null 2>&1; then
+    _asn_country=$(curl -sS --max-time 5 https://ipapi.co/country/ 2>/dev/null || true)
+    _asn_org=$(curl -sS --max-time 5 https://ipapi.co/org/ 2>/dev/null || true)
+  fi
+  real_target_list_by_region "${_asn_country:-AS}" "${_asn_org:-}"
+  echo "快速选择:"
+  echo " 1. www.ebay.com           (全球拍卖，国内可访问，证书 3.1KB)"
+  echo " 2. www.adobe.com          (Adobe 全家桶，证书 1.9KB)"
+  echo " 3. www.salesforce.com     (企业 CRM，证书 1.9KB)"
+  echo " 4. 手动输入（自动验证证书大小+黑名单）"
+  c=$(ask "请选择" "1")
+  case "$c" in
+    1) target="www.ebay.com" ;;
+    2) target="www.adobe.com" ;;
+    3) target="www.salesforce.com" ;;
+    *) target=$(ask "请输入 REALITY target 域名" "${REALITY_TARGET:-www.ebay.com}") ;;
+  esac
+  target=$(printf '%s' "$target" | tr -d '[:space:]')
+  while ! validate_hostname "$target"; do
+    warn "REALITY target 域名格式不合格：$target"
+    target=$(ask "请重新输入 REALITY target 域名" "www.ebay.com")
+    target=$(printf '%s' "$target" | tr -d '[:space:]')
+  done
+  if ! validate_reality_target "$target"; then
+    local _force=$(ask "证书过大或域名被拉黑，是否仍要使用 $target？可能无法连接 [y/N]" "N")
+    if [[ ! "$_force" =~ ^[Yy]$ ]]; then
+      warn "已取消。"; return 1
+    fi
+    warn "已强制使用 $target。"
+  fi
+  save_kv "$STATE_FILE" REALITY_TARGET "$target"
+  log "REALITY target: $target"
+}
+
+validate_x25519_key(){
+  local k="$1"
+  [[ "$k" =~ ^[A-Za-z0-9_-]{40,80}$ ]]
+}
+
 valid_uuid_literal(){
   local u="$1"
   [[ "$u" =~ ^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ ]]
@@ -518,8 +2088,8 @@ validate_state_or_regen(){
   fi
 
   if [[ -n "${REALITY_TARGET:-}" ]] && ! validate_hostname "$REALITY_TARGET"; then
-    warn "REALITY_TARGET 非法，已重置为 www.ebay.com：$REALITY_TARGET"
-    save_kv "$STATE_FILE" REALITY_TARGET "www.ebay.com"
+    warn "REALITY_TARGET 非法，已重置为 www.microsoft.com：$REALITY_TARGET"
+    save_kv "$STATE_FILE" REALITY_TARGET "www.microsoft.com"
   fi
   if [[ -n "${XHTTP_REALITY_PATH:-}" ]] && ! valid_safe_xray_path "$XHTTP_REALITY_PATH"; then
     warn "XHTTP_REALITY_PATH 非法，已重新生成。"
@@ -560,18 +2130,6 @@ generate_keys_if_needed(){
   require_cmds xray openssl
   load_state
   command -v xray >/dev/null 2>&1 || die "请先安装 Xray。"
-  # N9 fix: short-circuit if UUID + keys + paths are already valid (avoid re-running xray x25519 in tight loops)
-  if [[ -n "${UUID:-}" ]] && valid_uuid_literal "${UUID:-}" \
-     && [[ -n "${REALITY_PRIVATE_KEY:-}" ]] && [[ "${REALITY_PRIVATE_KEY:-}" =~ ^[A-Za-z0-9_-]{43,44}$ ]] \
-     && [[ -n "${REALITY_PUBLIC_KEY:-}" ]] && [[ "${REALITY_PUBLIC_KEY:-}" =~ ^[A-Za-z0-9_-]{43,44}$ ]] \
-     && [[ -n "${SHORT_ID:-}" ]] && valid_short_id "${SHORT_ID:-}" \
-     && [[ -n "${XHTTP_REALITY_PATH:-}" ]] && valid_safe_xray_path "${XHTTP_REALITY_PATH:-}" \
-     && [[ -n "${XHTTP_CDN_PATH:-}" ]] && valid_safe_xray_path "${XHTTP_CDN_PATH:-}" \
-     && [[ -n "${HY2_AUTH:-}" ]] && valid_safe_token "${HY2_AUTH:-}" \
-     && [[ -n "${SUB_TOKEN:-}" ]] \
-     && [[ -n "${MERGED_SUB_TOKEN:-}" ]]; then
-    return 0
-  fi
   if [[ -n "${UUID:-}" ]] && ! valid_uuid_literal "$UUID"; then
     warn "UUID 格式非法，已重新生成。"
     save_kv "$STATE_FILE" UUID ""
@@ -600,8 +2158,8 @@ generate_keys_if_needed(){
 
     # Fallback: extract the first two base64url-looking tokens if labels change.
     if ! validate_x25519_key "${priv:-}" || ! validate_x25519_key "${pub:-}"; then
-      first_candidate=$(printf '%s\n' "$raw_output" | grep -Eo '[A-Za-z0-9_-]{43,44}' | sed -n '1p' || true)
-      second_candidate=$(printf '%s\n' "$raw_output" | grep -Eo '[A-Za-z0-9_-]{43,44}' | sed -n '2p' || true)
+      first_candidate=$(printf '%s\n' "$raw_output" | grep -Eo '[A-Za-z0-9_-]{40,80}' | sed -n '1p' || true)
+      second_candidate=$(printf '%s\n' "$raw_output" | grep -Eo '[A-Za-z0-9_-]{40,80}' | sed -n '2p' || true)
       priv="${first_candidate:-$priv}"
       pub="${second_candidate:-$pub}"
     fi
@@ -1066,8 +2624,7 @@ generate_warp_outbound_from_warp_reg(){
   if [[ -z "${PUBLIC_IPV4:-}" ]]; then
     validate_warp_ipv6_endpoints_for_ipv6_only "$tmp_clean"
   fi
-  # R2-N1 fix: install with root:xray group + 640 so xray service user can read
-  install -m 640 -o root -g "${XRAY_GROUP:-xray}" "$tmp_clean" "$out"
+  install -m 600 "$tmp_clean" "$out"
   save_kv "$STATE_FILE" WARP_OUTBOUND_FILE "$out"
   log "已生成 Xray WARP outbound：$out"
   info "当前 WARP endpoint：$endpoint"
@@ -1295,22 +2852,6 @@ inspect_generated_xray_config(){
 
   [[ ! -s "$report" ]]
 }
-
-detect_public_ips(){
-  local ipv4 ipv6
-  ipv4=$(curl -sS --max-time 5 https://ipapi.co/ip/ 2>/dev/null || curl -sS --max-time 5 https://api.ipify.org 2>/dev/null || true)
-  ipv6=$(curl -sS --max-time 5 https://api6.ipify.org 2>/dev/null || true)
-  if [[ -n "$ipv4" ]]; then
-    save_kv "$STATE_FILE" PUBLIC_IPV4 "$ipv4"
-    [[ -n "${BASE_DOMAIN:-}" ]] && save_kv "$STATE_FILE" DOMAIN_V4 "${BASE_DOMAIN}"
-  fi
-  if [[ -n "$ipv6" ]]; then
-    save_kv "$STATE_FILE" PUBLIC_IPV6 "$ipv6"
-    [[ -n "${BASE_DOMAIN:-}" ]] && save_kv "$STATE_FILE" DOMAIN_V6 "v6.${BASE_DOMAIN}"
-  fi
-  log "公网 IP: IPv4=${ipv4:-无} IPv6=${ipv6:-无}"
-}
-
 
 generate_xray_config(){
   need_root
@@ -1587,16 +3128,8 @@ install_random_camouflage(){
   n=$((RANDOM % 9 + 1))
   zip="html${n}.zip"
   tmp=$(mktemp_dir "$APP_DIR/tmp/camouflage.XXXXXX")
-  # N4 fix: pin to a specific git ref for supply chain integrity
-  local FODDER_PINNED_BASE="${FODDER_BASE_URL}"
-  if [[ -n "${XEM_FODDER_REF:-}" ]]; then
-    FODDER_PINNED_BASE="https://raw.githubusercontent.com/mack-a/v2ray-agent/${XEM_FODDER_REF}/fodder/blog/unable"
-    info "Using pinned FODDER_BASE_URL at ref ${XEM_FODDER_REF}"
-  else
-    warn "未设置 XEM_FODDER_REF，伪装站模板下载无 commit pin，存在供应链风险。设置 XEM_FODDER_REF=<40-位SHA> 加固。"
-  fi
-  info "随机下载伪装站模板：${FODDER_PINNED_BASE}/${zip}"
-  if curl -fsSL --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time 60 -o "$tmp/$zip" "${FODDER_PINNED_BASE}/${zip}" 2>/dev/null; then
+  info "随机下载伪装站模板：v2ray-agent/fodder/blog/unable/${zip}"
+  if curl -fsSL --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time 60 -o "$tmp/$zip" "$FODDER_BASE_URL/$zip" 2>/dev/null; then
     # SECURITY: reject zip entries with absolute paths or path traversal.
     if unzip -Z1 "$tmp/$zip" 2>/dev/null | grep -qE '(^/|(^|/)\.\.(/|$))'; then
       warn "伪装站 zip 包含危险路径，已拒绝解压：${zip}"
@@ -1885,12 +3418,10 @@ add_vless_xhttp_reality_link(){
 }
 
 add_vless_xhttp_cdn_link(){
-  local server="$1" name="$2" raw="$3" port="${4:-443}" path_enc server_uri sni_host
-  # H1 fix: 5th param is sni_host (default BASE_DOMAIN). BestCF domain mode passes "$server" so SNI/Host match the optimized FQDN.
-  sni_host="${5:-$BASE_DOMAIN}"
+  local server="$1" name="$2" raw="$3" port="${4:-443}" path_enc server_uri
   server_uri=$(format_uri_host "$server")
   path_enc=$(uri_encode "$XHTTP_CDN_PATH")
-  echo "vless://${UUID}@${server_uri}:${port}?encryption=none&security=tls&sni=${sni_host}&fp=chrome&type=xhttp&host=${sni_host}&path=${path_enc}&mode=auto#$(uri_encode "$name")" >> "$raw"
+  echo "vless://${UUID}@${server_uri}:${port}?encryption=none&security=tls&sni=${BASE_DOMAIN}&fp=chrome&type=xhttp&host=${BASE_DOMAIN}&path=${path_enc}&mode=auto#$(uri_encode "$name")" >> "$raw"
 }
 
 add_reality_vision_link(){
@@ -2149,18 +3680,8 @@ ensure_bestcf_data_if_needed(){
   # If upstream data is unavailable, do not use any hardcoded third-party fallback;
   # protocol 5 will fall back to the user's own BASE_DOMAIN CDN entry.
   # 协议5必须每次刷新BestCF；协议2只有用户显式开启BESTCF_ENABLED才刷新。
-  # N10 fix: when BESTCF_ENABLED=0 AND protocol 5 not enabled, skip fetch to save bandwidth.
   if ! protocol_enabled 5 && [[ "${BESTCF_ENABLED:-0}" != "1" ]]; then
     return 0
-  fi
-  # N10 mitigation: warn if cache is older than 24h on enable (without auto-fetch)
-  local _cache_age _now
-  _now=$(date +%s)
-  if [[ -s "$BESTCF_DIR/bestcf-domain.txt" ]]; then
-    _cache_age=$(( _now - $(stat -c %Y "$BESTCF_DIR/bestcf-domain.txt" 2>/dev/null || echo "$_now") ))
-    if [[ "$_cache_age" -gt 86400 ]]; then
-      info "BestCF 本地缓存已 ${_cache_age}s 未刷新（>24h），下次 --bestcf-update 会重新拉取。"
-    fi
   fi
 
   if [[ "${BESTCF_FETCHED_THIS_RUN:-0}" == "1" ]]; then
@@ -2244,8 +3765,8 @@ regenerate_subscriptions_after_change(){
   #   /sub/$MERGED_SUB_TOKEN  = local + remotes; if no remotes exist, it equals local-only
   # This prevents first-install summaries from printing a merged subscription URL
   # that does not exist yet and would return 404.
-  generate_subscription || { warn "本机订阅自动刷新失败，请稍后手动执行菜单 14 -> 1。"; return 1; }
-  merge_remote_subscriptions || { warn "合并订阅自动刷新失败，请稍后手动执行菜单 14 -> 8。"; return 1; }
+  generate_subscription || { warn "本机订阅自动刷新失败，请稍后手动执行菜单 14 -> 1。"; return 0; }
+  merge_remote_subscriptions || warn "合并订阅自动刷新失败，请稍后手动执行菜单 14 -> 8。"
 }
 ensure_iptables(){
   command -v iptables >/dev/null 2>&1 && return 0
@@ -2356,40 +3877,26 @@ enable_hy2_hopping(){
     apt-get install -y iptables-persistent netfilter-persistent || true
     netfilter-persistent save || true
   fi
-  # N8 fix: batch the 7 KV writes into a single state-atomic update.
-  # save_kv() in current form performs 1 read + 1 write per call (N+1 stat ops).
-  # Under SIGKILL or disk-full mid-write, state.env can end up half-updated.
-  # New strategy: build a complete replacement state.env in a temp file, then mv.
-  local _hy2_state_tmp
-  _hy2_state_tmp=$(mktemp_file "$STATE_FILE.hy2.tmp.XXXXXX")
-  # Copy current state, drop existing HY2_*, then append new HY2_* atomically.
-  awk '"'"'!/^HY2_HOP_/'"'"' "$STATE_FILE" > "$_hy2_state_tmp" 2>/dev/null || true
-  {
-    echo "HY2_HOP_RANGE=$range"
-    echo "HY2_HOP_TO_PORT=$to_port"
-    if [[ "$ip4_ok" == "1" ]]; then
-      echo "HY2_HOP_V4_READY=1"
-      echo "HY2_HOP_RANGE_V4=$range"
-      echo "HY2_HOP_TO_PORT_V4=$to_port"
-    else
-      echo "HY2_HOP_V4_READY=0"
-      echo "HY2_HOP_RANGE_V4="
-      echo "HY2_HOP_TO_PORT_V4="
-    fi
-    if [[ "$ip6_ok" == "1" ]]; then
-      echo "HY2_HOP_V6_READY=1"
-      echo "HY2_HOP_RANGE_V6=$range"
-      echo "HY2_HOP_TO_PORT_V6=$to_port"
-    else
-      echo "HY2_HOP_V6_READY=0"
-      echo "HY2_HOP_RANGE_V6="
-      echo "HY2_HOP_TO_PORT_V6="
-    fi
-  } >> "$_hy2_state_tmp"
-  chmod 600 "$_hy2_state_tmp"
-  mv -f "$_hy2_state_tmp" "$STATE_FILE"
-  # Mark field as "set last" so allowed_state_key accepts them on next load
-  load_state 2>/dev/null || true
+  save_kv "$STATE_FILE" HY2_HOP_RANGE "$range"
+  save_kv "$STATE_FILE" HY2_HOP_TO_PORT "$to_port"
+  if [[ "$ip4_ok" == "1" ]]; then
+    save_kv "$STATE_FILE" HY2_HOP_V4_READY "1"
+    save_kv "$STATE_FILE" HY2_HOP_RANGE_V4 "$range"
+    save_kv "$STATE_FILE" HY2_HOP_TO_PORT_V4 "$to_port"
+  else
+    save_kv "$STATE_FILE" HY2_HOP_V4_READY "0"
+    save_kv "$STATE_FILE" HY2_HOP_RANGE_V4 ""
+    save_kv "$STATE_FILE" HY2_HOP_TO_PORT_V4 ""
+  fi
+  if [[ "$ip6_ok" == "1" ]]; then
+    save_kv "$STATE_FILE" HY2_HOP_V6_READY "1"
+    save_kv "$STATE_FILE" HY2_HOP_RANGE_V6 "$range"
+    save_kv "$STATE_FILE" HY2_HOP_TO_PORT_V6 "$to_port"
+  else
+    save_kv "$STATE_FILE" HY2_HOP_V6_READY "0"
+    save_kv "$STATE_FILE" HY2_HOP_RANGE_V6 ""
+    save_kv "$STATE_FILE" HY2_HOP_TO_PORT_V6 ""
+  fi
   if [[ "${XEM_INTERNAL_APPLY_HY2:-0}" != "1" ]]; then
     install_hy2_hopping_service
     regenerate_subscriptions_after_change
@@ -2947,17 +4454,9 @@ add_bestcf_nodes_from_file(){
   local line server port label name n=1
   [[ -s "$file" ]] || return 0
 
-  # H3 fix: shuffle the file before reading so each regen picks a different rotation
-  local shuffled
-  if command -v shuf >/dev/null 2>&1; then
-    shuffled=$(mktemp_file "${file}.shuf.XXXXXX")
-    shuf "$file" > "$shuffled"
-  else
-    shuffled="$file"
-  fi
   while IFS='|' read -r server port label _rest; do
     [[ -z "${server:-}" || "$server" =~ ^# ]] && continue
-    [[ "${!total_ref}" -ge "$total_limit" ]] && { rm -f "$shuffled"; return 0; }
+    [[ "${!total_ref}" -ge "$total_limit" ]] && return 0
 
     if [[ -z "${port:-}" || -z "${label:-}" ]]; then
       port="${CDN_PORT:-443}"
@@ -2970,20 +4469,12 @@ add_bestcf_nodes_from_file(){
 
     label="$(normalize_bestcf_label "$label" "${fallback_label}_${n}")"
     name="${NODE_NAME:-node}-${label}"
-    # H1 fix: pass $server as sni_host for domain files (bestcf-domain.txt);
-    # IP files (cmcc-ip, cucc-ip, etc.) keep default BASE_DOMAIN (CF edge IPs
-    # lack the optimized domain's TLS certificate, so domain SNI must be used).
-    if [[ "$file" == *domain* ]]; then
-      add_vless_xhttp_cdn_link "$server" "$name" "$raw" "$port" "$server"
-    else
-      add_vless_xhttp_cdn_link "$server" "$name" "$raw" "$port"
-    fi
+    add_vless_xhttp_cdn_link "$server" "$name" "$raw" "$port"
 
     n=$((n+1))
     printf -v "$total_ref" '%s' "$(( ${!total_ref} + 1 ))"
     [[ "$n" -gt "$max_each" ]] && break
-  done < "$shuffled"
-  rm -f "$shuffled"
+  done < "$file"
 }
 
 generate_bestcf_subscription_nodes(){
@@ -3041,42 +4532,6 @@ disable_bestcf_timer(){
   log "BestCF 自动更新已关闭。"
 }
 
-enable_subscription_daily_timer(){
-  install_self_to_local_bin
-  cat >/etc/systemd/system/xem-sub-regen.service <<'EOF2'
-[Unit]
-Description=Regenerate Xray Edge Manager subscription daily
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/bin/xem --subscription-regen
-EOF2
-  cat >/etc/systemd/system/xem-sub-regen.timer <<'EOF2'
-[Unit]
-Description=Daily subscription regeneration for anti-block rotation
-
-[Timer]
-OnCalendar=daily
-RandomizedDelaySec=2h
-Persistent=true
-
-[Install]
-WantedBy=timers.target
-EOF2
-  systemctl daemon-reload
-  systemctl enable --now xem-sub-regen.timer 2>/dev/null || true
-  log "订阅每日自动重生已启用（首次将在下一次 RandomizedDelay 窗口内执行）。"
-}
-
-disable_subscription_daily_timer(){
-  systemctl disable --now xem-sub-regen.timer 2>/dev/null || true
-  rm -f /etc/systemd/system/xem-sub-regen.service /etc/systemd/system/xem-sub-regen.timer
-  systemctl daemon-reload 2>/dev/null || true
-  log "订阅每日自动重生已关闭。"
-}
-
 network_status(){
   uname -a
   sysctl net.ipv4.tcp_available_congestion_control 2>/dev/null || true
@@ -3115,33 +4570,16 @@ net.ipv4.tcp_mtu_probing=1
 net.ipv4.tcp_slow_start_after_idle=0
 net.core.somaxconn=4096
 net.ipv4.tcp_max_syn_backlog=8192
-net.ipv4.ip_local_port_range=32768 65535
+net.ipv4.ip_local_port_range=1024 65535
 net.core.rmem_max=67108864
 net.core.wmem_max=67108864
 net.ipv4.tcp_rmem=4096 87380 67108864
 net.ipv4.tcp_wmem=4096 65536 67108864
 EOF2
   chmod 644 "$tmp" 2>/dev/null || true
-  # N7 fix: validate each sysctl key against kernel BEFORE committing the file.
-  # Parse the candidate tmp, run sysctl -w per line; abort cleanly on failure.
-  local -i ok=1 _sysctl_log
-  _sysctl_log=$(mktemp_file "$APP_DIR/tmp/sysctl-apply.log.XXXXXX")
-  while IFS='=' read -r key val; do
-    [[ -z "$key" || "$key" =~ ^[[:space:]]*# ]] && continue
-    key="${key// /}"
-    if ! sysctl -w "$key=$val" >>"$_sysctl_log" 2>&1; then
-      warn "sysctl -w $key=$val 被内核拒绝：详见 $_sysctl_log"
-      ok=0
-    fi
-  done < "$tmp"
-  if [[ "$ok" -ne 1 ]]; then
-    warn "sysctl 写入部分失败：保留旧 ${SYSCTL_FILE} 并丢弃候选 tmp。"
-    rm -f "$tmp"
-    if [[ -f "$SYSCTL_FILE" ]]; then sysctl -p "$SYSCTL_FILE" >/dev/null 2>&1 || true; fi
-    return 1
-  fi
   mv -f "$tmp" "$SYSCTL_FILE"
-  log "已应用稳定型网络优化（所有键已通过内核验证）。"
+  sysctl --system >/dev/null || warn "sysctl --system 返回非零；请用菜单 5 查看当前状态。"
+  log "已应用稳定型网络优化。"
 }
 
 restore_network_tuning(){
@@ -3372,291 +4810,6 @@ deployment_healthcheck(){
   fi
 }
 
-install_deps(){
-  need_root
-  info "安装/更新系统依赖..."
-  local pkgs=""
-  if command -v apt-get >/dev/null 2>&1; then
-    apt-get update -qq || true
-    pkgs="curl wget unzip tar xz-utils qrencode jq openssl iptables dnsutils net-tools lsof"
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq $pkgs 2>&1 | tail -5 || warn "部分软件包安装失败，请手动检查。"
-  elif command -v yum >/dev/null 2>&1; then
-    pkgs="curl wget unzip tar qrencode jq openssl iptables bind-utils net-tools lsof"
-    yum install -y -q $pkgs 2>&1 | tail -3 || warn "部分软件包安装失败，请手动检查。"
-  else
-    warn "无法识别的包管理器，请手动安装依赖：curl wget unzip tar jq openssl"
-  fi
-  log "系统依赖检查完成。"
-}
-
-install_or_upgrade_xray(){
-  local mode="${XEM_XRAY_INSTALL_MODE:-}" arch
-  arch=$(uname -m)
-  case "$arch" in aarch64|arm64) arch="arm64" ;; x86_64|amd64) arch="64" ;; *) arch="64" ;; esac
-  if [[ -z "$mode" ]]; then
-    echo "请选择安装方式："; echo "1. 官方脚本（推荐）"; echo "2. 直接下载"
-    mode=$(ask "请选择" "1")
-  fi
-  case "$mode" in
-    1|release)
-      bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install 2>&1 | tail -5 || die "Xray 安装失败。"
-      ;;
-    2|direct)
-      local ver=$(curl -fsSL https://api.github.com/repos/XTLS/Xray-core/releases/latest | grep '"tag_name"' | cut -d'"' -f4 || echo "v26.6.27")
-      ver="${ver#v}"
-      local tmp_dir=$(mktemp_dir "$APP_DIR/tmp/xray-install.XXXXXX")
-      cd "$tmp_dir"
-      curl -fsSL -o xray.zip "https://github.com/XTLS/Xray-core/releases/download/v${ver}/Xray-linux-${arch}-v8a.zip" 2>&1 | tail -3 || die "下载失败。"
-      unzip -oq xray.zip
-      install -m 755 xray /usr/local/bin/xray
-      install -m 644 geoip.dat /usr/local/share/xray/ 2>/dev/null || true
-      install -m 644 geosite.dat /usr/local/share/xray/ 2>/dev/null || true
-      cd / && rm -rf "$tmp_dir"
-      ;;
-  esac
-  command -v xray >/dev/null 2>&1 && log "Xray $(xray version|head -1) 安装成功。" || die "Xray 安装失败。"
-}
-
-update_geodata(){
-  info "更新 geoip.dat / geosite.dat..."
-  local geo_dir="/usr/local/share/xray"
-  mkdir -p "$geo_dir"
-  curl -fsSL -o "$geo_dir/geoip.dat" "https://github.com/v2fly/geoip/releases/latest/download/geoip.dat" 2>&1 | tail -1 || warn "geoip.dat 下载失败。"
-  curl -fsSL -o "$geo_dir/geosite.dat" "https://github.com/v2fly/domain-list-community/releases/latest/download/dlc.dat" 2>&1 | tail -1 || warn "geosite.dat 下载失败。"
-  [[ -f "$geo_dir/geosite.dat" ]] && mv -f "$geo_dir/geosite.dat" "$geo_dir/geosite.dat" 2>/dev/null || true
-  log "geoip.dat / geosite.dat 更新完成。"
-}
-
-setup_cloudflare(){
-  need_root; load_state
-  if [[ -n "${CF_API_TOKEN:-}" && -n "${CF_ZONE_ID:-}" ]]; then
-    local verify
-    verify=$(curl -fsS -H "Authorization: Bearer $CF_API_TOKEN" "https://api.cloudflare.com/client/v4/user/tokens/verify" 2>&1)
-    if echo "$verify" | grep -q '"success":true'; then log "Cloudflare 配置有效。"; else die "CF API Token 验证失败。"; fi
-  else
-    if [[ -z "${CF_API_TOKEN:-}" ]]; then
-      CF_API_TOKEN=$(ask "请输入 Cloudflare API Token (Zone:DNS:Edit 权限)" "")
-      save_kv "$STATE_FILE" CF_API_TOKEN "$CF_API_TOKEN"
-    fi
-    if [[ -z "${CF_ZONE_ID:-}" ]]; then
-      local zone=""
-      while [[ -z "$zone" ]]; do
-        local suggest="" domain
-        # 从 BASE_DOMAIN 自动提取根域名(如 jparm.0x0000.top → 0x0000.top)
-        if [[ -n "${BASE_DOMAIN:-}" ]]; then
-          local parts; IFS='.' read -ra parts <<< "$BASE_DOMAIN"
-          if [[ "${#parts[@]}" -ge 2 ]]; then
-            suggest="${parts[-2]}.${parts[-1]}"
-          fi
-        fi
-        echo ""
-        echo "========== Cloudflare 域名说明 =========="
-        echo "这里需要填 Cloudflare 上的 DNS zone 名称(根域名),不是刚才的母域名。"
-        echo "母域名: ${BASE_DOMAIN:-未设置}"
-        echo "根域名: ${suggest:-请填写}"
-        echo "示例: 如果母域名是 jparm.0x0000.top,根域名就是 0x0000.top"
-        echo "============================================="
-        echo ""
-        domain=$(ask "请输入 Cloudflare 根域名(zone)" "${suggest:-}")
-        zone=$(curl -fsS -H "Authorization: Bearer $CF_API_TOKEN" "https://api.cloudflare.com/client/v4/zones?name=$domain" 2>&1)
-        CF_ZONE_ID=$(echo "$zone" | jq -r '.result[0].id // empty' 2>/dev/null)
-        if [[ -z "$CF_ZONE_ID" ]]; then
-          warn "未找到域名 $domain 的 zone。"
-          echo "请检查:"
-          echo "  1. 域名 $domain 是否已添加到 Cloudflare (NS 指向 CF)"
-          echo "  2. API Token 是否有该 zone 的 Zone:DNS:Edit 权限"
-          echo "  3. 如果母域名是 $BASE_DOMAIN,根域名应该是 ${suggest:-xx},不是 $BASE_DOMAIN"
-        else
-          save_kv "$STATE_FILE" CF_ZONE_ID "$CF_ZONE_ID"
-          log "已找到 zone: $domain (ID: ${CF_ZONE_ID:0:12}...)"
-        fi
-      done
-    fi
-    log "Cloudflare 配置完成。"
-  fi
-}
-
-configure_node_name(){
-  load_state
-  if [[ -z "${NODE_NAME:-}" ]]; then
-    local default="${BASE_DOMAIN%%.*}"
-    NODE_NAME=$(ask "节点名称" "$default")
-    save_kv "$STATE_FILE" NODE_NAME "$NODE_NAME"
-  fi
-  log "节点名称: $NODE_NAME"
-}
-
-select_one_stack_protocols(){
-  local label="$1" current="$2" default_mode="$3" mode normalized
-  echo >&2
-  echo "===== ${label} 协议组合选择 =====" >&2
-  echo "0. 不生成 ${label} 节点" >&2
-  echo "1. ${label} VLESS + XHTTP + REALITY，直连，默认主力" >&2
-  echo "2. ${label} VLESS + XHTTP + TLS + CDN，CDN 隐藏，使用母域名" >&2
-  echo "3. ${label} Xray Hysteria2，UDP 高速备用，实验" >&2
-  echo "4. ${label} VLESS + REALITY + Vision，可选直连备用" >&2
-  echo "5. ${label} VLESS + XHTTP + TLS + CDN 入口扩展，复用 CDN 入站，可配合 BestCF/优选域名/域名前置" >&2
-  echo "可以输入组合，例如 123、13、23、1234；直接回车 = 使用方括号里的默认/当前值。" >&2
-  mode=$(ask "请选择 ${label} 协议组合（0/1/2/3/4/5 或组合）" "${current:-$default_mode}")
-  normalized=$(normalize_stack_protocols "$mode")
-  echo "$normalized"
-}
-build_default_protocols_from_stack_strategy(){
-  load_state
-  local p=""
-  [[ "${IPV4_PROTOCOLS:-0}" == *1* || "${IPV6_PROTOCOLS:-0}" == *1* ]] && p="${p}1"
-  [[ "${IPV4_PROTOCOLS:-0}" == *2* || "${IPV6_PROTOCOLS:-0}" == *2* ]] && p="${p}2"
-  [[ "${IPV4_PROTOCOLS:-0}" == *3* || "${IPV6_PROTOCOLS:-0}" == *3* ]] && p="${p}3"
-  [[ "${IPV4_PROTOCOLS:-0}" == *4* || "${IPV6_PROTOCOLS:-0}" == *4* ]] && p="${p}4"
-  [[ "${IPV4_PROTOCOLS:-0}" == *5* || "${IPV6_PROTOCOLS:-0}" == *5* ]] && p="${p}5"
-  [[ -z "$p" ]] && p="0"
-  echo "$p"
-}
-select_ip_stack_strategy(){
-  load_state
-  local ip4 ip6 v4_protos v6_protos default_p
-  detect_public_ips
-  ip4="${PUBLIC_IPV4:-}"
-  ip6="${PUBLIC_IPV6:-}"
-
-  echo
-  echo "===== IPv4 / IPv6 独立协议组合 ====="
-  echo "IPv4 和 IPv6 各自输入协议组合，例如 IPv4=123，IPv6=13。"
-  echo "0=不生成该栈节点；1=XHTTP+REALITY直连；2=XHTTP+TLS+CDN；3=Hysteria2 UDP；4=REALITY+Vision；5=CDN/BestCF入口扩展。"
-  echo "直接按回车会使用方括号里的默认/当前值。"
-
-  if [[ -n "$ip4" ]]; then
-    v4_protos=$(select_one_stack_protocols "IPv4" "${IPV4_PROTOCOLS:-}" "123")
-    save_kv "$STATE_FILE" IPV4_PROTOCOLS "$v4_protos"
-  else
-    save_kv "$STATE_FILE" IPV4_PROTOCOLS "0"
-    warn "未检测到 IPv4，IPv4 协议组合设为 0。"
-  fi
-  if [[ -n "$ip6" ]]; then
-    v6_protos=$(select_one_stack_protocols "IPv6" "${IPV6_PROTOCOLS:-}" "123")
-    save_kv "$STATE_FILE" IPV6_PROTOCOLS "$v6_protos"
-  else
-    save_kv "$STATE_FILE" IPV6_PROTOCOLS "0"
-    warn "未检测到 IPv6，IPv6 协议组合设为 0。"
-  fi
-  default_p=$(build_default_protocols_from_stack_strategy)
-  save_kv "$STATE_FILE" PROTOCOLS "$default_p"
-  if [[ "$default_p" == *2* || "$default_p" == *5* ]]; then save_kv "$STATE_FILE" ENABLE_CDN "1"; else save_kv "$STATE_FILE" ENABLE_CDN "0"; fi
-  log "协议策略已保存：IPv4=${v4_protos:-0} IPv6=${v6_protos:-0} 实际需要=${default_p}"
-}
-select_protocols(){
-  load_state
-  local p port
-  p=$(build_default_protocols_from_stack_strategy)
-  save_kv "$STATE_FILE" PROTOCOLS "$p"
-  echo ""
-  echo "========== 协议组合说明 =========="
-  echo "1=XHTTP+REALITY直连  2=XHTTP+TLS+CDN(自己域名)"
-  echo "3=Hysteria2 UDP       4=REALITY+Vision"
-  echo "5=BestCF优选CDN(优选域名/IP,不占自己域名)"
-  echo ""
-  echo "组合示例: 123=全部三协议, 125=REALITY+CDN+BestCF"
-  echo "         15=只有REALITY和BestCF, 23=只有CDN+HY2"
-  echo "当前 IPv4 组合: ${IPV4_PROTOCOLS:-123}  IPv6: ${IPV6_PROTOCOLS:-0}"
-  echo "================================="
-  echo ""
-
-  if [[ "$p" == *2* || "$p" == *5* ]]; then
-    save_kv "$STATE_FILE" ENABLE_CDN "1"
-    port=$(ask "CDN/订阅/伪装站 HTTPS 端口 (443/2053/2083/2087/2096/8443)" "${CDN_PORT:-443}")
-    valid_port "$port" || die "端口无效。"
-    is_cf_https_port "$port" || die "端口必须是 Cloudflare 可代理端口。"
-    save_kv "$STATE_FILE" CDN_PORT "$port"
-    CDN_PORT="$port"
-  else
-    save_kv "$STATE_FILE" ENABLE_CDN "0"
-    port=$(ask "订阅/伪装站 HTTPS 端口 (直连用)" "${CDN_PORT:-443}")
-    valid_port "$port" || die "端口无效。"
-    is_cf_https_port "$port" || die "订阅端口必须是 Cloudflare 可代理端口。"
-    save_kv "$STATE_FILE" CDN_PORT "$port"
-    CDN_PORT="$port"
-  fi
-
-  # 协议 5 = BestCF 优选 CDN
-  if [[ "$p" == *5* ]]; then
-    if [[ "${BESTCF_ENABLED:-0}" != "1" ]]; then
-      save_kv "$STATE_FILE" BESTCF_ENABLED "1"
-      save_kv "$STATE_FILE" BESTCF_MODE "domain"
-      save_kv "$STATE_FILE" BESTCF_PER_CATEGORY_LIMIT "1"
-      save_kv "$STATE_FILE" BESTCF_TOTAL_LIMIT "1"
-      log "BestCF 已自动开启：生成 1 个优选域名节点。"
-    fi
-  fi
-
-  if [[ "$p" == *1* ]]; then
-    port=$(ask "XHTTP+REALITY 直连 TCP 端口 (推荐 2443,不能等于 ${CDN_PORT:-443})" "${XHTTP_REALITY_PORT:-2443}")
-    valid_port "$port" || die "端口无效。"
-    [[ "$port" != "${CDN_PORT:-443}" ]] || die "端口 ${CDN_PORT:-443} 需留给 Nginx 订阅。"
-    save_kv "$STATE_FILE" XHTTP_REALITY_PORT "$port"
-  fi
-
-  if [[ "$p" == *4* ]]; then
-    port=$(ask "REALITY+Vision 直连 TCP 端口 (推荐 3443)" "${REALITY_VISION_PORT:-3443}")
-    valid_port "$port" || die "端口无效。"
-    [[ "$port" != "${CDN_PORT:-443}" ]] || die "端口 ${CDN_PORT:-443} 需留给 Nginx 订阅。"
-    save_kv "$STATE_FILE" REALITY_VISION_PORT "$port"
-  fi
-
-  if [[ "$p" == *3* ]]; then
-    port=$(ask "Hysteria2 UDP 监听端口 (推荐 443,可与 Nginx TCP 443 共存)" "${HY2_PORT:-443}")
-    valid_port "$port" || die "端口无效。"
-    save_kv "$STATE_FILE" HY2_PORT "$port"
-  fi
-
-  log "协议组合: $p (CDN端口=${CDN_PORT:-443}, BestCF=${BESTCF_ENABLED:-0})"
-}
-
-is_cf_https_port(){
-  local p="$1" x
-  for x in $CF_HTTPS_PORTS; do [[ "$p" == "$x" ]] && return 0; done
-  return 1
-}
-validate_hostname(){
-  local h="$1" len="${#1}"
-  [[ "$len" -ge 1 && "$len" -le 253 ]] || return 1
-  [[ "$h" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] || return 1
-  [[ "$h" != *".."* && "$h" != ".-"* && "$h" != "-."* && "$h" != *"." ]] || return 1
-  local p; IFS='.' read -ra p <<< "$h"
-  for part in "${p[@]}"; do
-    [[ "$part" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$ ]] || return 1
-  done
-  return 0
-}
-
-
-prepare_base_domain_for_install(){
-  need_root; load_state
-  if [[ -z "${BASE_DOMAIN:-}" ]]; then
-    local domain
-    echo ""
-    echo "========== 母域名说明 =========="
-    echo "母域名(BASE_DOMAIN)是节点的主域名,脚本会自动派生子域名:"
-    echo "  BASE_DOMAIN         → 订阅/CDN入口 (你填的域名)"
-    echo "  v4.BASE_DOMAIN      → IPv4 直连入口"
-    echo "  v6.BASE_DOMAIN      → IPv6 直连入口"
-    echo "示例: 如果你有域名叫 example.com 托管在 Cloudflare,"
-    echo "      母域名可以填 node.example.com 或 jparm.0x0000.top"
-    echo "      要求: 该域名(或母域名)必须在 Cloudflare 有 DNS zone。"
-    echo "============================================"
-    echo ""
-    domain=$(ask "请输入母域名 (如 jparm.0x0000.top)" "")
-
-    while ! validate_hostname "$domain"; do
-      warn "母域名格式不正确，请输入完整域名(如 jparm.0x0000.top)。"
-      domain=$(ask "请重新输入母域名" "")
-    done
-    save_kv "$STATE_FILE" BASE_DOMAIN "$domain"
-    BASE_DOMAIN="$domain"
-    load_state
-  fi
-  log "BASE_DOMAIN=$BASE_DOMAIN"
-}
-
 install_full(){
   need_root
   install_deps
@@ -3709,18 +4862,6 @@ add_remote_subscription(){
   url=$(ask "请输入远程 base64 订阅 URL" "")
   [[ -n "$url" ]] || { warn "URL 为空，取消。"; return 0; }
   ensure_remotes_file
-  # N2 fix: validate URL format before writing (avoid | injection + http:// bypass)
-  if [[ ! "$url" =~ ^https://[A-Za-z0-9._-]+(:[0-9]+)?(/[^|[:cntrl:]]*)?$ ]]; then
-    err "URL 非法：必须是 https:// 开头、无 '|' 无控制字符。"
-    return 1
-  fi
-  # Reject userinfo in authority
-  local _authority="${url#https://}"
-  _authority="${_authority%%/*}"
-  if [[ "$_authority" == *@* ]]; then
-    err "URL 包含 userinfo，拒绝。"
-    return 1
-  fi
   echo "${name}|${url}" >> "$REMOTES_FILE"
   log "已添加远程订阅：$name"
 }
@@ -3941,10 +5082,6 @@ merge_remote_subscriptions(){
   load_state
   generate_keys_if_needed
   load_state
-  # N9 fix: validate state after key generation to catch stale/illegal tokens
-  # before writing them into subscription files (merge path was missing this vs generate_subscription).
-  validate_state_or_regen
-  load_state
   mkdir -p "$SUB_DIR" "$WEB_ROOT/sub"
   [[ -f "$SUB_DIR/local.raw" ]] || generate_subscription
   ensure_remotes_file
@@ -4043,13 +5180,6 @@ merge_remote_subscriptions(){
 
     local filtered_file
     filtered_file="$(mktemp_file "$SUB_DIR/remote-filtered.XXXXXX")"
-    # N3 helper: inline cleanup before any continue
-    _merge_cleanup() {
-      [[ -f "${fetch_file:-}" ]] && rm -f "$fetch_file" || true
-      [[ -f "${decoded_file:-}" ]] && rm -f "$decoded_file" || true
-      [[ -z "${normalized_b64_file:-}" ]] || [[ -f "$normalized_b64_file" ]] && rm -f "$normalized_b64_file" 2>/dev/null || true
-      [[ -f "${filtered_file:-}" ]] && rm -f "$filtered_file" || true
-    }
     filter_subscription_lines "$decoded_file" "$filtered_file"
     if [[ ! -s "$filtered_file" ]]; then
       warn "远程订阅没有可识别的代理链接，已跳过：$name"
@@ -4057,12 +5187,6 @@ merge_remote_subscriptions(){
     fi
     cat "$filtered_file" >> "$remote_raw"
     echo >> "$remote_raw"
-    # N3 fix: per-iteration cleanup to avoid inode leak on SIGKILL (EXIT trap is bypassed).
-    # Best-effort unlink; success is not critical because GLOBAL_TEMP_FILES covers normal exit.
-    [[ -f "$fetch_file" ]] && rm -f "$fetch_file" || true
-    [[ -f "$decoded_file" ]] && rm -f "$decoded_file" || true
-    [[ -f "$normalized_b64_file" ]] && rm -f "$normalized_b64_file" || true
-    [[ -f "$filtered_file" ]] && rm -f "$filtered_file" || true
   done < "$REMOTES_FILE"
 
   cat "$SUB_DIR/local.raw" "$remote_raw" 2>/dev/null | sed '/^$/d' | awk '!seen[$0]++' > "$merged"
@@ -4292,12 +5416,9 @@ full_uninstall_xem(){
   systemctl stop nginx 2>/dev/null || true
   systemctl disable --now xem-bestcf-update.timer xem-geodata-update.timer 2>/dev/null || true
   systemctl disable --now xem-hy2-hopping.service xem-cf-origin-firewall.service 2>/dev/null || true
-  # R2-01 fix: also disable the subscription-daily timer + service files (added by H4 patch)
-  disable_subscription_daily_timer 2>/dev/null || true
   rm -f /etc/systemd/system/xem-bestcf-update.service /etc/systemd/system/xem-bestcf-update.timer
   rm -f /etc/systemd/system/xem-geodata-update.service /etc/systemd/system/xem-geodata-update.timer
   rm -f /etc/systemd/system/xem-hy2-hopping.service /etc/systemd/system/xem-cf-origin-firewall.service
-  rm -f /etc/systemd/system/xem-sub-regen.service /etc/systemd/system/xem-sub-regen.timer
   rm -f "$CERT_DEPLOY_HOOK" /etc/logrotate.d/xray 2>/dev/null || true
   XEM_SKIP_SUB_REGEN=1 remove_hy2_hopping_rules || true
   disable_cf_origin_firewall || true
@@ -4391,8 +5512,6 @@ main_menu(){
     echo "20. 卸载 / 清理"
     echo "21. WARP 出站管理 / 自动生成 warp-outbound.json"
     echo "22. 部署后生产自检"
-    echo "23. 启用订阅每日自动重生（systemd daily timer）"
-    echo "24. 关闭订阅每日自动重生"
     echo "0. 退出"
     local c; c=$(ask "请选择" "0")
     case "$c" in
@@ -4430,8 +5549,6 @@ main_menu(){
       20) uninstall_menu ;;
       21) warp_outbound_menu ;;
       22) deployment_healthcheck; pause ;;
-      23) enable_subscription_daily_timer; pause ;;
-      24) disable_subscription_daily_timer; pause ;;
       0) exit 0 ;;
       *) warn "无效选择。" ;;
     esac
@@ -4504,111 +5621,8 @@ case "${1:-}" in
     generate_warp_outbound_from_warp_reg 0
     exit 0
     ;;
-  --subscription-regen)
-    need_root
-    acquire_lock
-    load_state
-    # H4 fix: re-detect public IPs before regen so VM IP change is reflected
-    if [[ -n "${BASE_DOMAIN:-}" ]]; then
-      detect_public_ips
-      load_state
-      save_kv "$STATE_FILE" LAST_SUBSCRIPTION_REGEN "$(date -Iseconds)"
-    fi
-    if ! regenerate_subscriptions_after_change; then
-      warn "subscription-regen 远程订阅更新失败，将在下一个定时触发 (daily timer) 重试。"
-    fi
-    exit 0
-    ;;
 esac
-
-valid_port(){
-  local p="$1"
-  [[ "$p" =~ ^[0-9]+$ && "$p" -ge 1 && "$p" -le 65535 ]]
-}
-..." ipv6="${IPV6_ENABLED:-0}"
-  if [[ -z "${IPV4_ENABLED:-}" ]]; then
-    ipv4=$(ask "是否启用 IPv4? [Y/n]" "Y")
-    [[ "$ipv4" =~ ^[Nn] ]] && ipv4=0 || ipv4=1
-  fi
-  if [[ -z "${IPV6_ENABLED:-}" ]]; then
-    ipv6=$(ask "是否启用 IPv6? [Y/n]" "$([[ "$ipv6" == "1" ]] && echo Y || echo n)")
-    [[ "$ipv6" =~ ^[Yy] ]] && ipv6=1 || ipv6=0
-  fi
-  save_kv "$STATE_FILE" IPV4_ENABLED "$ipv4"
-  save_kv "$STATE_FILE" IPV6_ENABLED "$ipv6"
-  log "IP 栈策略: IPv4=$([[ $ipv4 == 1 ]] && echo ON || echo OFF) IPv6=$([[ $ipv6 == 1 ]] && echo ON || echo OFF)"
-}
-
-assert_deploy_stack_ready(){
-  load_state
-  local missing=""
-  [[ -n "${BASE_DOMAIN:-}" ]] || missing+=" BASE_DOMAIN"
-  [[ -n "${CF_API_TOKEN:-}" ]] || missing+=" CF_API_TOKEN"
-  [[ -n "${CF_ZONE_ID:-}" ]] || missing+=" CF_ZONE_ID"
-  [[ -n "${NODE_NAME:-}" ]] || missing+=" NODE_NAME"
-  [[ -n "${IPV4_PROTOCOLS:-}" || -n "${IPV6_PROTOCOLS:-}" ]] || missing+=" PROTOCOLS"
-  [[ -z "$missing" ]] || die "缺少必要配置:$missing，请先完成前期配置步骤。"
-  log "部署就绪检查通过。"
-}
-
-create_dns_records(){
-  need_root; load_state
-  [[ -n "${CF_API_TOKEN:-}" && -n "${CF_ZONE_ID:-}" ]] || die "请先配置 Cloudflare。"
-  local base="${BASE_DOMAIN:-}" ipv4="${PUBLIC_IPV4:-}" ipv6="${PUBLIC_IPV6:-}"
-  [[ -n "$base" ]] || base="${DOMAIN_V4:-}"
-
-  for record in "$base:proxy:true" "v4.$base:proxy:false"; do
-    local name="${record%%:*}" rest="${record#*:}" proxied="${rest#*:}"
-    local content=""
-    if echo "$name" | grep -q "^v4"; then content="$ipv4"; else content="$ipv4"; fi
-    [[ -z "$content" ]] && { warn "跳过 $name: 无 IP"; continue; }
-    local json; json=$(cat <<EOF
-{"type":"A","name":"$name","content":"$content","proxied":$proxied}
-EOF
-)
-    curl -fsS -X POST "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/dns_records"       -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json"       -d "$json" >/dev/null 2>&1       && log "DNS A $name -> $content (proxy=$proxied)"       || warn "DNS $name 创建失败。"
-  done
-
-  if [[ -n "$ipv6" ]]; then
-    local v6name="${DOMAIN_V6:-v6.$base}"
-    local json6; json6=$(cat <<EOF
-{"type":"AAAA","name":"$v6name","content":"$ipv6","proxied":false}
-EOF
-)
-    curl -fsS -X POST "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/dns_records"       -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json"       -d "$json6" >/dev/null 2>&1       && log "DNS AAAA $v6name -> $ipv6"       || warn "DNS AAAA $v6name 创建失败。"
-  fi
-}
-
-issue_certificate(){
-  need_root; load_state
-  local base="${BASE_DOMAIN:-}" email="${CERT_EMAIL:-admin@${base:-example.com}}"
-  [[ -n "$base" ]] || die "未设置母域名。"
-  if ! command -v certbot >/dev/null 2>&1; then
-    info "安装 certbot..."
-    if command -v apt-get >/dev/null 2>&1; then
-      apt-get install -y certbot python3-certbot-dns-cloudflare 2>&1 | tail -3
-    elif command -v yum >/dev/null 2>&1; then
-      yum install -y certbot python3-certbot-dns-cloudflare 2>&1 | tail -3
-    fi
-  fi
-  local cf_ini="/root/.cloudflare/cloudflare.ini"
-  mkdir -p "$(dirname "$cf_ini")" && chmod 700 "$(dirname "$cf_ini")"
-  echo "dns_cloudflare_api_token = $CF_API_TOKEN" > "$cf_ini"
-  chmod 600 "$cf_ini"
-
-  certbot certonly --dns-cloudflare --dns-cloudflare-credentials "$cf_ini"     -d "$base" -d "*.$base" --non-interactive --agree-tos -m "$email" 2>&1 | tail -5 || {
-    warn "证书申请失败，请手动运行：certbot certonly --dns-cloudflare ..."
-    return 1
-  }
-  local cert_dir="/etc/letsencrypt/live/$base"
-  local xray_cert_dir="/usr/local/etc/xray/certs/$base"
-  mkdir -p "$xray_cert_dir"
-  install -m 644 "$cert_dir/fullchain.pem" "$xray_cert_dir/"
-  install -m 644 "$cert_dir/privkey.pem" "$xray_cert_dir/"
-  log "SSL 证书已签发: $base + *.$base"
-}
 
 need_root
 acquire_lock
 main_menu "$@"
-
