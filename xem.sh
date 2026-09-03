@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Xray Edge Manager / Xray Anti-Block Manager
-# v0.0.38-antigfw — HY2 proxy-masquerade + Salamander + BBR; hop 20000-20499; extra REALITY shortIds
+# v0.0.39-mihomo — Meta/Alpha client: xhttp reuse-settings (XMUX), padding, packet-encoding xudp
 #
 # Features:
 # - Xray-core only, no Docker, no sing-box
@@ -2993,14 +2993,14 @@ EOF2
   if protocol_enabled 1; then
     if [[ -n "$bind_ip4" && "${IPV4_PROTOCOLS:-0}" == *1* ]]; then
       append_json_obj "$in_tmp" first_in <<EOF2
-    {"tag":"in-v4-xhttp-reality","listen":"${bind_ip4}","port":${XHTTP_REALITY_PORT},"protocol":"vless","settings":{"clients":[{"id":"${UUID}","email":"v4-xhttp-reality"}],"decryption":"none"},"streamSettings":{"method":"xhttp","network":"xhttp","security":"reality","xhttpSettings":{"path":"${XHTTP_REALITY_PATH}","mode":"auto"},"realitySettings":{"show":false,"dest":"${REALITY_TARGET}:443","target":"${REALITY_TARGET}:443","serverNames":["${REALITY_TARGET}"],"privateKey":"${REALITY_PRIVATE_KEY}","shortIds":["${SHORT_ID}","${SHORT_ID_B}","${SHORT_ID_C}"]}}}
+    {"tag":"in-v4-xhttp-reality","listen":"${bind_ip4}","port":${XHTTP_REALITY_PORT},"protocol":"vless","settings":{"clients":[{"id":"${UUID}","email":"v4-xhttp-reality"}],"decryption":"none"},"streamSettings":{"method":"xhttp","network":"xhttp","security":"reality","xhttpSettings":{"path":"${XHTTP_REALITY_PATH}","mode":"auto","extra":{"xPaddingBytes":"100-1000","noSSEHeader":true}},"realitySettings":{"show":false,"dest":"${REALITY_TARGET}:443","target":"${REALITY_TARGET}:443","serverNames":["${REALITY_TARGET}"],"privateKey":"${REALITY_PRIVATE_KEY}","shortIds":["${SHORT_ID}","${SHORT_ID_B}","${SHORT_ID_C}"]}}}
 EOF2
       v4_xhttp_ready=1
       [[ "$bind" == "1" ]] && append_route_for_inbound "$route_tmp" first_route "in-v4-xhttp-reality" "v4" "$outbound_mode"
     fi
     if [[ -n "$bind_ip6" && "${IPV6_PROTOCOLS:-0}" == *1* ]]; then
       append_json_obj "$in_tmp" first_in <<EOF2
-    {"tag":"in-v6-xhttp-reality","listen":"${bind_ip6}","port":${XHTTP_REALITY_PORT},"protocol":"vless","settings":{"clients":[{"id":"${UUID}","email":"v6-xhttp-reality"}],"decryption":"none"},"streamSettings":{"method":"xhttp","network":"xhttp","security":"reality","xhttpSettings":{"path":"${XHTTP_REALITY_PATH}","mode":"auto"},"realitySettings":{"show":false,"dest":"${REALITY_TARGET}:443","target":"${REALITY_TARGET}:443","serverNames":["${REALITY_TARGET}"],"privateKey":"${REALITY_PRIVATE_KEY}","shortIds":["${SHORT_ID}","${SHORT_ID_B}","${SHORT_ID_C}"]}}}
+    {"tag":"in-v6-xhttp-reality","listen":"${bind_ip6}","port":${XHTTP_REALITY_PORT},"protocol":"vless","settings":{"clients":[{"id":"${UUID}","email":"v6-xhttp-reality"}],"decryption":"none"},"streamSettings":{"method":"xhttp","network":"xhttp","security":"reality","xhttpSettings":{"path":"${XHTTP_REALITY_PATH}","mode":"auto","extra":{"xPaddingBytes":"100-1000","noSSEHeader":true}},"realitySettings":{"show":false,"dest":"${REALITY_TARGET}:443","target":"${REALITY_TARGET}:443","serverNames":["${REALITY_TARGET}"],"privateKey":"${REALITY_PRIVATE_KEY}","shortIds":["${SHORT_ID}","${SHORT_ID_B}","${SHORT_ID_C}"]}}}
 EOF2
       v6_xhttp_ready=1
       [[ "$bind" == "1" ]] && append_route_for_inbound "$route_tmp" first_route "in-v6-xhttp-reality" "v6" "$outbound_mode"
@@ -3009,7 +3009,7 @@ EOF2
 
   if protocol_enabled 2 || protocol_enabled 5; then
     append_json_obj "$in_tmp" first_in <<EOF2
-    {"tag":"in-xhttp-cdn-local","listen":"127.0.0.1","port":${XHTTP_CDN_LOCAL_PORT},"protocol":"vless","settings":{"clients":[{"id":"${UUID}","email":"xhttp-cdn"}],"decryption":"none"},"streamSettings":{"method":"xhttp","network":"xhttp","security":"none","xhttpSettings":{"path":"${XHTTP_CDN_PATH}","mode":"auto"}}}
+    {"tag":"in-xhttp-cdn-local","listen":"127.0.0.1","port":${XHTTP_CDN_LOCAL_PORT},"protocol":"vless","settings":{"clients":[{"id":"${UUID}","email":"xhttp-cdn"}],"decryption":"none"},"streamSettings":{"method":"xhttp","network":"xhttp","security":"none","xhttpSettings":{"path":"${XHTTP_CDN_PATH}","mode":"auto","extra":{"xPaddingBytes":"100-1000","noSSEHeader":true}}}}
 EOF2
     cdn_xhttp_ready=1
     [[ "$bind" == "1" ]] && append_route_for_inbound "$route_tmp" first_route "in-xhttp-cdn-local" "cdn" "$outbound_mode"
@@ -3469,7 +3469,7 @@ add_vless_xhttp_reality_link(){
   local server="$1" name="$2" raw="$3" path_enc server_uri
   server_uri=$(format_uri_host "$server")
   path_enc=$(uri_encode "$XHTTP_REALITY_PATH")
-  echo "vless://${UUID}@${server_uri}:${XHTTP_REALITY_PORT}?encryption=none&security=reality&sni=${REALITY_TARGET}&fp=chrome&pbk=${REALITY_PUBLIC_KEY}&sid=${SHORT_ID}&type=xhttp&path=${path_enc}&mode=auto#$(uri_encode "$name")" >> "$raw"
+  echo "vless://${UUID}@${server_uri}:${XHTTP_REALITY_PORT}?encryption=none&security=reality&sni=${REALITY_TARGET}&fp=chrome&pbk=${REALITY_PUBLIC_KEY}&sid=${SHORT_ID}&type=xhttp&path=${path_enc}&mode=auto&packetEncoding=xudp#$(uri_encode "$name")" >> "$raw"
 }
 
 add_vless_xhttp_cdn_link(){
@@ -3478,13 +3478,13 @@ add_vless_xhttp_cdn_link(){
   sni_host="${5:-$BASE_DOMAIN}"
   server_uri=$(format_uri_host "$server")
   path_enc=$(uri_encode "$XHTTP_CDN_PATH")
-  echo "vless://${UUID}@${server_uri}:${port}?encryption=none&security=tls&sni=${sni_host}&fp=chrome&type=xhttp&host=${sni_host}&path=${path_enc}&mode=auto#$(uri_encode "$name")" >> "$raw"
+  echo "vless://${UUID}@${server_uri}:${port}?encryption=none&security=tls&sni=${sni_host}&fp=chrome&type=xhttp&host=${sni_host}&path=${path_enc}&mode=auto&packetEncoding=xudp#$(uri_encode "$name")" >> "$raw"
 }
 
 add_reality_vision_link(){
   local server="$1" name="$2" raw="$3" server_uri
   server_uri=$(format_uri_host "$server")
-  echo "vless://${UUID}@${server_uri}:${REALITY_VISION_PORT}?encryption=none&security=reality&sni=${REALITY_TARGET}&fp=chrome&pbk=${REALITY_PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&flow=xtls-rprx-vision#$(uri_encode "$name")" >> "$raw"
+  echo "vless://${UUID}@${server_uri}:${REALITY_VISION_PORT}?encryption=none&security=reality&sni=${REALITY_TARGET}&fp=chrome&pbk=${REALITY_PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&flow=xtls-rprx-vision&packetEncoding=xudp#$(uri_encode "$name")" >> "$raw"
 }
 
 hy2_hop_range_for_stack(){
@@ -3595,7 +3595,7 @@ generate_mihomo_reference(){
   local f="$SUB_DIR/mihomo-reference.yaml"
   cat > "$f" <<EOF2
 # 仅供参考：对外订阅仍只发布 base64。
-# 建议使用 Clash Verge Rev / Mihomo 新版内核测试 XHTTP。
+# 面向 Mihomo 开发板/Alpha（需支持 xhttp-opts.reuse-settings）。不要叠加 smux。
 proxies:
 EOF2
   if protocol_enabled 1; then
@@ -3612,7 +3612,9 @@ EOF2
     client-fingerprint: chrome
     alpn:
       - h2
-    encryption: ""
+    encryption: "none"
+    packet-encoding: xudp
+    flow: ""
     network: xhttp
     reality-opts:
       public-key: ${REALITY_PUBLIC_KEY}
@@ -3620,6 +3622,10 @@ EOF2
     xhttp-opts:
       mode: auto
       path: ${XHTTP_REALITY_PATH}
+      reuse-settings:
+        max-concurrency: "16-32"
+        c-max-reuse-times: "0"
+        h-max-reusable-secs: "1800-3000"
 EOF2
     fi
     if [[ -n "${PUBLIC_IPV6:-}" && "${IPV6_PROTOCOLS:-0}" == *1* ]] && node_ready V6_XHTTP_REALITY_READY; then
@@ -3635,7 +3641,9 @@ EOF2
     client-fingerprint: chrome
     alpn:
       - h2
-    encryption: ""
+    encryption: "none"
+    packet-encoding: xudp
+    flow: ""
     network: xhttp
     reality-opts:
       public-key: ${REALITY_PUBLIC_KEY}
@@ -3643,6 +3651,10 @@ EOF2
     xhttp-opts:
       mode: auto
       path: ${XHTTP_REALITY_PATH}
+      reuse-settings:
+        max-concurrency: "16-32"
+        c-max-reuse-times: "0"
+        h-max-reusable-secs: "1800-3000"
 EOF2
     fi
   fi
@@ -3660,12 +3672,18 @@ EOF2
     client-fingerprint: chrome
     alpn:
       - h2
-    encryption: ""
+    encryption: "none"
+    packet-encoding: xudp
+    flow: ""
     network: xhttp
     xhttp-opts:
       host: ${BASE_DOMAIN}
       mode: auto
       path: ${XHTTP_CDN_PATH}
+      reuse-settings:
+        max-concurrency: "16-32"
+        c-max-reuse-times: "0"
+        h-max-reusable-secs: "1800-3000"
 EOF2
   fi
 
@@ -3682,12 +3700,18 @@ EOF2
     client-fingerprint: chrome
     alpn:
       - h2
-    encryption: ""
+    encryption: "none"
+    packet-encoding: xudp
+    flow: ""
     network: xhttp
     xhttp-opts:
       host: ${BASE_DOMAIN}
       mode: auto
       path: ${XHTTP_CDN_PATH}
+      reuse-settings:
+        max-concurrency: "16-32"
+        c-max-reuse-times: "0"
+        h-max-reusable-secs: "1800-3000"
 EOF2
   fi
 
@@ -3710,7 +3734,7 @@ EOF2
       hop_range_v4="$(hy2_hop_range_for_stack v4)"
       [[ -n "$hop_range_v4" ]] && cat >> "$f" <<EOF2
     ports: ${hop_range_v4/:/-}
-    hop-interval: 10
+    hop-interval: "10-30"
 EOF2
     fi
     if [[ -n "${PUBLIC_IPV6:-}" && "${IPV6_PROTOCOLS:-0}" == *3* ]] && node_ready V6_HY2_READY; then
@@ -3731,7 +3755,7 @@ EOF2
       hop_range_v6="$(hy2_hop_range_for_stack v6)"
       [[ -n "$hop_range_v6" ]] && cat >> "$f" <<EOF2
     ports: ${hop_range_v6/:/-}
-    hop-interval: 10
+    hop-interval: "10-30"
 EOF2
     fi
   fi
@@ -3748,7 +3772,8 @@ EOF2
     tls: true
     servername: ${REALITY_TARGET}
     client-fingerprint: chrome
-    encryption: ""
+    encryption: "none"
+    packet-encoding: xudp
     network: tcp
     flow: xtls-rprx-vision
     reality-opts:
@@ -3767,7 +3792,8 @@ EOF2
     tls: true
     servername: ${REALITY_TARGET}
     client-fingerprint: chrome
-    encryption: ""
+    encryption: "none"
+    packet-encoding: xudp
     network: tcp
     flow: xtls-rprx-vision
     reality-opts:
@@ -5599,7 +5625,7 @@ main_menu(){
   load_state
   while true; do
     echo
-    echo "===== Xray Edge Manager v0.0.38-antigfw ====="
+    echo "===== Xray Edge Manager v0.0.39-mihomo ====="
     echo "1. 首次部署向导，推荐"
     echo "2. 安装/升级基础依赖"
     echo "3. 安装/升级 Xray-core"

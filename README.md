@@ -2,7 +2,7 @@
 
 一键在 VPS 上部署 **Xray-core 边缘抗封锁节点**：REALITY 直连 + Cloudflare CDN 中转 + Xray Hysteria2 (HY2) + BestCF 优选入口 + Nginx 伪装站/订阅 + 可选 WARP 出站。
 
-当前脚本版本：`v0.0.38-antigfw`（仓库入口脚本一般为 `xem.sh`）。
+当前脚本版本：`v0.0.39-mihomo`（仓库入口脚本一般为 `xem.sh`）。
 
 ---
 
@@ -220,7 +220,7 @@ REALITY_BLACKLIST=("www.microsoft.com" "microsoft.com" "login.microsoftonline.co
 | Vision | `type=tcp`，`flow=xtls-rprx-vision`，`security=reality` | Meta 常规 REALITY+Vision 支持 |
 | HY2 | `hysteria2://`，`alpn=h3`，可选 `mport` 跳跃 | 客户端需 **Hysteria2** 实现；**旧 Clash 内核不够** |
 
-建议客户端：**Clash Verge Rev / Mihomo（新版 meta 内核）**、v2rayN / sing-box 等已跟进 xhttp 与 HY2 的版本。  
+建议客户端：**Mihomo 开发板/Alpha**（xhttp `reuse-settings` / XMUX）。Clash Verge Rev 选开发板内核。不要给 XHTTP 节点叠 smux。v2rayN / sing-box 仍可用通用订阅，但 XMUX 字段以 Mihomo 参考 YAML 为准。  
 本脚本 **不使用 WebSocket(ws)** 作为主传输；CDN 与直连主力均为 **xhttp**。
 
 ---
