@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Xray Edge Manager / Xray Anti-Block Manager
-# v0.0.36-rc22-production-ready — strict BASE/v4/v6 DNS role model, cert reuse, GitHub Raw safe run, WARP auto generation, production preflight/postflight
+# v0.0.37-xray26 — align generated JSON/share-links to Xray-core 26.x (method + HY2 users), keep BASE/v4/v6 DNS roles
 #
 # Features:
 # - Xray-core only, no Docker, no sing-box
@@ -45,7 +45,7 @@ trap 'cleanup_and_exit 143' TERM
 APP_DIR="/root/.xray-edge-manager"
 STATE_FILE="$APP_DIR/state.env"
 # REALITY_BLACKLIST: domains whose TLS cert chains exceed 8192-byte xray REALITY buffer
-REALITY_BLACKLIST=("www.microsoft.com" "microsoft.com" "login.microsoftonline.com")
+REALITY_BLACKLIST=("www.microsoft.com" "microsoft.com" "login.microsoftonline.com" "www.apple.com" "apple.com" "icloud.com" "www.icloud.com")
 CF_ENV="$APP_DIR/cloudflare.env"
 CF_CRED="$APP_DIR/cloudflare.ini"
 SUB_DIR="$APP_DIR/subscription"
@@ -183,11 +183,29 @@ mktemp_dir(){
 }
 
 acquire_lock(){
+  # 清理已退出进程留下的锁文件，避免菜单被永久挡住。
+  local _lock_pid _retry=0
+  while [[ $_retry -lt 2 ]]; do
+    _lock_pid=""
+    if [[ -f "$LOCK_FILE" ]]; then
+      _lock_pid=$(head -n1 "$LOCK_FILE" 2>/dev/null || true)
+      _lock_pid="${_lock_pid//[[:space:]]/}"
+    fi
+    if [[ -n "$_lock_pid" ]] && ! kill -0 "$_lock_pid" 2>/dev/null; then
+      warn "检测到僵尸锁 (PID $_lock_pid 已退出)，自动清理。"
+      : > "$LOCK_FILE"
+      _retry=$((_retry + 1))
+      continue
+    fi
+    break
+  done
   exec 9>"$LOCK_FILE"
   if ! flock -n 9; then
     err "检测到另一个 xray-edge-manager 实例正在运行，请稍后再试。"
     exit 1
   fi
+  : > "$LOCK_FILE"
+  printf '%s\n' "$$" >&9
 }
 
 allowed_state_key(){
@@ -210,7 +228,7 @@ allowed_state_key(){
     BESTCF_ENABLED|BESTCF_MODE|BESTCF_PER_CATEGORY_LIMIT|BESTCF_TOTAL_LIMIT)
       return 0
       ;;
-    HY2_HOP_RANGE|HY2_HOP_TO_PORT|HY2_HOP_RANGE_V4|HY2_HOP_RANGE_V6|HY2_HOP_TO_PORT_V4|HY2_HOP_TO_PORT_V6|HY2_HOP_V4_READY|HY2_HOP_V6_READY|ENABLE_CF_ORIGIN_FIREWALL)
+    HY2_HOP_RANGE|HY2_HOP_TO_PORT|HY2_HOP_RANGE_V4|HY2_HOP_RANGE_V6|HY2_HOP_TO_PORT_V4|HY2_HOP_TO_PORT_V6|HY2_HOP_V4_READY|HY2_HOP_V6_READY|ENABLE_CF_ORIGIN_FIREWALL|LAST_BESTCF_UPDATE|LAST_HY2_ATOMIC_UPDATE)
       return 0
       ;;
     LAST_XRAY_BACKUP|LAST_NGINX_BACKUP|LAST_SYSCTL_BACKUP)
@@ -811,11 +829,11 @@ install_or_upgrade_xray_release_verified(){
     -o "$release_json" "$XRAY_CORE_RELEASE_API?per_page=50" || die "获取 Xray-core 官方 Release 列表失败。"
 
   local allow_prerelease release_filter
-  allow_prerelease="${XEM_XRAY_ALLOW_PRERELEASE:-1}"
+  allow_prerelease="${XEM_XRAY_ALLOW_PRERELEASE:-0}"
   [[ "$allow_prerelease" == "1" ]] || allow_prerelease=0
   if [[ "$allow_prerelease" == "1" ]]; then
     release_filter='map(select(.draft|not))'
-    warn "Xray-core 安装允许官方 prerelease：用于跟进最新 Xray 抗审查协议特性；仍会使用官方 .dgst 校验 ZIP。"
+    warn "Xray-core 安装允许官方 prerelease（XEM_XRAY_ALLOW_PRERELEASE=1）：用于跟进最新协议；默认安装最新稳定版并校验官方 .dgst。"
   else
     release_filter='map(select((.draft|not) and (.prerelease|not)))'
   fi
@@ -1886,8 +1904,15 @@ validate_reality_target(){
   domain="${lower_target%%:*}"
   for bl in "${REALITY_BLACKLIST[@]}"; do
     lower_bl=$(printf '%s' "$bl" | tr '[:upper:]' '[:lower:]')
-    [[ "$lower_target" == "$lower_bl" ]] && { warn "$domain 在黑名单中(证书 >8192)", return 1; }
+    [[ "$lower_target" == "$lower_bl" || "$domain" == "$lower_bl" ]] && { warn "$domain 在黑名单中（证书过大或官方 REALITY 警告目标）"; return 1; }
   done
+  # 与 Xray-core REALITY 启动警告一致：apple/icloud/microsoft 以及 .cn/.ru/.ir 易导致 IP 被封。
+  if [[ "$domain" == *apple* || "$domain" == *icloud* || "$domain" == *microsoft* ]]; then
+    warn "$domain 属于 Apple/iCloud/Microsoft，Xray 官方警告易被 GFW 针对。"; return 1
+  fi
+  if [[ "$domain" == *.cn || "$domain" == *.ru || "$domain" == *.ir ]]; then
+    warn "$domain 使用 .cn/.ru/.ir，Xray 官方警告易被 GFW 针对。"; return 1
+  fi
   if command -v openssl >/dev/null 2>&1; then
     bytes_in_cert=$(echo | timeout 8 openssl s_client -connect "${domain}:443" -servername "$domain" -showcerts 2>/dev/null       | sed -n "/BEGIN CERTIFICATE/,/END CERTIFICATE/p" | wc -c 2>/dev/null || true)
     if [[ -z "$bytes_in_cert" || "$bytes_in_cert" -eq 0 ]]; then
@@ -1944,7 +1969,8 @@ choose_reality_target(){
 
 validate_x25519_key(){
   local k="$1"
-  [[ "$k" =~ ^[A-Za-z0-9_-]{40,80}$ ]]
+  # X25519 32 字节的 base64url 长度为 43（无填充）或 44（有填充）。
+  [[ "$k" =~ ^[A-Za-z0-9_-]{43,44}$ ]]
 }
 
 valid_uuid_literal(){
@@ -2164,12 +2190,12 @@ generate_keys_if_needed(){
 
     # Prefer semantic labels, because xray output wording is more stable than line numbers.
     priv=$(printf '%s\n' "$raw_output" | grep -iE 'Private[ _-]?key|PrivateKey|Seed' | awk -F':' '{print $2}' | tr -d '[:space:]' | head -n1 || true)
-    pub=$(printf '%s\n' "$raw_output" | grep -iE 'Public[ _-]?key|PublicKey|Password|Client' | awk -F':' '{print $2}' | tr -d '[:space:]' | head -n1 || true)
+    pub=$(printf '%s\n' "$raw_output" | grep -iE 'Password \(PublicKey\)|Public[ _-]?key|PublicKey|Password|Client' | awk -F':' '{print $2}' | tr -d '[:space:]' | head -n1 || true)
 
     # Fallback: extract the first two base64url-looking tokens if labels change.
     if ! validate_x25519_key "${priv:-}" || ! validate_x25519_key "${pub:-}"; then
-      first_candidate=$(printf '%s\n' "$raw_output" | grep -Eo '[A-Za-z0-9_-]{40,80}' | sed -n '1p' || true)
-      second_candidate=$(printf '%s\n' "$raw_output" | grep -Eo '[A-Za-z0-9_-]{40,80}' | sed -n '2p' || true)
+      first_candidate=$(printf '%s\n' "$raw_output" | grep -Eo '[A-Za-z0-9_-]{43,44}' | sed -n '1p' || true)
+      second_candidate=$(printf '%s\n' "$raw_output" | grep -Eo '[A-Za-z0-9_-]{43,44}' | sed -n '2p' || true)
       priv="${first_candidate:-$priv}"
       pub="${second_candidate:-$pub}"
     fi
@@ -2634,7 +2660,7 @@ generate_warp_outbound_from_warp_reg(){
   if [[ -z "${PUBLIC_IPV4:-}" ]]; then
     validate_warp_ipv6_endpoints_for_ipv6_only "$tmp_clean"
   fi
-  install -m 600 "$tmp_clean" "$out"
+  install -m 640 -o root -g "${XRAY_GROUP:-xray}" "$tmp_clean" "$out"
   save_kv "$STATE_FILE" WARP_OUTBOUND_FILE "$out"
   log "已生成 Xray WARP outbound：$out"
   info "当前 WARP endpoint：$endpoint"
@@ -2948,14 +2974,14 @@ EOF2
   if protocol_enabled 1; then
     if [[ -n "$bind_ip4" && "${IPV4_PROTOCOLS:-0}" == *1* ]]; then
       append_json_obj "$in_tmp" first_in <<EOF2
-    {"tag":"in-v4-xhttp-reality","listen":"${bind_ip4}","port":${XHTTP_REALITY_PORT},"protocol":"vless","settings":{"clients":[{"id":"${UUID}","email":"v4-xhttp-reality"}],"decryption":"none"},"streamSettings":{"network":"xhttp","security":"reality","xhttpSettings":{"path":"${XHTTP_REALITY_PATH}","mode":"auto"},"realitySettings":{"show":false,"dest":"${REALITY_TARGET}:443","serverNames":["${REALITY_TARGET}"],"privateKey":"${REALITY_PRIVATE_KEY}","shortIds":["${SHORT_ID}"]}}}
+    {"tag":"in-v4-xhttp-reality","listen":"${bind_ip4}","port":${XHTTP_REALITY_PORT},"protocol":"vless","settings":{"clients":[{"id":"${UUID}","email":"v4-xhttp-reality"}],"decryption":"none"},"streamSettings":{"method":"xhttp","network":"xhttp","security":"reality","xhttpSettings":{"path":"${XHTTP_REALITY_PATH}","mode":"auto"},"realitySettings":{"show":false,"dest":"${REALITY_TARGET}:443","target":"${REALITY_TARGET}:443","serverNames":["${REALITY_TARGET}"],"privateKey":"${REALITY_PRIVATE_KEY}","shortIds":["${SHORT_ID}"]}}}
 EOF2
       v4_xhttp_ready=1
       [[ "$bind" == "1" ]] && append_route_for_inbound "$route_tmp" first_route "in-v4-xhttp-reality" "v4" "$outbound_mode"
     fi
     if [[ -n "$bind_ip6" && "${IPV6_PROTOCOLS:-0}" == *1* ]]; then
       append_json_obj "$in_tmp" first_in <<EOF2
-    {"tag":"in-v6-xhttp-reality","listen":"${bind_ip6}","port":${XHTTP_REALITY_PORT},"protocol":"vless","settings":{"clients":[{"id":"${UUID}","email":"v6-xhttp-reality"}],"decryption":"none"},"streamSettings":{"network":"xhttp","security":"reality","xhttpSettings":{"path":"${XHTTP_REALITY_PATH}","mode":"auto"},"realitySettings":{"show":false,"dest":"${REALITY_TARGET}:443","serverNames":["${REALITY_TARGET}"],"privateKey":"${REALITY_PRIVATE_KEY}","shortIds":["${SHORT_ID}"]}}}
+    {"tag":"in-v6-xhttp-reality","listen":"${bind_ip6}","port":${XHTTP_REALITY_PORT},"protocol":"vless","settings":{"clients":[{"id":"${UUID}","email":"v6-xhttp-reality"}],"decryption":"none"},"streamSettings":{"method":"xhttp","network":"xhttp","security":"reality","xhttpSettings":{"path":"${XHTTP_REALITY_PATH}","mode":"auto"},"realitySettings":{"show":false,"dest":"${REALITY_TARGET}:443","target":"${REALITY_TARGET}:443","serverNames":["${REALITY_TARGET}"],"privateKey":"${REALITY_PRIVATE_KEY}","shortIds":["${SHORT_ID}"]}}}
 EOF2
       v6_xhttp_ready=1
       [[ "$bind" == "1" ]] && append_route_for_inbound "$route_tmp" first_route "in-v6-xhttp-reality" "v6" "$outbound_mode"
@@ -2964,7 +2990,7 @@ EOF2
 
   if protocol_enabled 2 || protocol_enabled 5; then
     append_json_obj "$in_tmp" first_in <<EOF2
-    {"tag":"in-xhttp-cdn-local","listen":"127.0.0.1","port":${XHTTP_CDN_LOCAL_PORT},"protocol":"vless","settings":{"clients":[{"id":"${UUID}","email":"xhttp-cdn"}],"decryption":"none"},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"path":"${XHTTP_CDN_PATH}","mode":"auto"}}}
+    {"tag":"in-xhttp-cdn-local","listen":"127.0.0.1","port":${XHTTP_CDN_LOCAL_PORT},"protocol":"vless","settings":{"clients":[{"id":"${UUID}","email":"xhttp-cdn"}],"decryption":"none"},"streamSettings":{"method":"xhttp","network":"xhttp","security":"none","xhttpSettings":{"path":"${XHTTP_CDN_PATH}","mode":"auto"}}}
 EOF2
     cdn_xhttp_ready=1
     [[ "$bind" == "1" ]] && append_route_for_inbound "$route_tmp" first_route "in-xhttp-cdn-local" "cdn" "$outbound_mode"
@@ -2973,14 +2999,14 @@ EOF2
   if protocol_enabled 3; then
     if [[ -n "$bind_ip4" && "${IPV4_PROTOCOLS:-0}" == *3* ]]; then
       append_json_obj "$in_tmp" first_in <<EOF2
-    {"tag":"in-v4-hysteria2-udp","listen":"${bind_ip4}","port":${HY2_PORT},"protocol":"hysteria","settings":{"version":2,"clients":[{"auth":"${HY2_AUTH}","email":"v4-hy2"}]},"streamSettings":{"network":"hysteria","security":"tls","tlsSettings":{"alpn":["h3"],"certificates":[{"certificateFile":"${XRAY_CERT_DIR}/${BASE_DOMAIN}/fullchain.pem","keyFile":"${XRAY_CERT_DIR}/${BASE_DOMAIN}/privkey.pem"}]},"hysteriaSettings":{"version":2,"auth":"${HY2_AUTH}","udpIdleTimeout":60}}}
+    {"tag":"in-v4-hysteria2-udp","listen":"${bind_ip4}","port":${HY2_PORT},"protocol":"hysteria","settings":{"version":2,"users":[{"auth":"${HY2_AUTH}","email":"v4-hy2"}]},"streamSettings":{"method":"hysteria","network":"hysteria","security":"tls","tlsSettings":{"alpn":["h3"],"certificates":[{"certificateFile":"${XRAY_CERT_DIR}/${BASE_DOMAIN}/fullchain.pem","keyFile":"${XRAY_CERT_DIR}/${BASE_DOMAIN}/privkey.pem"}]},"hysteriaSettings":{"version":2,"auth":"${HY2_AUTH}","udpIdleTimeout":60,"masquerade":{"type":"string","content":"Not Found","statusCode":404,"headers":{"content-type":"text/plain; charset=utf-8"}}}}}
 EOF2
       v4_hy2_ready=1
       [[ "$bind" == "1" ]] && append_route_for_inbound "$route_tmp" first_route "in-v4-hysteria2-udp" "v4" "$outbound_mode"
     fi
     if [[ -n "$bind_ip6" && "${IPV6_PROTOCOLS:-0}" == *3* ]]; then
       append_json_obj "$in_tmp" first_in <<EOF2
-    {"tag":"in-v6-hysteria2-udp","listen":"${bind_ip6}","port":${HY2_PORT},"protocol":"hysteria","settings":{"version":2,"clients":[{"auth":"${HY2_AUTH}","email":"v6-hy2"}]},"streamSettings":{"network":"hysteria","security":"tls","tlsSettings":{"alpn":["h3"],"certificates":[{"certificateFile":"${XRAY_CERT_DIR}/${BASE_DOMAIN}/fullchain.pem","keyFile":"${XRAY_CERT_DIR}/${BASE_DOMAIN}/privkey.pem"}]},"hysteriaSettings":{"version":2,"auth":"${HY2_AUTH}","udpIdleTimeout":60}}}
+    {"tag":"in-v6-hysteria2-udp","listen":"${bind_ip6}","port":${HY2_PORT},"protocol":"hysteria","settings":{"version":2,"users":[{"auth":"${HY2_AUTH}","email":"v6-hy2"}]},"streamSettings":{"method":"hysteria","network":"hysteria","security":"tls","tlsSettings":{"alpn":["h3"],"certificates":[{"certificateFile":"${XRAY_CERT_DIR}/${BASE_DOMAIN}/fullchain.pem","keyFile":"${XRAY_CERT_DIR}/${BASE_DOMAIN}/privkey.pem"}]},"hysteriaSettings":{"version":2,"auth":"${HY2_AUTH}","udpIdleTimeout":60,"masquerade":{"type":"string","content":"Not Found","statusCode":404,"headers":{"content-type":"text/plain; charset=utf-8"}}}}}
 EOF2
       v6_hy2_ready=1
       [[ "$bind" == "1" ]] && append_route_for_inbound "$route_tmp" first_route "in-v6-hysteria2-udp" "v6" "$outbound_mode"
@@ -2990,14 +3016,14 @@ EOF2
   if protocol_enabled 4; then
     if [[ -n "$bind_ip4" && "${IPV4_PROTOCOLS:-0}" == *4* ]]; then
       append_json_obj "$in_tmp" first_in <<EOF2
-    {"tag":"in-v4-reality-vision","listen":"${bind_ip4}","port":${REALITY_VISION_PORT},"protocol":"vless","settings":{"clients":[{"id":"${UUID}","flow":"xtls-rprx-vision","email":"v4-reality-vision"}],"decryption":"none"},"streamSettings":{"network":"raw","security":"reality","realitySettings":{"show":false,"dest":"${REALITY_TARGET}:443","serverNames":["${REALITY_TARGET}"],"privateKey":"${REALITY_PRIVATE_KEY}","shortIds":["${SHORT_ID}"]}}}
+    {"tag":"in-v4-reality-vision","listen":"${bind_ip4}","port":${REALITY_VISION_PORT},"protocol":"vless","settings":{"clients":[{"id":"${UUID}","flow":"xtls-rprx-vision","email":"v4-reality-vision"}],"decryption":"none"},"streamSettings":{"method":"raw","network":"raw","security":"reality","realitySettings":{"show":false,"dest":"${REALITY_TARGET}:443","target":"${REALITY_TARGET}:443","serverNames":["${REALITY_TARGET}"],"privateKey":"${REALITY_PRIVATE_KEY}","shortIds":["${SHORT_ID}"]}}}
 EOF2
       v4_vision_ready=1
       [[ "$bind" == "1" ]] && append_route_for_inbound "$route_tmp" first_route "in-v4-reality-vision" "v4" "$outbound_mode"
     fi
     if [[ -n "$bind_ip6" && "${IPV6_PROTOCOLS:-0}" == *4* ]]; then
       append_json_obj "$in_tmp" first_in <<EOF2
-    {"tag":"in-v6-reality-vision","listen":"${bind_ip6}","port":${REALITY_VISION_PORT},"protocol":"vless","settings":{"clients":[{"id":"${UUID}","flow":"xtls-rprx-vision","email":"v6-reality-vision"}],"decryption":"none"},"streamSettings":{"network":"raw","security":"reality","realitySettings":{"show":false,"dest":"${REALITY_TARGET}:443","serverNames":["${REALITY_TARGET}"],"privateKey":"${REALITY_PRIVATE_KEY}","shortIds":["${SHORT_ID}"]}}}
+    {"tag":"in-v6-reality-vision","listen":"${bind_ip6}","port":${REALITY_VISION_PORT},"protocol":"vless","settings":{"clients":[{"id":"${UUID}","flow":"xtls-rprx-vision","email":"v6-reality-vision"}],"decryption":"none"},"streamSettings":{"method":"raw","network":"raw","security":"reality","realitySettings":{"show":false,"dest":"${REALITY_TARGET}:443","target":"${REALITY_TARGET}:443","serverNames":["${REALITY_TARGET}"],"privateKey":"${REALITY_PRIVATE_KEY}","shortIds":["${SHORT_ID}"]}}}
 EOF2
       v6_vision_ready=1
       [[ "$bind" == "1" ]] && append_route_for_inbound "$route_tmp" first_route "in-v6-reality-vision" "v6" "$outbound_mode"
@@ -3428,10 +3454,12 @@ add_vless_xhttp_reality_link(){
 }
 
 add_vless_xhttp_cdn_link(){
-  local server="$1" name="$2" raw="$3" port="${4:-443}" path_enc server_uri
+  local server="$1" name="$2" raw="$3" port="${4:-443}" path_enc server_uri sni_host
+  # 第 5 参数为 SNI/Host；BestCF 域名模式传入优选 FQDN，使其与证书/回源主机一致。
+  sni_host="${5:-$BASE_DOMAIN}"
   server_uri=$(format_uri_host "$server")
   path_enc=$(uri_encode "$XHTTP_CDN_PATH")
-  echo "vless://${UUID}@${server_uri}:${port}?encryption=none&security=tls&sni=${BASE_DOMAIN}&fp=chrome&type=xhttp&host=${BASE_DOMAIN}&path=${path_enc}&mode=auto#$(uri_encode "$name")" >> "$raw"
+  echo "vless://${UUID}@${server_uri}:${port}?encryption=none&security=tls&sni=${sni_host}&fp=chrome&type=xhttp&host=${sni_host}&path=${path_enc}&mode=auto#$(uri_encode "$name")" >> "$raw"
 }
 
 add_reality_vision_link(){
@@ -3508,7 +3536,7 @@ node_ready(){
       jq -e --arg tag "$tag" --arg auth "${HY2_AUTH:-}" --argjson port "${HY2_PORT}" '
           .inbounds[]?
           | select(.tag == $tag and .port == $port)
-          | select(any(.settings.clients[]?; .auth == $auth))
+          | select(any((.settings.users // .settings.clients // [])[]?; .auth == $auth))
         ' "$XRAY_CONFIG" >/dev/null 2>&1
       ;;
     V4_VISION_READY|V6_VISION_READY)
@@ -3552,7 +3580,7 @@ EOF2
       cat >> "$f" <<EOF2
   - name: ${NODE_NAME:-node}-v4-XHTTP-REALITY
     type: vless
-    server: ${PUBLIC_IPV4}
+    server: v4.${BASE_DOMAIN}
     port: ${XHTTP_REALITY_PORT}
     uuid: ${UUID}
     udp: true
@@ -3575,7 +3603,7 @@ EOF2
       cat >> "$f" <<EOF2
   - name: ${NODE_NAME:-node}-v6-XHTTP-REALITY
     type: vless
-    server: ${PUBLIC_IPV6}
+    server: v6.${BASE_DOMAIN}
     port: ${XHTTP_REALITY_PORT}
     uuid: ${UUID}
     udp: true
@@ -3645,7 +3673,7 @@ EOF2
       cat >> "$f" <<EOF2
   - name: ${NODE_NAME:-node}-v4-HY2-UDP${HY2_PORT:-443}
     type: hysteria2
-    server: ${PUBLIC_IPV4}
+    server: v4.${BASE_DOMAIN}
     port: ${HY2_PORT:-443}
     password: ${HY2_AUTH}
     sni: ${BASE_DOMAIN}
@@ -3664,7 +3692,7 @@ EOF2
       cat >> "$f" <<EOF2
   - name: ${NODE_NAME:-node}-v6-HY2-UDP${HY2_PORT:-443}
     type: hysteria2
-    server: ${PUBLIC_IPV6}
+    server: v6.${BASE_DOMAIN}
     port: ${HY2_PORT:-443}
     password: ${HY2_AUTH}
     sni: ${BASE_DOMAIN}
@@ -3686,7 +3714,7 @@ EOF2
       cat >> "$f" <<EOF2
   - name: ${NODE_NAME:-node}-v4-REALITY-Vision
     type: vless
-    server: ${PUBLIC_IPV4}
+    server: v4.${BASE_DOMAIN}
     port: ${REALITY_VISION_PORT}
     uuid: ${UUID}
     udp: true
@@ -3705,7 +3733,7 @@ EOF2
       cat >> "$f" <<EOF2
   - name: ${NODE_NAME:-node}-v6-REALITY-Vision
     type: vless
-    server: ${PUBLIC_IPV6}
+    server: v6.${BASE_DOMAIN}
     port: ${REALITY_VISION_PORT}
     uuid: ${UUID}
     udp: true
@@ -3759,8 +3787,8 @@ generate_subscription(){
   : > "$raw"
 
   if protocol_enabled 1; then
-    [[ -n "${PUBLIC_IPV4:-}" && "${IPV4_PROTOCOLS:-0}" == *1* ]] && node_ready V4_XHTTP_REALITY_READY && add_vless_xhttp_reality_link "${PUBLIC_IPV4}" "${NODE_NAME:-node}-v4-XHTTP-REALITY" "$raw"
-    [[ -n "${PUBLIC_IPV6:-}" && "${IPV6_PROTOCOLS:-0}" == *1* ]] && node_ready V6_XHTTP_REALITY_READY && add_vless_xhttp_reality_link "${PUBLIC_IPV6}" "${NODE_NAME:-node}-v6-XHTTP-REALITY" "$raw"
+    [[ -n "${PUBLIC_IPV4:-}" && "${IPV4_PROTOCOLS:-0}" == *1* ]] && node_ready V4_XHTTP_REALITY_READY && add_vless_xhttp_reality_link "v4.${BASE_DOMAIN}" "${NODE_NAME:-node}-v4-XHTTP-REALITY" "$raw"
+    [[ -n "${PUBLIC_IPV6:-}" && "${IPV6_PROTOCOLS:-0}" == *1* ]] && node_ready V6_XHTTP_REALITY_READY && add_vless_xhttp_reality_link "v6.${BASE_DOMAIN}" "${NODE_NAME:-node}-v6-XHTTP-REALITY" "$raw"
   fi
 
   if protocol_enabled 2 && node_ready CDN_XHTTP_READY; then
@@ -3782,13 +3810,13 @@ generate_subscription(){
   fi
 
   if protocol_enabled 3; then
-    [[ -n "${PUBLIC_IPV4:-}" && "${IPV4_PROTOCOLS:-0}" == *3* ]] && node_ready V4_HY2_READY && add_hy2_link "${PUBLIC_IPV4}" "${NODE_NAME:-node}-v4-HY2-UDP${HY2_PORT:-443}" "$raw"
-    [[ -n "${PUBLIC_IPV6:-}" && "${IPV6_PROTOCOLS:-0}" == *3* ]] && node_ready V6_HY2_READY && add_hy2_link "${PUBLIC_IPV6}" "${NODE_NAME:-node}-v6-HY2-UDP${HY2_PORT:-443}" "$raw"
+    [[ -n "${PUBLIC_IPV4:-}" && "${IPV4_PROTOCOLS:-0}" == *3* ]] && node_ready V4_HY2_READY && add_hy2_link "v4.${BASE_DOMAIN}" "${NODE_NAME:-node}-v4-HY2-UDP${HY2_PORT:-443}" "$raw"
+    [[ -n "${PUBLIC_IPV6:-}" && "${IPV6_PROTOCOLS:-0}" == *3* ]] && node_ready V6_HY2_READY && add_hy2_link "v6.${BASE_DOMAIN}" "${NODE_NAME:-node}-v6-HY2-UDP${HY2_PORT:-443}" "$raw"
   fi
 
   if protocol_enabled 4; then
-    [[ -n "${PUBLIC_IPV4:-}" && "${IPV4_PROTOCOLS:-0}" == *4* ]] && node_ready V4_VISION_READY && add_reality_vision_link "${PUBLIC_IPV4}" "${NODE_NAME:-node}-v4-REALITY-Vision" "$raw"
-    [[ -n "${PUBLIC_IPV6:-}" && "${IPV6_PROTOCOLS:-0}" == *4* ]] && node_ready V6_VISION_READY && add_reality_vision_link "${PUBLIC_IPV6}" "${NODE_NAME:-node}-v6-REALITY-Vision" "$raw"
+    [[ -n "${PUBLIC_IPV4:-}" && "${IPV4_PROTOCOLS:-0}" == *4* ]] && node_ready V4_VISION_READY && add_reality_vision_link "v4.${BASE_DOMAIN}" "${NODE_NAME:-node}-v4-REALITY-Vision" "$raw"
+    [[ -n "${PUBLIC_IPV6:-}" && "${IPV6_PROTOCOLS:-0}" == *4* ]] && node_ready V6_VISION_READY && add_reality_vision_link "v6.${BASE_DOMAIN}" "${NODE_NAME:-node}-v6-REALITY-Vision" "$raw"
   fi
 
   # COMPATIBILITY FIX: avoid GNU-specific sed -i and base64 -w0.
@@ -4520,7 +4548,11 @@ add_bestcf_nodes_from_file(){
 
     label="$(normalize_bestcf_label "$label" "${fallback_label}_${n}")"
     name="${NODE_NAME:-node}-${label}"
-    add_vless_xhttp_cdn_link "$server" "$name" "$raw" "$port"
+    if [[ "$server" =~ ^[0-9.]+$ || "$server" == *:* ]]; then
+      add_vless_xhttp_cdn_link "$server" "$name" "$raw" "$port"
+    else
+      add_vless_xhttp_cdn_link "$server" "$name" "$raw" "$port" "$server"
+    fi
 
     n=$((n+1))
     printf -v "$total_ref" '%s' "$(( ${!total_ref} + 1 ))"
@@ -5540,7 +5572,7 @@ main_menu(){
   load_state
   while true; do
     echo
-    echo "===== Xray Edge Manager v0.0.36-rc22-production-ready ====="
+    echo "===== Xray Edge Manager v0.0.37-xray26 ====="
     echo "1. 首次部署向导，推荐"
     echo "2. 安装/升级基础依赖"
     echo "3. 安装/升级 Xray-core"
