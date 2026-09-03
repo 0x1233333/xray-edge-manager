@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Xray Edge Manager / Xray Anti-Block Manager
-# v0.0.37-xray26 — align generated JSON/share-links to Xray-core 26.x (method + HY2 users), keep BASE/v4/v6 DNS roles
+# v0.0.38-antigfw — HY2 proxy-masquerade + Salamander + BBR; hop 20000-20499; extra REALITY shortIds
 #
 # Features:
 # - Xray-core only, no Docker, no sing-box
@@ -78,7 +78,7 @@ CF_HTTPS_PORTS="443 2053 2083 2087 2096 8443"
 CF_IPS_V4_URL="https://www.cloudflare.com/ips-v4"
 CF_IPS_V6_URL="https://www.cloudflare.com/ips-v6"
 CF_ORIGIN_CHAIN="XEM_CF_ORIGIN"
-DEFAULT_HY2_HOP_RANGE="20000:20100"
+DEFAULT_HY2_HOP_RANGE="20000:20499"
 # When this script is run through bash <(curl ...), it cannot safely copy
 # itself from /dev/fd. Use this URL for later self-install/timer jobs.
 # Override with XEM_SCRIPT_RAW_URL when testing a branch, fork, or tagged release.
@@ -219,7 +219,7 @@ allowed_state_key(){
     XHTTP_REALITY_PORT|REALITY_VISION_PORT|HY2_PORT|XHTTP_CDN_LOCAL_PORT)
       return 0
       ;;
-    UUID|REALITY_PRIVATE_KEY|REALITY_PUBLIC_KEY|SHORT_ID|XHTTP_REALITY_PATH|XHTTP_CDN_PATH|HY2_AUTH)
+    UUID|REALITY_PRIVATE_KEY|REALITY_PUBLIC_KEY|SHORT_ID|SHORT_ID_B|SHORT_ID_C|XHTTP_REALITY_PATH|XHTTP_CDN_PATH|HY2_AUTH|HY2_OBFS)
       return 0
       ;;
     SUB_TOKEN|MERGED_SUB_TOKEN|CERT_EMAIL|REALITY_TARGET|ENABLE_IP_STACK_BINDING|IP_OUTBOUND_MODE|WARP_OUTBOUND_FILE)
@@ -2139,9 +2139,21 @@ validate_state_or_regen(){
     warn "HY2_AUTH 非法，已重新生成。"
     save_kv "$STATE_FILE" HY2_AUTH "$(rand_hex 16)"
   fi
+  if [[ -n "${HY2_OBFS:-}" ]] && ! valid_safe_token "$HY2_OBFS"; then
+    warn "HY2_OBFS 非法，已重新生成。"
+    save_kv "$STATE_FILE" HY2_OBFS "$(rand_hex 8)"
+  fi
   if [[ -n "${SHORT_ID:-}" ]] && ! valid_short_id "$SHORT_ID"; then
     warn "SHORT_ID 非法，已重新生成。"
     save_kv "$STATE_FILE" SHORT_ID "$(rand_hex 8)"
+  fi
+  if [[ -n "${SHORT_ID_B:-}" ]] && ! valid_short_id "$SHORT_ID_B"; then
+    warn "SHORT_ID_B 非法，已重新生成。"
+    save_kv "$STATE_FILE" SHORT_ID_B "$(rand_hex 8)"
+  fi
+  if [[ -n "${SHORT_ID_C:-}" ]] && ! valid_short_id "$SHORT_ID_C"; then
+    warn "SHORT_ID_C 非法，已重新生成。"
+    save_kv "$STATE_FILE" SHORT_ID_C "$(rand_hex 8)"
   fi
 
   validate_or_regen_token SUB_TOKEN
@@ -2211,9 +2223,16 @@ generate_keys_if_needed(){
   if [[ -z "${SHORT_ID:-}" ]] || ! valid_short_id "${SHORT_ID:-}"; then
     save_kv "$STATE_FILE" SHORT_ID "$(rand_hex 8)"
   fi
+  if [[ -z "${SHORT_ID_B:-}" ]] || ! valid_short_id "${SHORT_ID_B:-}"; then
+    save_kv "$STATE_FILE" SHORT_ID_B "$(rand_hex 8)"
+  fi
+  if [[ -z "${SHORT_ID_C:-}" ]] || ! valid_short_id "${SHORT_ID_C:-}"; then
+    save_kv "$STATE_FILE" SHORT_ID_C "$(rand_hex 8)"
+  fi
   [[ -n "${XHTTP_REALITY_PATH:-}" ]] || save_kv "$STATE_FILE" XHTTP_REALITY_PATH "$(rand_path)"
   [[ -n "${XHTTP_CDN_PATH:-}" ]] || save_kv "$STATE_FILE" XHTTP_CDN_PATH "$(rand_path)"
   [[ -n "${HY2_AUTH:-}" ]] || save_kv "$STATE_FILE" HY2_AUTH "$(rand_hex 16)"
+  [[ -n "${HY2_OBFS:-}" ]] || save_kv "$STATE_FILE" HY2_OBFS "$(rand_hex 8)"
   [[ -n "${SUB_TOKEN:-}" ]] || save_kv "$STATE_FILE" SUB_TOKEN "$(rand_token)"
   [[ -n "${MERGED_SUB_TOKEN:-}" ]] || save_kv "$STATE_FILE" MERGED_SUB_TOKEN "$(rand_token)"
   [[ -n "${XHTTP_CDN_LOCAL_PORT:-}" ]] || save_kv "$STATE_FILE" XHTTP_CDN_LOCAL_PORT "31301"
@@ -2974,14 +2993,14 @@ EOF2
   if protocol_enabled 1; then
     if [[ -n "$bind_ip4" && "${IPV4_PROTOCOLS:-0}" == *1* ]]; then
       append_json_obj "$in_tmp" first_in <<EOF2
-    {"tag":"in-v4-xhttp-reality","listen":"${bind_ip4}","port":${XHTTP_REALITY_PORT},"protocol":"vless","settings":{"clients":[{"id":"${UUID}","email":"v4-xhttp-reality"}],"decryption":"none"},"streamSettings":{"method":"xhttp","network":"xhttp","security":"reality","xhttpSettings":{"path":"${XHTTP_REALITY_PATH}","mode":"auto"},"realitySettings":{"show":false,"dest":"${REALITY_TARGET}:443","target":"${REALITY_TARGET}:443","serverNames":["${REALITY_TARGET}"],"privateKey":"${REALITY_PRIVATE_KEY}","shortIds":["${SHORT_ID}"]}}}
+    {"tag":"in-v4-xhttp-reality","listen":"${bind_ip4}","port":${XHTTP_REALITY_PORT},"protocol":"vless","settings":{"clients":[{"id":"${UUID}","email":"v4-xhttp-reality"}],"decryption":"none"},"streamSettings":{"method":"xhttp","network":"xhttp","security":"reality","xhttpSettings":{"path":"${XHTTP_REALITY_PATH}","mode":"auto"},"realitySettings":{"show":false,"dest":"${REALITY_TARGET}:443","target":"${REALITY_TARGET}:443","serverNames":["${REALITY_TARGET}"],"privateKey":"${REALITY_PRIVATE_KEY}","shortIds":["${SHORT_ID}","${SHORT_ID_B}","${SHORT_ID_C}"]}}}
 EOF2
       v4_xhttp_ready=1
       [[ "$bind" == "1" ]] && append_route_for_inbound "$route_tmp" first_route "in-v4-xhttp-reality" "v4" "$outbound_mode"
     fi
     if [[ -n "$bind_ip6" && "${IPV6_PROTOCOLS:-0}" == *1* ]]; then
       append_json_obj "$in_tmp" first_in <<EOF2
-    {"tag":"in-v6-xhttp-reality","listen":"${bind_ip6}","port":${XHTTP_REALITY_PORT},"protocol":"vless","settings":{"clients":[{"id":"${UUID}","email":"v6-xhttp-reality"}],"decryption":"none"},"streamSettings":{"method":"xhttp","network":"xhttp","security":"reality","xhttpSettings":{"path":"${XHTTP_REALITY_PATH}","mode":"auto"},"realitySettings":{"show":false,"dest":"${REALITY_TARGET}:443","target":"${REALITY_TARGET}:443","serverNames":["${REALITY_TARGET}"],"privateKey":"${REALITY_PRIVATE_KEY}","shortIds":["${SHORT_ID}"]}}}
+    {"tag":"in-v6-xhttp-reality","listen":"${bind_ip6}","port":${XHTTP_REALITY_PORT},"protocol":"vless","settings":{"clients":[{"id":"${UUID}","email":"v6-xhttp-reality"}],"decryption":"none"},"streamSettings":{"method":"xhttp","network":"xhttp","security":"reality","xhttpSettings":{"path":"${XHTTP_REALITY_PATH}","mode":"auto"},"realitySettings":{"show":false,"dest":"${REALITY_TARGET}:443","target":"${REALITY_TARGET}:443","serverNames":["${REALITY_TARGET}"],"privateKey":"${REALITY_PRIVATE_KEY}","shortIds":["${SHORT_ID}","${SHORT_ID_B}","${SHORT_ID_C}"]}}}
 EOF2
       v6_xhttp_ready=1
       [[ "$bind" == "1" ]] && append_route_for_inbound "$route_tmp" first_route "in-v6-xhttp-reality" "v6" "$outbound_mode"
@@ -2999,14 +3018,14 @@ EOF2
   if protocol_enabled 3; then
     if [[ -n "$bind_ip4" && "${IPV4_PROTOCOLS:-0}" == *3* ]]; then
       append_json_obj "$in_tmp" first_in <<EOF2
-    {"tag":"in-v4-hysteria2-udp","listen":"${bind_ip4}","port":${HY2_PORT},"protocol":"hysteria","settings":{"version":2,"users":[{"auth":"${HY2_AUTH}","email":"v4-hy2"}]},"streamSettings":{"method":"hysteria","network":"hysteria","security":"tls","tlsSettings":{"alpn":["h3"],"certificates":[{"certificateFile":"${XRAY_CERT_DIR}/${BASE_DOMAIN}/fullchain.pem","keyFile":"${XRAY_CERT_DIR}/${BASE_DOMAIN}/privkey.pem"}]},"hysteriaSettings":{"version":2,"auth":"${HY2_AUTH}","udpIdleTimeout":60,"masquerade":{"type":"string","content":"Not Found","statusCode":404,"headers":{"content-type":"text/plain; charset=utf-8"}}}}}
+    {"tag":"in-v4-hysteria2-udp","listen":"${bind_ip4}","port":${HY2_PORT},"protocol":"hysteria","settings":{"version":2,"users":[{"auth":"${HY2_AUTH}","email":"v4-hy2"}]},"streamSettings":{"method":"hysteria","network":"hysteria","security":"tls","tlsSettings":{"alpn":["h3"],"certificates":[{"certificateFile":"${XRAY_CERT_DIR}/${BASE_DOMAIN}/fullchain.pem","keyFile":"${XRAY_CERT_DIR}/${BASE_DOMAIN}/privkey.pem"}]},"hysteriaSettings":{"version":2,"auth":"${HY2_AUTH}","udpIdleTimeout":120,"masquerade":{"type":"proxy","url":"https://${REALITY_TARGET:-$BASE_DOMAIN}","rewriteHost":true,"insecure":false}},"finalmask":{"quicParams":{"congestion":"bbr"},"udp":[{"type":"salamander","settings":{"password":"${HY2_OBFS}"}}]}}}
 EOF2
       v4_hy2_ready=1
       [[ "$bind" == "1" ]] && append_route_for_inbound "$route_tmp" first_route "in-v4-hysteria2-udp" "v4" "$outbound_mode"
     fi
     if [[ -n "$bind_ip6" && "${IPV6_PROTOCOLS:-0}" == *3* ]]; then
       append_json_obj "$in_tmp" first_in <<EOF2
-    {"tag":"in-v6-hysteria2-udp","listen":"${bind_ip6}","port":${HY2_PORT},"protocol":"hysteria","settings":{"version":2,"users":[{"auth":"${HY2_AUTH}","email":"v6-hy2"}]},"streamSettings":{"method":"hysteria","network":"hysteria","security":"tls","tlsSettings":{"alpn":["h3"],"certificates":[{"certificateFile":"${XRAY_CERT_DIR}/${BASE_DOMAIN}/fullchain.pem","keyFile":"${XRAY_CERT_DIR}/${BASE_DOMAIN}/privkey.pem"}]},"hysteriaSettings":{"version":2,"auth":"${HY2_AUTH}","udpIdleTimeout":60,"masquerade":{"type":"string","content":"Not Found","statusCode":404,"headers":{"content-type":"text/plain; charset=utf-8"}}}}}
+    {"tag":"in-v6-hysteria2-udp","listen":"${bind_ip6}","port":${HY2_PORT},"protocol":"hysteria","settings":{"version":2,"users":[{"auth":"${HY2_AUTH}","email":"v6-hy2"}]},"streamSettings":{"method":"hysteria","network":"hysteria","security":"tls","tlsSettings":{"alpn":["h3"],"certificates":[{"certificateFile":"${XRAY_CERT_DIR}/${BASE_DOMAIN}/fullchain.pem","keyFile":"${XRAY_CERT_DIR}/${BASE_DOMAIN}/privkey.pem"}]},"hysteriaSettings":{"version":2,"auth":"${HY2_AUTH}","udpIdleTimeout":120,"masquerade":{"type":"proxy","url":"https://${REALITY_TARGET:-$BASE_DOMAIN}","rewriteHost":true,"insecure":false}},"finalmask":{"quicParams":{"congestion":"bbr"},"udp":[{"type":"salamander","settings":{"password":"${HY2_OBFS}"}}]}}}
 EOF2
       v6_hy2_ready=1
       [[ "$bind" == "1" ]] && append_route_for_inbound "$route_tmp" first_route "in-v6-hysteria2-udp" "v6" "$outbound_mode"
@@ -3016,14 +3035,14 @@ EOF2
   if protocol_enabled 4; then
     if [[ -n "$bind_ip4" && "${IPV4_PROTOCOLS:-0}" == *4* ]]; then
       append_json_obj "$in_tmp" first_in <<EOF2
-    {"tag":"in-v4-reality-vision","listen":"${bind_ip4}","port":${REALITY_VISION_PORT},"protocol":"vless","settings":{"clients":[{"id":"${UUID}","flow":"xtls-rprx-vision","email":"v4-reality-vision"}],"decryption":"none"},"streamSettings":{"method":"raw","network":"raw","security":"reality","realitySettings":{"show":false,"dest":"${REALITY_TARGET}:443","target":"${REALITY_TARGET}:443","serverNames":["${REALITY_TARGET}"],"privateKey":"${REALITY_PRIVATE_KEY}","shortIds":["${SHORT_ID}"]}}}
+    {"tag":"in-v4-reality-vision","listen":"${bind_ip4}","port":${REALITY_VISION_PORT},"protocol":"vless","settings":{"clients":[{"id":"${UUID}","flow":"xtls-rprx-vision","email":"v4-reality-vision"}],"decryption":"none"},"streamSettings":{"method":"raw","network":"raw","security":"reality","realitySettings":{"show":false,"dest":"${REALITY_TARGET}:443","target":"${REALITY_TARGET}:443","serverNames":["${REALITY_TARGET}"],"privateKey":"${REALITY_PRIVATE_KEY}","shortIds":["${SHORT_ID}","${SHORT_ID_B}","${SHORT_ID_C}"]}}}
 EOF2
       v4_vision_ready=1
       [[ "$bind" == "1" ]] && append_route_for_inbound "$route_tmp" first_route "in-v4-reality-vision" "v4" "$outbound_mode"
     fi
     if [[ -n "$bind_ip6" && "${IPV6_PROTOCOLS:-0}" == *4* ]]; then
       append_json_obj "$in_tmp" first_in <<EOF2
-    {"tag":"in-v6-reality-vision","listen":"${bind_ip6}","port":${REALITY_VISION_PORT},"protocol":"vless","settings":{"clients":[{"id":"${UUID}","flow":"xtls-rprx-vision","email":"v6-reality-vision"}],"decryption":"none"},"streamSettings":{"method":"raw","network":"raw","security":"reality","realitySettings":{"show":false,"dest":"${REALITY_TARGET}:443","target":"${REALITY_TARGET}:443","serverNames":["${REALITY_TARGET}"],"privateKey":"${REALITY_PRIVATE_KEY}","shortIds":["${SHORT_ID}"]}}}
+    {"tag":"in-v6-reality-vision","listen":"${bind_ip6}","port":${REALITY_VISION_PORT},"protocol":"vless","settings":{"clients":[{"id":"${UUID}","flow":"xtls-rprx-vision","email":"v6-reality-vision"}],"decryption":"none"},"streamSettings":{"method":"raw","network":"raw","security":"reality","realitySettings":{"show":false,"dest":"${REALITY_TARGET}:443","target":"${REALITY_TARGET}:443","serverNames":["${REALITY_TARGET}"],"privateKey":"${REALITY_PRIVATE_KEY}","shortIds":["${SHORT_ID}","${SHORT_ID_B}","${SHORT_ID_C}"]}}}
 EOF2
       v6_vision_ready=1
       [[ "$bind" == "1" ]] && append_route_for_inbound "$route_tmp" first_route "in-v6-reality-vision" "v6" "$outbound_mode"
@@ -3496,7 +3515,11 @@ add_hy2_link(){
   if [[ -n "$hop_range" ]]; then
     mport_param="&mport=${hop_range/:/-}"
   fi
-  echo "hysteria2://${HY2_AUTH}@${server_uri}:${HY2_PORT:-443}?sni=${BASE_DOMAIN}&insecure=0&alpn=h3${mport_param}#$(uri_encode "$name")" >> "$raw"
+  local obfs_param=""
+  if [[ -n "${HY2_OBFS:-}" ]]; then
+    obfs_param="&obfs=salamander&obfs-password=${HY2_OBFS}"
+  fi
+  echo "hysteria2://${HY2_AUTH}@${server_uri}:${HY2_PORT:-443}?sni=${BASE_DOMAIN}&insecure=0&alpn=h3${mport_param}${obfs_param}#$(uri_encode "$name")" >> "$raw"
 }
 
 ready_key_to_inbound_tag(){
@@ -3680,12 +3703,14 @@ EOF2
     skip-cert-verify: false
     alpn:
       - h3
+    obfs: salamander
+    obfs-password: ${HY2_OBFS}
 EOF2
       local hop_range_v4
       hop_range_v4="$(hy2_hop_range_for_stack v4)"
       [[ -n "$hop_range_v4" ]] && cat >> "$f" <<EOF2
     ports: ${hop_range_v4/:/-}
-    hop-interval: 30
+    hop-interval: 10
 EOF2
     fi
     if [[ -n "${PUBLIC_IPV6:-}" && "${IPV6_PROTOCOLS:-0}" == *3* ]] && node_ready V6_HY2_READY; then
@@ -3699,12 +3724,14 @@ EOF2
     skip-cert-verify: false
     alpn:
       - h3
+    obfs: salamander
+    obfs-password: ${HY2_OBFS}
 EOF2
       local hop_range_v6
       hop_range_v6="$(hy2_hop_range_for_stack v6)"
       [[ -n "$hop_range_v6" ]] && cat >> "$f" <<EOF2
     ports: ${hop_range_v6/:/-}
-    hop-interval: 30
+    hop-interval: 10
 EOF2
     fi
   fi
@@ -4006,7 +4033,7 @@ EOF2
 configure_hy2_hopping_prompt(){
   load_state
   [[ "${PROTOCOLS:-0}" == *3* ]] || return 0
-  if confirm "是否开启 Hysteria2 UDP 端口跳跃？推荐小范围 ${DEFAULT_HY2_HOP_RANGE}" "Y"; then
+  if confirm "是否开启 Hysteria2 UDP 端口跳跃（抗单端口 QoS，推荐）？范围 ${DEFAULT_HY2_HOP_RANGE}" "Y"; then
     local range; range=$(ask "请输入跳跃端口范围，格式 start:end" "${HY2_HOP_RANGE:-$DEFAULT_HY2_HOP_RANGE}")
     enable_hy2_hopping "$range"
   fi
@@ -5572,7 +5599,7 @@ main_menu(){
   load_state
   while true; do
     echo
-    echo "===== Xray Edge Manager v0.0.37-xray26 ====="
+    echo "===== Xray Edge Manager v0.0.38-antigfw ====="
     echo "1. 首次部署向导，推荐"
     echo "2. 安装/升级基础依赖"
     echo "3. 安装/升级 Xray-core"

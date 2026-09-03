@@ -2,7 +2,7 @@
 
 一键在 VPS 上部署 **Xray-core 边缘抗封锁节点**：REALITY 直连 + Cloudflare CDN 中转 + Xray Hysteria2 (HY2) + BestCF 优选入口 + Nginx 伪装站/订阅 + 可选 WARP 出站。
 
-当前脚本版本：`v0.0.37-xray26`（仓库入口脚本一般为 `xem.sh`）。
+当前脚本版本：`v0.0.38-antigfw`（仓库入口脚本一般为 `xem.sh`）。
 
 ---
 
@@ -252,7 +252,9 @@ REALITY_BLACKLIST=("www.microsoft.com" "microsoft.com" "login.microsoftonline.co
    服务端是 Xray 的 HY2 入站，不是独立 `hysteria` 二进制。老版 Clash Premium / 仅支持 hy1 的客户端连不上。
 
 2. **Cloudflare 不代理 UDP，也不代理非 CF HTTPS 端口上的直连**  
-   - HY2（UDP）必须走 `v4.`/`v6.` DNS-only（或直接 IP），不能指望黄云母域名。  
+   - HY2（UDP）必须走 `v4.`/`v6.` DNS-only（或直接 IP），不能指望黄云母域名。
+   默认开启端口跳跃 `20000-20499`（iptables DNAT 到监听口，符合 Xray 官方「只听一个口」）。
+   未认证探测走 REALITY 目标站反向代理伪装；QUIC 用 BBR；Salamander 混淆（订阅带 `obfs=salamander`，客户端需支持）。  
    - REALITY `2443` / Vision `3443` 同理，必须直连。  
    - 只有协议 2/5 的 TCP 443（及 CF 支持的 HTTPS 端口）适合走 CDN。
 
