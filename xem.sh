@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Xray Edge Manager / Xray Anti-Block Manager
-# v0.0.44-pipefix — stdin-safe ask; zombie lock rm; CDN XFF trust header; BestCF retry; noninteractive skips
+# v0.0.45-hy2-canonical — HY2 inbound matches Xray26 official (users+TLS/h3); salamander/masquerade opt-in
 #
 # Features:
 # - Xray-core only, no Docker, no sing-box
@@ -3095,15 +3095,39 @@ EOF2
 
   if protocol_enabled 3; then
     if [[ -n "$bind_ip4" && "${IPV4_PROTOCOLS:-0}" == *3* ]]; then
+      # Xray 26 official-shaped HY2 inbound: users[].auth + network=hysteria + TLS/h3.
+      # Do NOT put auth in hysteriaSettings (outbound field). Salamander/masquerade are opt-in.
+      local hy2_stream_v4
+      hy2_stream_v4=$(cat <<EOF_HY2_STREAM
+{"network":"hysteria","security":"tls","tlsSettings":{"alpn":["h3"],"certificates":[{"certificateFile":"${XRAY_CERT_DIR}/${BASE_DOMAIN}/fullchain.pem","keyFile":"${XRAY_CERT_DIR}/${BASE_DOMAIN}/privkey.pem"}]},"hysteriaSettings":{"version":2,"udpIdleTimeout":120}}
+EOF_HY2_STREAM
+)
+      if [[ "${HY2_SALAMANDER:-0}" == "1" && -n "${HY2_OBFS:-}" ]]; then
+        hy2_stream_v4=$(jq -c --arg pw "${HY2_OBFS}" '.finalmask={"udp":[{"type":"salamander","settings":{"password":$pw}}]}' <<<"$hy2_stream_v4")
+      fi
+      if [[ "${HY2_MASQUERADE:-0}" == "1" ]]; then
+        hy2_stream_v4=$(jq -c --arg url "https://${REALITY_TARGET:-$BASE_DOMAIN}" '.hysteriaSettings.masquerade={"type":"proxy","url":$url,"rewriteHost":true,"insecure":false}' <<<"$hy2_stream_v4")
+      fi
       append_json_obj "$in_tmp" first_in <<EOF2
-    {"tag":"in-v4-hysteria2-udp","listen":"${bind_ip4}","port":${HY2_PORT},"protocol":"hysteria","settings":{"version":2,"users":[{"auth":"${HY2_AUTH}","email":"v4-hy2"}]},"streamSettings":{"method":"hysteria","network":"hysteria","security":"tls","tlsSettings":{"alpn":["h3"],"certificates":[{"certificateFile":"${XRAY_CERT_DIR}/${BASE_DOMAIN}/fullchain.pem","keyFile":"${XRAY_CERT_DIR}/${BASE_DOMAIN}/privkey.pem"}]},"hysteriaSettings":{"version":2,"auth":"${HY2_AUTH}","udpIdleTimeout":120,"masquerade":{"type":"proxy","url":"https://${REALITY_TARGET:-$BASE_DOMAIN}","rewriteHost":true,"insecure":false}},"finalmask":{"quicParams":{"congestion":"bbr"},"udp":[{"type":"salamander","settings":{"password":"${HY2_OBFS}"}}]}}}
+    {"tag":"in-v4-hysteria2-udp","listen":"${bind_ip4}","port":${HY2_PORT},"protocol":"hysteria","settings":{"version":2,"users":[{"auth":"${HY2_AUTH}","email":"v4-hy2"}]},"streamSettings":${hy2_stream_v4}}
 EOF2
       v4_hy2_ready=1
       [[ "$bind" == "1" ]] && append_route_for_inbound "$route_tmp" first_route "in-v4-hysteria2-udp" "v4" "$outbound_mode"
     fi
     if [[ -n "$bind_ip6" && "${IPV6_PROTOCOLS:-0}" == *3* ]]; then
+      local hy2_stream_v6
+      hy2_stream_v6=$(cat <<EOF_HY2_STREAM
+{"network":"hysteria","security":"tls","tlsSettings":{"alpn":["h3"],"certificates":[{"certificateFile":"${XRAY_CERT_DIR}/${BASE_DOMAIN}/fullchain.pem","keyFile":"${XRAY_CERT_DIR}/${BASE_DOMAIN}/privkey.pem"}]},"hysteriaSettings":{"version":2,"udpIdleTimeout":120}}
+EOF_HY2_STREAM
+)
+      if [[ "${HY2_SALAMANDER:-0}" == "1" && -n "${HY2_OBFS:-}" ]]; then
+        hy2_stream_v6=$(jq -c --arg pw "${HY2_OBFS}" '.finalmask={"udp":[{"type":"salamander","settings":{"password":$pw}}]}' <<<"$hy2_stream_v6")
+      fi
+      if [[ "${HY2_MASQUERADE:-0}" == "1" ]]; then
+        hy2_stream_v6=$(jq -c --arg url "https://${REALITY_TARGET:-$BASE_DOMAIN}" '.hysteriaSettings.masquerade={"type":"proxy","url":$url,"rewriteHost":true,"insecure":false}' <<<"$hy2_stream_v6")
+      fi
       append_json_obj "$in_tmp" first_in <<EOF2
-    {"tag":"in-v6-hysteria2-udp","listen":"${bind_ip6}","port":${HY2_PORT},"protocol":"hysteria","settings":{"version":2,"users":[{"auth":"${HY2_AUTH}","email":"v6-hy2"}]},"streamSettings":{"method":"hysteria","network":"hysteria","security":"tls","tlsSettings":{"alpn":["h3"],"certificates":[{"certificateFile":"${XRAY_CERT_DIR}/${BASE_DOMAIN}/fullchain.pem","keyFile":"${XRAY_CERT_DIR}/${BASE_DOMAIN}/privkey.pem"}]},"hysteriaSettings":{"version":2,"auth":"${HY2_AUTH}","udpIdleTimeout":120,"masquerade":{"type":"proxy","url":"https://${REALITY_TARGET:-$BASE_DOMAIN}","rewriteHost":true,"insecure":false}},"finalmask":{"quicParams":{"congestion":"bbr"},"udp":[{"type":"salamander","settings":{"password":"${HY2_OBFS}"}}]}}}
+    {"tag":"in-v6-hysteria2-udp","listen":"${bind_ip6}","port":${HY2_PORT},"protocol":"hysteria","settings":{"version":2,"users":[{"auth":"${HY2_AUTH}","email":"v6-hy2"}]},"streamSettings":${hy2_stream_v6}}
 EOF2
       v6_hy2_ready=1
       [[ "$bind" == "1" ]] && append_route_for_inbound "$route_tmp" first_route "in-v6-hysteria2-udp" "v6" "$outbound_mode"
@@ -3597,7 +3621,7 @@ add_hy2_link(){
     mport_param="&mport=${hop_range/:/-}"
   fi
   local obfs_param=""
-  if [[ -n "${HY2_OBFS:-}" ]]; then
+  if [[ "${HY2_SALAMANDER:-0}" == "1" && -n "${HY2_OBFS:-}" ]]; then
     obfs_param="&obfs=salamander&obfs-password=${HY2_OBFS}"
   fi
   echo "hysteria2://${HY2_AUTH}@${server_uri}:${HY2_PORT:-443}?sni=${BASE_DOMAIN}&insecure=0&alpn=h3${mport_param}${obfs_param}#$(uri_encode "$name")" >> "$raw"
@@ -3809,7 +3833,7 @@ EOF2
     alpn:
       - h3
 EOF2
-      if [[ -n "${HY2_OBFS:-}" ]]; then
+      if [[ "${HY2_SALAMANDER:-0}" == "1" && -n "${HY2_OBFS:-}" ]]; then
         cat >> "$f" <<EOF2
     obfs: salamander
     obfs-password: ${HY2_OBFS}
@@ -3819,7 +3843,7 @@ EOF2
       hop_range_v4="$(hy2_hop_range_for_stack v4)"
       [[ -n "$hop_range_v4" ]] && cat >> "$f" <<EOF2
     ports: ${hop_range_v4/:/-}
-    hop-interval: "10-30"
+    hop-interval: 20
 EOF2
     fi
     if [[ -n "${PUBLIC_IPV6:-}" && "${IPV6_PROTOCOLS:-0}" == *3* ]] && node_ready V6_HY2_READY; then
@@ -3834,7 +3858,7 @@ EOF2
     alpn:
       - h3
 EOF2
-      if [[ -n "${HY2_OBFS:-}" ]]; then
+      if [[ "${HY2_SALAMANDER:-0}" == "1" && -n "${HY2_OBFS:-}" ]]; then
         cat >> "$f" <<EOF2
     obfs: salamander
     obfs-password: ${HY2_OBFS}
@@ -3844,7 +3868,7 @@ EOF2
       hop_range_v6="$(hy2_hop_range_for_stack v6)"
       [[ -n "$hop_range_v6" ]] && cat >> "$f" <<EOF2
     ports: ${hop_range_v6/:/-}
-    hop-interval: "10-30"
+    hop-interval: 20
 EOF2
     fi
   fi
@@ -5792,7 +5816,7 @@ main_menu(){
   load_state
   while true; do
     echo
-    echo "===== Xray Edge Manager v0.0.44-pipefix ====="
+    echo "===== Xray Edge Manager v0.0.45-hy2-canonical ====="
     echo "1. 首次部署向导，推荐"
     echo "2. 安装/升级基础依赖"
     echo "3. 安装/升级 Xray-core"
