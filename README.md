@@ -1,10 +1,11 @@
+- **v0.0.47-hy2-hop-default**: 默认开启 HY2 UDP 端口跳跃；订阅/Mihomo 参考 YAML **优先** `*-HY2-HOP`（`ports`/`mport`），其后附单端口节点；文档注明部分机房外网 UDP 443 在到达网卡前被丢。关闭跳跃：`HY2_DISABLE_HOP=1` 或交互确认关闭。
 - **v0.0.46-hy2-clients**: HY2 inbound JSON key `clients` (Xray 26.3.27 only unmarshals `clients`, not `users`; empty validator caused HTTP/3 404).
 
 # xray-edge-manager
 
 一键在 VPS 上部署 **Xray-core 边缘抗封锁节点**：REALITY 直连 + Cloudflare CDN 中转 + Xray Hysteria2 (HY2) + BestCF 优选入口 + Nginx 伪装站/订阅 + 可选 WARP 出站。
 
-当前脚本版本：`v0.0.46-hy2-clients`（仓库入口脚本一般为 `xem.sh`）。
+当前脚本版本：`v0.0.47-hy2-hop-default`（仓库入口脚本一般为 `xem.sh`）。
 
 ---
 
@@ -15,7 +16,7 @@
 | **REALITY 直连** | 协议 1：VLESS + XHTTP + REALITY（默认 TCP `2443`）；协议 4：VLESS + REALITY + Vision（默认 TCP `3443`） |
 | **CDN 中转** | 协议 2：VLESS + XHTTP + TLS，经 Nginx 回源，走 Cloudflare 代理的母域名 |
 | **BestCF 优选** | 协议 5：复用 CDN 入站，订阅中生成 BestCF 优选域名/IP 入口节点 |
-| **Hysteria2** | 协议 3：Xray 内置 HY2（UDP，默认 `443`，可与 Nginx TCP 443 共存） |
+| **Hysteria2** | 协议 3：Xray 内置 HY2（UDP 监听默认 `443`，可与 Nginx TCP 443 共存；**默认开启端口跳跃**，订阅优先 hop） |
 | **伪装 + 订阅** | Nginx 随机博客伪装站；base64 订阅发布到 Web；可选合并远程订阅 |
 | **WARP 出站** | 纯 IPv6 / 需要 IPv4 出口时，可用 `warp-reg` 自动生成 WireGuard outbound |
 | **运维** | Cloudflare DNS 角色模型、DNS-01 证书、源站仅 CF 回源、HY2 端口跳跃、geodata 定时更新 |
@@ -195,7 +196,7 @@ REALITY_BLACKLIST=("www.microsoft.com" "microsoft.com" "login.microsoftonline.co
 
 额外校验（对齐 Xray-core 26.x 启动警告）：域名包含 `apple` / `icloud` / `microsoft`，或后缀 `.cn` / `.ru` / `.ir` 会被拒绝。
 
-生成的 Xray JSON 同时写 `streamSettings.method` 与兼容字段 `network`；Hysteria2 入站使用官方 `settings.users`（仍兼容旧 `clients`）；REALITY 同时写 `dest` 与 `target`。安装 Xray 默认取**最新稳定 Release**（当前官方 latest 为 `v26.3.27`），需要跟进 prerelease 时设置 `XEM_XRAY_ALLOW_PRERELEASE=1`。
+生成的 Xray JSON 同时写 `streamSettings.method` 与兼容字段 `network`；Hysteria2 入站使用 `settings.clients`（Xray 26.3.27 仅认此 JSON 键；≥26.6.1 亦兼容 `users`）；REALITY 同时写 `dest` 与 `target`。安装 Xray 默认取**最新稳定 Release**（当前官方 latest 为 `v26.3.27`），需要跟进 prerelease 时设置 `XEM_XRAY_ALLOW_PRERELEASE=1`。
 
 ---
 
@@ -255,11 +256,12 @@ REALITY_BLACKLIST=("www.microsoft.com" "microsoft.com" "login.microsoftonline.co
 
 2. **Cloudflare 不代理 UDP，也不代理非 CF HTTPS 端口上的直连**  
    - HY2（UDP）必须走 `v4.`/`v6.` DNS-only（或直接 IP），不能指望黄云母域名。  
-   - 端口跳跃默认段 `20000-20499`：Xray **只听一个** HY2 UDP 口；本机用 iptables/ip6tables `REDIRECT` 把跳跃段转到该口（开机由 `xem-hy2-hopping.service` / `xem --apply-hy2-hopping` 恢复）。跳跃范围**不能包含**真实监听口，否则会自环。  
+   - **默认开启**端口跳跃（段 `20000-20499`）：Xray **只听一个** HY2 UDP 口；本机用 iptables/ip6tables `REDIRECT` 把跳跃段转到该口（开机由 `xem-hy2-hopping.service` / `xem --apply-hy2-hopping` 恢复）。跳跃范围**不能包含**真实监听口，否则会自环。  
    - 变更 `HY2_PORT` 或开关协议 3 后，脚本会尝试同步/清理跳跃 NAT；同步失败**不会**回滚已写入的 Xray 配置（会告警，可稍后菜单 12 重跑）。  
    - 开机 `--apply-hy2-hopping` / 内部恢复路径对非法范围、缺 iptables、跳跃段包含监听口等改为**告警并跳过**，避免 oneshot 每次开机失败；交互菜单仍会直接报错退出。  
    - 防火墙放行跳跃 UDP 段仅在协议 3 启用且已配置 `HY2_HOP_RANGE` 时添加。  
-   - 客户端：订阅 `mport` / Mihomo `ports` + `hop-interval: 20`（随机间隔换端口）。  
+   - 客户端：订阅 `mport` / Mihomo `ports` + `hop-interval: 20`（随机间隔换端口）。
+   - **部分机房外网 UDP 443 不可达**：包在到达 VPS 网卡前被上游丢弃（本机 `tcpdump` 0 包），本机环回/同机官方客户端仍可能 HyOK。生产请用 **HY2-HOP**；云安全组需放行跳跃 UDP 段（默认 `20000-20499`）。单端口节点仅作同机/可达路径备用。  
    - 未认证探测走 REALITY 目标站反向代理伪装；Salamander 混淆（有 `HY2_OBFS` 时订阅才带 `obfs=salamander`，客户端需支持）。  
    - REALITY `2443` / Vision `3443` 同理，必须直连。  
    - 只有协议 2/5 的 TCP 443（及 CF 支持的 HTTPS 端口）适合走 CDN。
