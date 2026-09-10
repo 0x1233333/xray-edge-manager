@@ -1,3 +1,4 @@
+- **v0.0.50-bugfix**: 七项修复——① 禁止静默降级 Xray（`xray_version_ge` / 安装前跳过）；② `XEM_XRAY_PIN_VERSION` 精确钉版（允许该标签 prerelease）；③ `XEM_XRAY_ALLOW_PRERELEASE=1` 时按最高 semver 选取而非 API `.[0]`；④ `select_protocols` 非交互早退前 `reconcile_bestcf_state_if_needed`；⑤ HY2 跳跃按 live iptables 清理/同步（`purge_stale_hy2_redirect_rules` / `hy2_live_redirect_matches`）；⑥ 去掉 `configure_nginx` 对订阅文件的空 `touch`，生成后拒绝发布空 b64；⑦ `XEM_VERSION` 横幅与 `allowed_state_key` 去重 `CF_ZONE_NAME`。
 - **v0.0.49-net-default**: 首次部署 `install_full` 默认应用稳定型网络优化（有 BBR 则开 BBR + `fq`；无则保留现有拥塞控制；可 `XEM_SKIP_NET_TUNING=1` 跳过 / `XEM_QDISC=cake` 选用 cake）。`skills/xem-deploy` 同步干净重装与验收清单。
 - **v0.0.48-hy2-probe-pad**: Mihomo 参考 YAML 为 XHTTP 补上与服务端一致的 `x-padding-bytes: "100-1000"`；部署自检增加 HY2 监听/跳跃确认，并明文提示优先用 `*-HY2-HOP`；仓库增加 `skills/xem-deploy/SKILL.md` 供 Agent 使用。
 - **v0.0.47-hy2-hop-default**: 默认开启 HY2 UDP 端口跳跃；订阅/Mihomo 参考 YAML **优先** `*-HY2-HOP`（`ports`/`mport`），其后附单端口节点；文档注明部分机房外网 UDP 443 在到达网卡前被丢。关闭跳跃：`HY2_DISABLE_HOP=1` 或交互确认关闭。
@@ -7,7 +8,7 @@
 
 一键在 VPS 上部署 **Xray-core 边缘抗封锁节点**：REALITY 直连 + Cloudflare CDN 中转 + Xray Hysteria2 (HY2) + BestCF 优选入口 + Nginx 伪装站/订阅 + 可选 WARP 出站。
 
-当前脚本版本：`v0.0.49-net-default`（仓库入口脚本一般为 `xem.sh`）。
+当前脚本版本：`v0.0.50-bugfix`（仓库入口脚本一般为 `xem.sh`）。
 
 ---
 
@@ -316,6 +317,7 @@ REALITY_BLACKLIST=("www.microsoft.com" "microsoft.com" "login.microsoftonline.co
 
 | 版本 | 要点 |
 |------|------|
+| **v0.0.50-bugfix** | 不降级 Xray + PIN/最高 semver；BESTCF 早退前 reconcile；HOP 按 live iptables 清理同步；拒绝空订阅 touch/发布；版本常量横幅 |
 | **v0.0.44-pipefix** | 管道下 `ask` 只读 stdin；已保存 CF 防火墙状态可跳过确认；僵尸锁 `rm` 重建；CDN `trustedXForwardedFor`+`X-Xem-Cdn-Trusted`；BestCF 无数据重试且有协议2时不重复 Entry；非交互跳过节点名/REALITY/HY2 跳跃提问 |
 | **v0.0.43-ops** | 开机/内部 HY2 跳跃恢复 soft-fail；`restart_services` 轮询 active 避免误回滚；备份选取避开 `ls\|head` pipefail；防火墙跳跃段仅协议 3；菜单 4 可关闭 geodata 定时器；清理未使用 stack/SSRF 包装函数 |
 | **v0.0.42-harden** | Xray 配置已原子写入后，HY2 跳跃同步在子 shell 执行：`die`/`exit` 不会把整次 `generate_xray_config` 判失败 |

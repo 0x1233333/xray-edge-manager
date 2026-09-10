@@ -26,7 +26,7 @@ description: >-
 ## 系统重装后：干净安装步骤
 
 1. 新系统装好基础工具（curl、jq、systemd 等；脚本 `install_deps` 也会装）。
-2. 取 PR 公开 `xem.sh`（当前线：**v0.0.49-net-default** 起）。
+2. 取 PR 公开 `xem.sh`（当前线：**v0.0.50-bugfix** 起）。
 3. root 跑首次部署（`install_full` / 菜单完整安装）：
    - **默认**会跑稳定型网络优化（BBR+`fq`，见下）。
    - 配 CF / 域名 / 协议；HY2 **默认开端口跳跃**。
@@ -77,6 +77,14 @@ description: >-
 | CDN-Entry | **通** |
 
 每条记录：delay、generate_204、egress IP。报告勿含密钥/完整订阅链。
+
+
+## v0.0.50-bugfix 运维要点
+
+- **Xray 不降级**：`install_or_upgrade_xray_release_verified` 会读 `/usr/local/bin/xray version`；若当前 ≥ 候选则跳过覆盖。钉版：`XEM_XRAY_PIN_VERSION=v26.6.1`（允许该标签 prerelease）。跟新协议：`XEM_XRAY_ALLOW_PRERELEASE=1` 时在候选里取 **最高 semver**，不是 GitHub API 顺序的 `.[0]`。
+- **HY2 HOP live iptables**：启用/同步时 `purge_stale_hy2_redirect_rules` 按 `iptables/ip6tables -t nat -S PREROUTING` 清理非期望的 UDP 范围 REDIRECT；`sync_hy2_hopping_if_needed` 在状态一致但 live 规则缺失时也会重应用。跳跃段仍不可包含真实监听口。
+- **BESTCF reconcile**：协议含 5 时，`select_protocols` 在非交互早退前就会把 `BESTCF_ENABLED/MODE/PER/TOTAL` 对齐；订阅 WARN 会区分「开关未开」与「数据不可用」。
+- **空订阅守卫**：`configure_nginx` 不再 `touch` 空订阅文件；`generate_subscription` / 合并订阅在 b64 为空时 `warn`、删除空文件并 `return 1`。
 
 ## 给协作 Bot
 
