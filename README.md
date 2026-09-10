@@ -2,7 +2,7 @@
 
 一键在 VPS 上部署 **Xray-core 边缘抗封锁节点**：REALITY 直连 + Cloudflare CDN 中转 + Xray Hysteria2 (HY2) + BestCF 优选入口 + Nginx 伪装站/订阅 + 可选 WARP 出站。
 
-当前脚本版本：`v0.0.44-pipefix`（仓库入口脚本一般为 `xem.sh`）。
+当前脚本版本：`v0.0.45-hy2-canonical`（仓库入口脚本一般为 `xem.sh`）。
 
 ---
 
@@ -220,7 +220,7 @@ REALITY_BLACKLIST=("www.microsoft.com" "microsoft.com" "login.microsoftonline.co
 | Vision | `type=tcp`，`flow=xtls-rprx-vision`，`security=reality` | Meta 常规 REALITY+Vision 支持 |
 | HY2 | `hysteria2://`，`alpn=h3`，可选 `mport` 跳跃 | 客户端需 **Hysteria2** 实现；**旧 Clash 内核不够** |
 
-建议客户端：**Mihomo 开发板/Alpha**（xhttp `reuse-settings` / XMUX；HY2 参考 YAML 含 `ports` + `hop-interval: "10-30"`）。Clash Verge Rev 选开发板内核。不要给 XHTTP 节点叠 smux。v2rayN / sing-box 仍可用通用订阅，但 XMUX 字段以 Mihomo 参考 YAML 为准。  
+建议客户端：**Mihomo 开发板/Alpha**（xhttp `reuse-settings` / XMUX；HY2 参考 YAML 含 `ports` + `hop-interval: 20`）。Clash Verge Rev 选开发板内核。不要给 XHTTP 节点叠 smux。v2rayN / sing-box 仍可用通用订阅，但 XMUX 字段以 Mihomo 参考 YAML 为准。  
 本脚本 **不使用 WebSocket(ws)** 作为主传输；CDN 与直连主力均为 **xhttp**。
 
 ---
@@ -257,7 +257,7 @@ REALITY_BLACKLIST=("www.microsoft.com" "microsoft.com" "login.microsoftonline.co
    - 变更 `HY2_PORT` 或开关协议 3 后，脚本会尝试同步/清理跳跃 NAT；同步失败**不会**回滚已写入的 Xray 配置（会告警，可稍后菜单 12 重跑）。  
    - 开机 `--apply-hy2-hopping` / 内部恢复路径对非法范围、缺 iptables、跳跃段包含监听口等改为**告警并跳过**，避免 oneshot 每次开机失败；交互菜单仍会直接报错退出。  
    - 防火墙放行跳跃 UDP 段仅在协议 3 启用且已配置 `HY2_HOP_RANGE` 时添加。  
-   - 客户端：订阅 `mport` / Mihomo `ports` + `hop-interval: "10-30"`（随机间隔换端口）。  
+   - 客户端：订阅 `mport` / Mihomo `ports` + `hop-interval: 20`（随机间隔换端口）。  
    - 未认证探测走 REALITY 目标站反向代理伪装；Salamander 混淆（有 `HY2_OBFS` 时订阅才带 `obfs=salamander`，客户端需支持）。  
    - REALITY `2443` / Vision `3443` 同理，必须直连。  
    - 只有协议 2/5 的 TCP 443（及 CF 支持的 HTTPS 端口）适合走 CDN。
