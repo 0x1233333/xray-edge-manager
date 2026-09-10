@@ -1,3 +1,4 @@
+- **v0.0.48-hy2-probe-pad**: Mihomo 参考 YAML 为 XHTTP 补上与服务端一致的 `x-padding-bytes: "100-1000"`；部署自检增加 HY2 监听/跳跃确认，并明文提示优先用 `*-HY2-HOP`；仓库增加 `skills/xem-deploy/SKILL.md` 供 Agent 使用。
 - **v0.0.47-hy2-hop-default**: 默认开启 HY2 UDP 端口跳跃；订阅/Mihomo 参考 YAML **优先** `*-HY2-HOP`（`ports`/`mport`），其后附单端口节点；文档注明部分机房外网 UDP 443 在到达网卡前被丢。关闭跳跃：`HY2_DISABLE_HOP=1` 或交互确认关闭。
 - **v0.0.46-hy2-clients**: HY2 inbound JSON key `clients` (Xray 26.3.27 only unmarshals `clients`, not `users`; empty validator caused HTTP/3 404).
 
@@ -5,7 +6,7 @@
 
 一键在 VPS 上部署 **Xray-core 边缘抗封锁节点**：REALITY 直连 + Cloudflare CDN 中转 + Xray Hysteria2 (HY2) + BestCF 优选入口 + Nginx 伪装站/订阅 + 可选 WARP 出站。
 
-当前脚本版本：`v0.0.47-hy2-hop-default`（仓库入口脚本一般为 `xem.sh`）。
+当前脚本版本：`v0.0.48-hy2-probe-pad`（仓库入口脚本一般为 `xem.sh`）。
 
 ---
 
@@ -261,6 +262,7 @@ REALITY_BLACKLIST=("www.microsoft.com" "microsoft.com" "login.microsoftonline.co
    - 开机 `--apply-hy2-hopping` / 内部恢复路径对非法范围、缺 iptables、跳跃段包含监听口等改为**告警并跳过**，避免 oneshot 每次开机失败；交互菜单仍会直接报错退出。  
    - 防火墙放行跳跃 UDP 段仅在协议 3 启用且已配置 `HY2_HOP_RANGE` 时添加。  
    - 客户端：订阅 `mport` / Mihomo `ports` + `hop-interval: 20`（随机间隔换端口）。
+   - 部署自检会打印「HY2 连通提示」：确认本机 UDP 监听与跳跃规则，并提醒客户端优先 `*-HY2-HOP`（本机通 ≠ 外网 UDP 主端口通）。
    - **部分机房外网 UDP 443 不可达**：包在到达 VPS 网卡前被上游丢弃（本机 `tcpdump` 0 包），本机环回/同机官方客户端仍可能 HyOK。生产请用 **HY2-HOP**；云安全组需放行跳跃 UDP 段（默认 `20000-20499`）。单端口节点仅作同机/可达路径备用。  
    - 未认证探测走 REALITY 目标站反向代理伪装；Salamander 混淆（有 `HY2_OBFS` 时订阅才带 `obfs=salamander`，客户端需支持）。  
    - REALITY `2443` / Vision `3443` 同理，必须直连。  
