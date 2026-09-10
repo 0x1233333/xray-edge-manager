@@ -2,7 +2,7 @@
 
 一键在 VPS 上部署 **Xray-core 边缘抗封锁节点**：REALITY 直连 + Cloudflare CDN 中转 + Xray Hysteria2 (HY2) + BestCF 优选入口 + Nginx 伪装站/订阅 + 可选 WARP 出站。
 
-当前脚本版本：`v0.0.36-rc22-production-ready`（仓库入口脚本一般为 `xem.sh`）。
+当前脚本版本：`v0.0.44-pipefix`（仓库入口脚本一般为 `xem.sh`）。
 
 ---
 
@@ -37,10 +37,10 @@
 
 | 组件 | 路径 / 角色 |
 |------|-------------|
-| Xray | `/usr/local/etc/xray/config.json`，用户 `xray` |
+| Xray | `/usr/local/etc/xray/config.json`，用户 `xray`；geodata 在 `/usr/local/share/xray`，`XRAY_LOCATION_ASSET`（systemd drop-in `15-xem-asset.conf`） |
 | Nginx | `/etc/nginx/conf.d/xray-edge-manager.conf` |
-| 伪装站 + 订阅 Web 根 | `/var/www/xray-edge-manager/` |
-| 订阅文件 | `/var/www/xray-edge-manager/sub/<TOKEN>` |
+| 伪装站 + 订阅 Web 根 | `/usr/local/etc/xray/www/` |
+| 订阅文件 | `/usr/local/etc/xray/www/sub/<TOKEN>` |
 | 本机订阅源 | `/root/.xray-edge-manager/subscription/` |
 | 状态 / BestCF / WARP | `/root/.xray-edge-manager/` |
 | 本地命令 | `/usr/local/bin/xem`（首次 curl 运行后会提示固化） |
@@ -53,14 +53,14 @@ Cloudflare 只代理 **TCP 80/443**（及少数 HTTPS 备用端口），**不代
 
 | 名称 | DNS | 用途 |
 |------|-----|------|
-| `BASE_DOMAIN`（如 `jparm.example.com`） | A/AAAA，**proxied=true**（小黄云） | 订阅 URL、伪装站、CDN/BestCF 入口 |
+| `BASE_DOMAIN`（如 `node.example.com`） | A/AAAA，**proxied=true**（小黄云） | 订阅 URL、伪装站、CDN/BestCF 入口 |
 | `v4.BASE_DOMAIN` | **仅 A**，proxied=false | IPv4 **直连**节点（REALITY / Vision / HY2） |
 | `v6.BASE_DOMAIN` | **仅 AAAA**，proxied=false | IPv6 **直连**节点 |
 
 因此：
 
 - **REALITY / HY2 / Vision** 链接主机名使用 `v4.` / `v6.`（直连解析到机器 IP），**不要**走 CF 代理的母域名。
-- **CDN / BestCF** 使用母域名或优选 CF 边缘地址，TLS SNI / host 仍为母域名。
+- **CDN / BestCF**：IP 入口的 TLS SNI/host 用母域名；优选 **域名** 入口的 SNI/host 用该 FQDN。
 
 ---
 
@@ -92,6 +92,7 @@ xem
 | `XEM_SCRIPT_RAW_URL` | 覆盖自安装 / 定时任务用的脚本 Raw 地址（分支/fork） |
 | `XEM_SELF_SHA256` | 安装本地 `xem` 时强制校验脚本 SHA256 |
 | `XEM_TRUST_REMOTE_SELF=1` | 跳过“是否从远程固化本地命令”确认 |
+| `XEM_XRAY_ALLOW_PRERELEASE=1` | 安装 Xray-core 时包含官方 prerelease；默认只装最新稳定版 |
 | `XEM_WARP_ENDPOINT_IPV4` / `XEM_WARP_ENDPOINT_IPV6` | WARP endpoint 覆盖 |
 
 ### 云厂商安全组（必做）
@@ -105,14 +106,14 @@ xem
 | TCP | `2443`（或你设的 REALITY 端口） | XHTTP+REALITY |
 | TCP | `3443`（若启用 Vision） | REALITY+Vision |
 | UDP | `443`（或你设的 HY2 端口） | Hysteria2 |
-| UDP | 跳跃段（若启用，如 `20000-20100`） | HY2 端口跳跃 |
+| UDP | 跳跃段（若启用，默认 `20000-20499`） | HY2 端口跳跃 |
 
 ---
 
 ## 配置流程（首次部署向导）
 
 1. **安装依赖** + **Xray-core** + geodata  
-2. **母域名** `BASE_DOMAIN`（建议 ≥3 段，如 `jparm.0x0000.top`）  
+2. **母域名** `BASE_DOMAIN`（建议 ≥3 段，如 `node.example.com`）  
 3. **Cloudflare API Token**（Zone DNS Edit + 用于 certbot DNS-01）  
 4. **节点显示名**  
 5. **ASN/IP 报告**（辅助选 REALITY 伪装目标）  
@@ -179,7 +180,7 @@ xem --apply-cf-origin-firewall
 Xray REALITY 对目标站点 TLS 证书链有缓冲区上限（约 **8192 字节**）。脚本内置全局黑名单（可按需改脚本内数组）：
 
 ```bash
-REALITY_BLACKLIST=("www.microsoft.com" "microsoft.com" "login.microsoftonline.com")
+REALITY_BLACKLIST=("www.microsoft.com" "microsoft.com" "login.microsoftonline.com" "www.apple.com" "apple.com" "icloud.com" "www.icloud.com")
 ```
 
 `validate_reality_target` 行为：
@@ -188,7 +189,11 @@ REALITY_BLACKLIST=("www.microsoft.com" "microsoft.com" "login.microsoftonline.co
 - 使用 `openssl s_client -showcerts` 探测完整证书链长度  
 - 链长度 **> 7800** 字节则拒绝（留安全余量）  
 - 探测失败 / 未装 openssl → **fail-closed**（拒绝该 target，避免装完不能用）  
-- 快捷选项与手动输入最终都会过校验  
+- 快捷选项与手动输入最终都会过校验。
+
+额外校验（对齐 Xray-core 26.x 启动警告）：域名包含 `apple` / `icloud` / `microsoft`，或后缀 `.cn` / `.ru` / `.ir` 会被拒绝。
+
+生成的 Xray JSON 同时写 `streamSettings.method` 与兼容字段 `network`；Hysteria2 入站使用官方 `settings.users`（仍兼容旧 `clients`）；REALITY 同时写 `dest` 与 `target`。安装 Xray 默认取**最新稳定 Release**（当前官方 latest 为 `v26.3.27`），需要跟进 prerelease 时设置 `XEM_XRAY_ALLOW_PRERELEASE=1`。
 
 ---
 
@@ -196,7 +201,7 @@ REALITY_BLACKLIST=("www.microsoft.com" "microsoft.com" "login.microsoftonline.co
 
 - 本机订阅：`https://<BASE_DOMAIN>/sub/<SUB_TOKEN>`  
 - 合并订阅（本机 + 远程列表）：`https://<BASE_DOMAIN>/sub/<MERGED_SUB_TOKEN>`  
-- Web 文件目录：`/var/www/xray-edge-manager/sub/`（**不是** `/usr/local/etc/xray/www/sub/`）  
+- Web 文件目录：`/usr/local/etc/xray/www/sub/`（Nginx 读这里，不读 `/root`）  
 - 原始节点列表：`/root/.xray-edge-manager/subscription/local.raw`  
 - Mihomo 参考片段：`.../subscription/mihomo-reference.yaml`（仅参考，对外仍发 base64）
 
@@ -211,11 +216,11 @@ REALITY_BLACKLIST=("www.microsoft.com" "microsoft.com" "login.microsoftonline.co
 | 协议 | 分享链接要点 | 客户端要求 |
 |------|----------------|------------|
 | XHTTP + REALITY | `type=xhttp`，`security=reality`，`mode=auto` | **Clash Meta / Mihomo 较新 dev 内核**（需支持 xhttp） |
-| XHTTP + CDN | `type=xhttp`，`security=tls`，`host`/`sni`=母域名 | 同上 |
+| XHTTP + CDN | `type=xhttp`，`security=tls`，`host`/`sni`=母域名或优选 FQDN | 同上 |
 | Vision | `type=tcp`，`flow=xtls-rprx-vision`，`security=reality` | Meta 常规 REALITY+Vision 支持 |
 | HY2 | `hysteria2://`，`alpn=h3`，可选 `mport` 跳跃 | 客户端需 **Hysteria2** 实现；**旧 Clash 内核不够** |
 
-建议客户端：**Clash Verge Rev / Mihomo（新版 meta 内核）**、v2rayN / sing-box 等已跟进 xhttp 与 HY2 的版本。  
+建议客户端：**Mihomo 开发板/Alpha**（xhttp `reuse-settings` / XMUX；HY2 参考 YAML 含 `ports` + `hop-interval: "10-30"`）。Clash Verge Rev 选开发板内核。不要给 XHTTP 节点叠 smux。v2rayN / sing-box 仍可用通用订阅，但 XMUX 字段以 Mihomo 参考 YAML 为准。  
 本脚本 **不使用 WebSocket(ws)** 作为主传输；CDN 与直连主力均为 **xhttp**。
 
 ---
@@ -248,6 +253,12 @@ REALITY_BLACKLIST=("www.microsoft.com" "microsoft.com" "login.microsoftonline.co
 
 2. **Cloudflare 不代理 UDP，也不代理非 CF HTTPS 端口上的直连**  
    - HY2（UDP）必须走 `v4.`/`v6.` DNS-only（或直接 IP），不能指望黄云母域名。  
+   - 端口跳跃默认段 `20000-20499`：Xray **只听一个** HY2 UDP 口；本机用 iptables/ip6tables `REDIRECT` 把跳跃段转到该口（开机由 `xem-hy2-hopping.service` / `xem --apply-hy2-hopping` 恢复）。跳跃范围**不能包含**真实监听口，否则会自环。  
+   - 变更 `HY2_PORT` 或开关协议 3 后，脚本会尝试同步/清理跳跃 NAT；同步失败**不会**回滚已写入的 Xray 配置（会告警，可稍后菜单 12 重跑）。  
+   - 开机 `--apply-hy2-hopping` / 内部恢复路径对非法范围、缺 iptables、跳跃段包含监听口等改为**告警并跳过**，避免 oneshot 每次开机失败；交互菜单仍会直接报错退出。  
+   - 防火墙放行跳跃 UDP 段仅在协议 3 启用且已配置 `HY2_HOP_RANGE` 时添加。  
+   - 客户端：订阅 `mport` / Mihomo `ports` + `hop-interval: "10-30"`（随机间隔换端口）。  
+   - 未认证探测走 REALITY 目标站反向代理伪装；Salamander 混淆（有 `HY2_OBFS` 时订阅才带 `obfs=salamander`，客户端需支持）。  
    - REALITY `2443` / Vision `3443` 同理，必须直连。  
    - 只有协议 2/5 的 TCP 443（及 CF 支持的 HTTPS 端口）适合走 CDN。
 
@@ -267,7 +278,10 @@ REALITY_BLACKLIST=("www.microsoft.com" "microsoft.com" "login.microsoftonline.co
    进程来自 `/dev/fd`，固化 `/usr/local/bin/xem` 时可能再拉一次 Raw；生产环境建议先落盘再 `install`，或设置 `XEM_SELF_SHA256`。
 
 8. **Oracle ARM 等**  
-   注意安全列表、IPv6 是否完整、以及 UDP 443 是否被运营商/安全组丢掉；HY2 问题优先查 UDP 与客户端内核。
+   注意安全列表、IPv6 是否完整、以及 UDP 443 是否被运营商/安全组掉掉；HY2 问题优先查 UDP 与客户端内核。
+
+9. **Xray 26.x REALITY 默认 minClientVer**  
+   若服务端未显式设置 `minClientVer`，Xray-core 26.3.27+ 会默认要求客户端也是 v26.3.27+；旧客户端/第三方内核可能被拒。
 
 ---
 
@@ -287,6 +301,25 @@ REALITY_BLACKLIST=("www.microsoft.com" "microsoft.com" "login.microsoftonline.co
 
 ---
 
+## 版本记录（脚本 / README 同步更新）
+
+每次改 `xem.sh` 都会同步改本 README 的版本号与说明。
+
+**历史备份**：每次发版前把上一版可运行的 `xem.sh` 拷到仓库 `backup/`（命名如 `backup/xem-v0.0.43-ops.sh`），改坏时可直接回滚，不必翻 git bisect。
+
+| 版本 | 要点 |
+|------|------|
+| **v0.0.44-pipefix** | 管道下 `ask` 只读 stdin；已保存 CF 防火墙状态可跳过确认；僵尸锁 `rm` 重建；CDN `trustedXForwardedFor`+`X-Xem-Cdn-Trusted`；BestCF 无数据重试且有协议2时不重复 Entry；非交互跳过节点名/REALITY/HY2 跳跃提问 |
+| **v0.0.43-ops** | 开机/内部 HY2 跳跃恢复 soft-fail；`restart_services` 轮询 active 避免误回滚；备份选取避开 `ls\|head` pipefail；防火墙跳跃段仅协议 3；菜单 4 可关闭 geodata 定时器；清理未使用 stack/SSRF 包装函数 |
+| **v0.0.42-harden** | Xray 配置已原子写入后，HY2 跳跃同步在子 shell 执行：`die`/`exit` 不会把整次 `generate_xray_config` 判失败 |
+| **v0.0.41-hy2hop-sync** | 监听口变更后同步 iptables `REDIRECT` 目标；拒绝跳跃段包含监听口；开机只恢复 NAT；Mihomo HY2 `obfs` 仅在设置了混淆时写入 |
+| **v0.0.40-geodata** | `XRAY_LOCATION_ASSET=/usr/local/share/xray`，避免首次 `xray -test` 找不到 `geoip.dat` |
+| **v0.0.39-mihomo** | Mihomo Alpha：XHTTP `reuse-settings`/XMUX、padding、`packet-encoding: xudp`；HY2 `hop-interval: "10-30"` |
+| **v0.0.38-antigfw** | HY2 Salamander、masquerade、默认端口跳跃、额外 REALITY shortIds |
+
+合入 `main` 后请在 VPS 上重新生成 Xray 配置与订阅（菜单 9 或等价流程）。
+
+---
 ## 许可证与致谢
 
 - [XTLS/Xray-core](https://github.com/XTLS/Xray-core)  

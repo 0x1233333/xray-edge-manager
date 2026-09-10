@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Xray Edge Manager / Xray Anti-Block Manager
-# v0.0.44-pipefix — stdin-safe ask; zombie lock rm; CDN XFF trust header; BestCF retry; noninteractive skips
+# v0.0.43-ops — boot HY2 hop soft-fail; restart active wait; pipefail-safe backup pick; firewall hop scope
 #
 # Features:
 # - Xray-core only, no Docker, no sing-box
@@ -185,42 +185,25 @@ mktemp_dir(){
 
 acquire_lock(){
   # 清理已退出进程留下的锁文件，避免菜单被永久挡住。
-  # 必须 rm 掉旧 inode：仅 truncate 时，若仍有异常持有者/残留，flock 可能一直失败。
   local _lock_pid _retry=0
-  mkdir -p "$(dirname "$LOCK_FILE")" 2>/dev/null || true
-  while [[ $_retry -lt 3 ]]; do
+  while [[ $_retry -lt 2 ]]; do
     _lock_pid=""
     if [[ -f "$LOCK_FILE" ]]; then
       _lock_pid=$(head -n1 "$LOCK_FILE" 2>/dev/null || true)
       _lock_pid="${_lock_pid//[[:space:]]/}"
     fi
-    if [[ -n "$_lock_pid" && "$_lock_pid" =~ ^[0-9]+$ ]] && ! kill -0 "$_lock_pid" 2>/dev/null; then
+    if [[ -n "$_lock_pid" ]] && ! kill -0 "$_lock_pid" 2>/dev/null; then
       warn "检测到僵尸锁 (PID $_lock_pid 已退出)，自动清理。"
-      rm -f "$LOCK_FILE" 2>/dev/null || true
+      : > "$LOCK_FILE"
       _retry=$((_retry + 1))
       continue
     fi
     break
   done
-  touch "$LOCK_FILE" 2>/dev/null || true
   exec 9>"$LOCK_FILE"
   if ! flock -n 9; then
-    _lock_pid=$(head -n1 "$LOCK_FILE" 2>/dev/null || true)
-    _lock_pid="${_lock_pid//[[:space:]]/}"
-    if [[ -n "$_lock_pid" && "$_lock_pid" =~ ^[0-9]+$ ]] && ! kill -0 "$_lock_pid" 2>/dev/null; then
-      warn "flock 失败但记录 PID $_lock_pid 已退出，强制重建锁文件。"
-      exec 9<&- 9>&- 2>/dev/null || true
-      rm -f "$LOCK_FILE" 2>/dev/null || true
-      touch "$LOCK_FILE" 2>/dev/null || true
-      exec 9>"$LOCK_FILE"
-      if ! flock -n 9; then
-        err "检测到另一个 xray-edge-manager 实例正在运行，请稍后再试。"
-        exit 1
-      fi
-    else
-      err "检测到另一个 xray-edge-manager 实例正在运行，请稍后再试。"
-      exit 1
-    fi
+    err "检测到另一个 xray-edge-manager 实例正在运行，请稍后再试。"
+    exit 1
   fi
   : > "$LOCK_FILE"
   printf '%s\n' "$$" >&9
@@ -362,12 +345,10 @@ ask(){
   local prompt="$1" default="${2:-}" ans msg
   if [[ -n "$default" ]]; then msg="$prompt [$default]: "; else msg="$prompt: "; fi
 
-  # IMPORTANT: when stdin is a pipe/file (non-interactive answer scripts), NEVER
-  # read /dev/tty — otherwise later confirms (e.g. CF origin firewall) consume
-  # leftover stdin answers and appear "mis-eaten".
-  # Interactive terminals may still prefer /dev/tty so prompts work when stdout
-  # is redirected.
-  if [[ -t 0 ]] && { exec 3<>/dev/tty; } 2>/dev/null; then
+  # Robust interactive input: some non-interactive shells report /dev/tty as
+  # present but fail when opening it. Open it once and fall back cleanly to
+  # stdin/stderr, avoiding noisy "/dev/tty: No such device" diagnostics.
+  if { exec 3<>/dev/tty; } 2>/dev/null; then
     printf '%s' "$msg" >&3 || true
     IFS= read -r ans <&3 || ans=""
     exec 3<&- 3>&- || true
@@ -1128,19 +1109,7 @@ configure_node_name(){
   else
     default_name="node"
   fi
-  if [[ -n "${NODE_NAME:-}" ]]; then
-    name=$(sanitize_node_name "$NODE_NAME")
-    save_kv "$STATE_FILE" NODE_NAME "$name"
-    info "已使用节点名称：$name"
-    return 0
-  fi
-  if [[ ! -t 0 ]]; then
-    name=$(sanitize_node_name "$default_name")
-    save_kv "$STATE_FILE" NODE_NAME "$name"
-    info "非交互模式：节点名称默认 $name"
-    return 0
-  fi
-  name=$(ask "请输入节点名称，用于订阅中区分机器，例如 jp1/us1/oracle-tokyo" "$default_name")
+  name=$(ask "请输入节点名称，用于订阅中区分机器，例如 jp1/us1/oracle-tokyo" "${NODE_NAME:-$default_name}")
   name=$(sanitize_node_name "$name")
   save_kv "$STATE_FILE" NODE_NAME "$name"
   log "节点名称已设置：$name"
@@ -1972,19 +1941,6 @@ validate_reality_target(){
 choose_reality_target(){
   load_state
   local c target _asn_country="" _asn_org=""
-  if [[ -n "${REALITY_TARGET:-}" ]] && validate_hostname "${REALITY_TARGET%%:*}" && validate_reality_target "$REALITY_TARGET"; then
-    info "已使用 REALITY 伪装目标：$REALITY_TARGET"
-    return 0
-  fi
-  if [[ ! -t 0 ]]; then
-    target="${REALITY_TARGET:-www.ebay.com}"
-    if ! validate_hostname "${target%%:*}" || ! validate_reality_target "$target"; then
-      target="www.ebay.com"
-    fi
-    save_kv "$STATE_FILE" REALITY_TARGET "$target"
-    info "非交互模式：REALITY 伪装目标默认 $target"
-    return 0
-  fi
   if command -v asn >/dev/null 2>&1; then
     _asn_country=$(asn -j 2>/dev/null | jq -r ".country_name // empty" 2>/dev/null || true)
     _asn_org=$(asn -j 2>/dev/null | jq -r ".org // empty" 2>/dev/null || true)
@@ -3087,7 +3043,7 @@ EOF2
 
   if protocol_enabled 2 || protocol_enabled 5; then
     append_json_obj "$in_tmp" first_in <<EOF2
-    {"tag":"in-xhttp-cdn-local","listen":"127.0.0.1","port":${XHTTP_CDN_LOCAL_PORT},"protocol":"vless","settings":{"clients":[{"id":"${UUID}","email":"xhttp-cdn"}],"decryption":"none"},"streamSettings":{"method":"xhttp","network":"xhttp","security":"none","xhttpSettings":{"path":"${XHTTP_CDN_PATH}","mode":"auto","extra":{"xPaddingBytes":"100-1000","noSSEHeader":true}},"sockopt":{"trustedXForwardedFor":["X-Xem-Cdn-Trusted"]}}}
+    {"tag":"in-xhttp-cdn-local","listen":"127.0.0.1","port":${XHTTP_CDN_LOCAL_PORT},"protocol":"vless","settings":{"clients":[{"id":"${UUID}","email":"xhttp-cdn"}],"decryption":"none"},"streamSettings":{"method":"xhttp","network":"xhttp","security":"none","xhttpSettings":{"path":"${XHTTP_CDN_PATH}","mode":"auto","extra":{"xPaddingBytes":"100-1000","noSSEHeader":true}}}}
 EOF2
     cdn_xhttp_ready=1
     [[ "$bind" == "1" ]] && append_route_for_inbound "$route_tmp" first_route "in-xhttp-cdn-local" "cdn" "$outbound_mode"
@@ -3347,8 +3303,6 @@ configure_nginx(){
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto https;
-        # Presence-only trust gate for Xray sockopt.trustedXForwardedFor (not an IP list).
-        proxy_set_header X-Xem-Cdn-Trusted 1;
         proxy_buffering off;
         proxy_request_buffering off;
         proxy_read_timeout 3600s;
@@ -3937,29 +3891,15 @@ generate_subscription(){
     add_vless_xhttp_cdn_link "$BASE_DOMAIN" "${NODE_NAME:-node}-CDN-XHTTP-Origin" "$raw" "${CDN_PORT:-443}"
   fi
 
-  # 5 = CDN 入口扩展：只发 BestCF 节点。无数据时先重试拉取；仍失败则：
-  # - 若同时开了协议 2，不再重复塞母域名 Entry（协议 2 已有 Origin）
-  # - 若只有协议 5，才退回一条母域名 Entry，避免订阅空白
+  # 5 = CDN 入口扩展。优先生成 BestCF 节点；若 BestCF 数据还没拉取，则保留一个母域名入口，防止节点为空。
   if protocol_enabled 5 && node_ready CDN_XHTTP_READY; then
     local before_count after_count
     before_count=$(wc -l < "$raw" 2>/dev/null || echo 0)
     generate_bestcf_subscription_nodes "$raw"
     after_count=$(wc -l < "$raw" 2>/dev/null || echo 0)
     if [[ "$after_count" -eq "$before_count" ]]; then
-      warn "协议 5 本轮无 BestCF 节点，正在重试拉取远端数据。"
-      # ensure_bestcf_data_if_needed skips when BESTCF_FETCHED_THIS_RUN=1
-      export BESTCF_FETCHED_THIS_RUN=0
-      fetch_bestcf_all || true
-      generate_bestcf_subscription_nodes "$raw"
-      after_count=$(wc -l < "$raw" 2>/dev/null || echo 0)
-    fi
-    if [[ "$after_count" -eq "$before_count" ]]; then
-      if protocol_enabled 2; then
-        warn "协议 5 仍无可用 BestCF 数据；已有协议 2 母域名 CDN 节点，跳过重复 Entry 回退。"
-      else
-        add_vless_xhttp_cdn_link "$BASE_DOMAIN" "${NODE_NAME:-node}-CDN-XHTTP-Entry" "$raw" "${CDN_PORT:-443}"
-        warn "协议 5 仍无可用 BestCF 数据，且未启用协议 2：临时回退一条母域名 CDN Entry，请稍后菜单 11 重拉 BestCF。"
-      fi
+      add_vless_xhttp_cdn_link "$BASE_DOMAIN" "${NODE_NAME:-node}-CDN-XHTTP-Entry" "$raw" "${CDN_PORT:-443}"
+      warn "协议 5 未找到可用 BestCF 数据，已自动退回母域名 CDN Entry。"
     fi
   elif protocol_enabled 2 && node_ready CDN_XHTTP_READY; then
     generate_bestcf_subscription_nodes "$raw"
@@ -4206,16 +4146,6 @@ sync_hy2_hopping_if_needed(){
 configure_hy2_hopping_prompt(){
   load_state
   [[ "${PROTOCOLS:-0}" == *3* ]] || return 0
-  if [[ -n "${HY2_HOP_RANGE:-}" ]]; then
-    info "已使用 HY2 跳跃范围：${HY2_HOP_RANGE} -> ${HY2_PORT:-443}"
-    enable_hy2_hopping "$HY2_HOP_RANGE" || warn "HY2 跳跃应用失败，可稍后菜单 12 重试。"
-    return 0
-  fi
-  if [[ ! -t 0 ]]; then
-    info "非交互模式：默认开启 HY2 跳跃 ${DEFAULT_HY2_HOP_RANGE}"
-    enable_hy2_hopping "$DEFAULT_HY2_HOP_RANGE" || warn "HY2 跳跃应用失败，可稍后菜单 12 重试。"
-    return 0
-  fi
   if confirm "是否开启 Hysteria2 UDP 端口跳跃（抗单端口 QoS，推荐）？范围 ${DEFAULT_HY2_HOP_RANGE}" "Y"; then
     local range; range=$(ask "请输入跳跃端口范围，格式 start:end" "${HY2_HOP_RANGE:-$DEFAULT_HY2_HOP_RANGE}")
     enable_hy2_hopping "$range"
@@ -4341,17 +4271,6 @@ disable_cf_origin_firewall(){
 
 configure_cf_origin_firewall_prompt(){
   load_state
-  # Prefill / re-run: honor saved choice so piped installs do not re-prompt and
-  # accidentally consume the wrong stdin answer.
-  if [[ "${ENABLE_CF_ORIGIN_FIREWALL:-}" == "1" ]]; then
-    info "已按状态启用 Cloudflare 源站入口限制（ENABLE_CF_ORIGIN_FIREWALL=1）。"
-    enable_cf_origin_firewall
-    return 0
-  fi
-  if [[ "${ENABLE_CF_ORIGIN_FIREWALL:-}" == "0" ]]; then
-    info "已按状态跳过 Cloudflare 源站入口限制（ENABLE_CF_ORIGIN_FIREWALL=0）。"
-    return 0
-  fi
   warn "开启后，TCP 80/${CDN_PORT:-443} 的非 Cloudflare 来源会被丢弃；纯节点机推荐开启，有其它直连网站业务请选 N。"
   if confirm "是否限制订阅/伪装站/CDN 源站 TCP 80/${CDN_PORT:-443} 只允许 Cloudflare 回源？直接回车 = Y；不影响 HY2 UDP 443" "Y"; then
     enable_cf_origin_firewall
@@ -5792,7 +5711,7 @@ main_menu(){
   load_state
   while true; do
     echo
-    echo "===== Xray Edge Manager v0.0.44-pipefix ====="
+    echo "===== Xray Edge Manager v0.0.43-ops ====="
     echo "1. 首次部署向导，推荐"
     echo "2. 安装/升级基础依赖"
     echo "3. 安装/升级 Xray-core"
