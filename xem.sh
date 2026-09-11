@@ -5052,6 +5052,83 @@ add_bestcf_nodes_from_file(){
   done < "$file"
 }
 
+# 判断 IPv4 是否属于 Cloudflare 边缘 IP 段。
+# 优先 python3 + ipaddress 精确匹配脚本内置 CF 段（cf_fallback_ips_v4）；
+# 无 python3 时退化为前缀近似（宁可放过，不可错杀）。
+is_cf_edge_ip(){
+  local ip="${1:-}"
+  valid_ipv4_literal "$ip" || return 1
+  if command -v python3 >/dev/null 2>&1; then
+    local nets
+    nets="$(cf_fallback_ips_v4 | tr '\n' ' ')"
+    python3 - "$ip" "$nets" <<'PYCIDR' >/dev/null 2>&1
+import ipaddress, sys
+try:
+    ip = ipaddress.ip_address(sys.argv[1])
+except Exception:
+    raise SystemExit(1)
+for tok in sys.argv[2].split():
+    try:
+        net = ipaddress.ip_network(tok, strict=False)
+    except Exception:
+        continue
+    if ip in net:
+        raise SystemExit(0)
+raise SystemExit(1)
+PYCIDR
+    return $?
+  fi
+  local a b
+  a="${ip%%.*}"; b="${ip#*.}"; b="${b%%.*}"
+  case "$a" in
+    104) (( 10#$b >= 16 && 10#$b <= 27 )) && return 0 ;;
+    172) (( 10#$b >= 64 && 10#$b <= 71 )) && return 0 ;;
+    162) (( 10#$b >= 158 && 10#$b <= 159 )) && return 0 ;;
+    188) (( 10#$b == 114 )) && return 0 ;;
+    173) (( 10#$b == 245 )) && return 0 ;;
+    141) (( 10#$b == 101 )) && return 0 ;;
+    108) (( 10#$b == 162 )) && return 0 ;;
+    190) (( 10#$b == 93 )) && return 0 ;;
+    197) (( 10#$b == 234 )) && return 0 ;;
+    198) (( 10#$b == 41 )) && return 0 ;;
+    131) (( 10#$b == 0 )) && return 0 ;;
+    103) (( 10#$b >= 21 && 10#$b <= 31 )) && return 0 ;;
+  esac
+  return 1
+}
+
+# 从 BestCF 优选域名列表里筛出**真正能当 CF 入口**的条目，写入临时文件并输出其路径
+# （调用方负责使用；临时文件已注册进脚本的退出清理）。无可用条目时输出空字符串。
+# 判据：① 能解析出 IPv4；② 该 IPv4 落在 Cloudflare 边缘段内。
+# 为什么需要：数据源 bestcf-domain.txt 实测 25 条里混有**失效域名**（无 A 记录，如 bestcf.top）
+# 与**非 CF 域名**（解析到自己真实 IP，如 www.visa.cn → 123.138.202.33，请求根本不会到 CF 边缘）。
+# 原实现盲取前 N 条 → 订阅里混进必然连不上的节点（实测取前 3 条就有 1 条死的）。
+# 过滤后顺序取前 N 条，保证写进订阅的都是活入口。label 重新编号为连续的 CFDomain_1..N。
+filter_reachable_bestcf_entries(){
+  local src="$1"
+  [[ -s "$src" ]] || { echo ""; return 0; }
+  local out="" srv port label ip hit=0
+  out="$(mktemp_file "$BESTCF_DIR/filtered-domain.XXXXXX")" || { echo ""; return 0; }
+  while IFS='|' read -r srv port label _rest; do
+    [[ -z "${srv:-}" || "$srv" =~ ^# ]] && continue
+    if valid_ipv4_literal "$srv"; then
+      ip="$srv"
+    else
+      ip="$(getent ahostsv4 "$srv" 2>/dev/null | awk 'NR==1{print $1}')"
+    fi
+    [[ -n "$ip" ]] || continue
+    is_cf_edge_ip "$ip" || continue
+    hit=$((hit+1))
+    printf '%s|%s|%s\n' "$srv" "${port:-443}" "CFDomain_${hit}" >> "$out"
+  done < "$src"
+  if [[ "$hit" -eq 0 ]]; then
+    rm -f "$out" 2>/dev/null || true
+    echo ""
+    return 0
+  fi
+  echo "$out"
+}
+
 generate_bestcf_subscription_nodes(){
   local raw="$1" mode="${BESTCF_MODE:-domain}" total=0
   [[ "${BESTCF_ENABLED:-0}" == "1" ]] || return 0
@@ -5064,7 +5141,18 @@ generate_bestcf_subscription_nodes(){
     [[ "$dom_limit" =~ ^[0-9]+$ ]] || dom_limit=1
     [[ "$dom_limit" -lt 1 ]] && dom_limit=1
     [[ "$dom_limit" -gt 25 ]] && dom_limit=25
-    add_bestcf_nodes_from_file "$BESTCF_DIR/bestcf-domain.txt" "CFDomain" "$raw" "$dom_limit" total "$dom_limit"
+    local dom_src="$BESTCF_DIR/bestcf-domain.txt"
+    # 先按可达性过滤（能解析 + 解析到 CF 边缘段），再顺序取前 dom_limit 条 ——
+    # 数据源里混有失效域名与非 CF 域名，盲取会把必然连不上的节点写进订阅。
+    # 过滤结果为空（如 DNS 临时故障）时回退未过滤数据，保持旧行为而不是产出 0 个节点。
+    local dom_filtered
+    dom_filtered="$(filter_reachable_bestcf_entries "$dom_src")"
+    if [[ -n "$dom_filtered" && -s "$dom_filtered" ]]; then
+      add_bestcf_nodes_from_file "$dom_filtered" "CFDomain" "$raw" "$dom_limit" total "$dom_limit"
+    else
+      warn "BestCF 优选域名可达性过滤后无可用条目，退回未过滤数据。"
+      add_bestcf_nodes_from_file "$dom_src" "CFDomain" "$raw" "$dom_limit" total "$dom_limit"
+    fi
     return 0
   fi
 
