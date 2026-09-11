@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Xray Edge Manager / Xray Anti-Block Manager
-# v0.0.51-cfdomain-sni-fix — BestCF 节点 SNI/Host 固定为本机母域名（修复 CFDomain 全部不可用）
+# v0.0.49-net-default — install_full applies stable BBR/sysctl by default; skill for clean reinstall
 #
 # Features:
 # - Xray-core only, no Docker, no sing-box
@@ -22,8 +22,6 @@
 
 set -Eeuo pipefail
 umask 077
-
-XEM_VERSION="v0.0.51-cfdomain-sni-fix"
 
 # Global temp cleanup registry. Any temp file/dir registered here will be
 # removed on normal exit or interruption. Missing paths are ignored.
@@ -260,7 +258,7 @@ allowed_state_key(){
     DOMAIN_V4|DOMAIN_V6|IPV4_ENABLED|IPV6_ENABLED|CF_ZONE_NAME|CDN_NETWORK|HY2_SNI|WEB_ROOT|LAST_SUBSCRIPTION_NODE_COUNT|LAST_SUBSCRIPTION_REGEN|LAST_PUBLIC_IP_DETECT)
       return 0
       ;;
-    CF_API_TOKEN|CF_ZONE_ID)
+    CF_API_TOKEN|CF_ZONE_NAME|CF_ZONE_ID)
       return 0
       ;;
     *)
@@ -431,35 +429,6 @@ version_ge(){
   fi
   return 1
 }
-# Normalize Xray tag/version strings for comparison (strip leading v, take first token).
-xray_version_normalize(){
-  local v="${1:-}"
-  v="${v#v}"
-  v="${v#V}"
-  v="${v%%[[:space:]]*}"
-  # Drop common build metadata suffixes after +
-  v="${v%%+*}"
-  printf '%s' "$v"
-}
-
-xray_version_ge(){
-  local a b
-  a="$(xray_version_normalize "$1")"
-  b="$(xray_version_normalize "$2")"
-  [[ -n "$a" && -n "$b" ]] || return 1
-  version_ge "$a" "$b"
-}
-
-xray_installed_version(){
-  local line ver
-  [[ -x /usr/local/bin/xray ]] || { printf '%s' ""; return 0; }
-  line="$(/usr/local/bin/xray version 2>/dev/null | head -n1 || true)"
-  # e.g. "Xray 26.6.1 (Xray, Penetrates Everything.) ..."
-  ver="$(sed -n 's/^[Xx]ray[[:space:]]\+\([0-9][^[:space:]]*\).*/\1/p' <<<"$line")"
-  printf '%s' "$ver"
-}
-
-
 
 validate_base_domain(){
   local d="$1"
@@ -879,7 +848,6 @@ install_or_upgrade_xray_release_verified(){
   need_root
   ensure_runtime_dirs
   local asset release_json release_obj tag asset_url dgst_url tmp zip dgst expected actual extract_dir xray_bin dat f
-  local allow_prerelease pin_version current_ver
 
   asset="$(xray_release_asset_name)" || die "当前架构暂不支持自动匹配 Xray 官方 Release：$(uname -m)"
   # SECURITY FIX: use APP_DIR instead of /tmp to avoid symlink race in multi-user systems.
@@ -894,50 +862,25 @@ install_or_upgrade_xray_release_verified(){
     -H "Accept: application/vnd.github+json" \
     -o "$release_json" "$XRAY_CORE_RELEASE_API?per_page=50" || die "获取 Xray-core 官方 Release 列表失败。"
 
+  local allow_prerelease release_filter
   allow_prerelease="${XEM_XRAY_ALLOW_PRERELEASE:-0}"
   [[ "$allow_prerelease" == "1" ]] || allow_prerelease=0
-  pin_version="${XEM_XRAY_PIN_VERSION:-}"
-  if [[ -n "$pin_version" ]]; then
-    info "已设置 XEM_XRAY_PIN_VERSION=${pin_version}：将安装该精确标签（允许 prerelease）。"
-  elif [[ "$allow_prerelease" == "1" ]]; then
-    warn "Xray-core 安装允许官方 prerelease（XEM_XRAY_ALLOW_PRERELEASE=1）：按最高 semver 标签选取；默认安装最新稳定版并校验官方 .dgst。"
+  if [[ "$allow_prerelease" == "1" ]]; then
+    release_filter='map(select(.draft|not))'
+    warn "Xray-core 安装允许官方 prerelease（XEM_XRAY_ALLOW_PRERELEASE=1）：用于跟进最新协议；默认安装最新稳定版并校验官方 .dgst。"
+  else
+    release_filter='map(select((.draft|not) and (.prerelease|not)))'
   fi
 
   # Select one release object first, then take ZIP and .dgst from the same
   # release. Do not use `jq ... | head -n1` under pipefail: when GitHub returns
   # many releases, head may close the pipe early and jq exits with SIGPIPE,
   # causing a silent script exit before any die() message is printed.
-  if [[ -n "$pin_version" ]]; then
-    release_obj=$(jq -c --arg asset "$asset" --arg pin "$pin_version" '
-      map(select(.draft|not)) |
-      map(select(
-        .tag_name == $pin
-        or .tag_name == ("v" + $pin)
-        or ("v" + .tag_name) == $pin
-      )) |
-      map(select(any(.assets[]?; .name == $asset) and any(.assets[]?; .name == ($asset + ".dgst")))) |
-      .[0] // empty
-    ' "$release_json") || die "解析 Xray-core Release JSON 失败。"
-  elif [[ "$allow_prerelease" == "1" ]]; then
-    # Highest semver among matching assets (not GitHub API .[0] order).
-    release_obj=$(jq -c --arg asset "$asset" '
-      map(select(.draft|not)) |
-      map(select(any(.assets[]?; .name == $asset) and any(.assets[]?; .name == ($asset + ".dgst")))) |
-      sort_by(
-        .tag_name
-        | sub("^v";"")
-        | split("-")[0]
-        | split(".")
-        | map(tonumber? // 0)
-      ) | reverse | .[0] // empty
-    ' "$release_json") || die "解析 Xray-core Release JSON 失败。"
-  else
-    release_obj=$(jq -c --arg asset "$asset" '
-      map(select((.draft|not) and (.prerelease|not))) |
-      map(select(any(.assets[]?; .name == $asset) and any(.assets[]?; .name == ($asset + ".dgst")))) |
-      .[0] // empty
-    ' "$release_json") || die "解析 Xray-core Release JSON 失败。"
-  fi
+  release_obj=$(jq -c --arg asset "$asset" --argjson allow_pre "$allow_prerelease" '
+    (if $allow_pre == 1 then map(select(.draft|not)) else map(select((.draft|not) and (.prerelease|not))) end) |
+    map(select(any(.assets[]?; .name == $asset) and any(.assets[]?; .name == ($asset + ".dgst")))) |
+    .[0] // empty
+  ' "$release_json") || die "解析 Xray-core Release JSON 失败。"
 
   [[ -n "$release_obj" && "$release_obj" != "null" ]] || die "未在 Xray-core 官方 Release 中找到 $asset 及其 .dgst 校验文件。"
 
@@ -946,20 +889,6 @@ install_or_upgrade_xray_release_verified(){
   dgst_url=$(jq -r --arg asset "$asset" '.assets[]? | select(.name == ($asset + ".dgst")) | .browser_download_url' <<<"$release_obj") || die "解析 Xray digest 下载地址失败。"
 
   [[ -n "$tag" && -n "$asset_url" && -n "$dgst_url" && "$asset_url" != "null" && "$dgst_url" != "null" ]] || die "未在 Xray-core 官方 Release 中找到 $asset 及其 .dgst 校验文件。"
-
-  # BUG1: never silently downgrade an already-newer installed Xray.
-  current_ver="$(xray_installed_version)"
-  if [[ -n "$current_ver" ]]; then
-    if xray_version_ge "$current_ver" "$tag"; then
-      if [[ "$(xray_version_normalize "$current_ver")" == "$(xray_version_normalize "$tag")" ]]; then
-        log "当前 Xray-core 已是 ${current_ver}（候选 ${tag}），跳过覆盖安装。"
-      else
-        warn "当前 Xray-core ${current_ver} 不低于候选 ${tag}，跳过安装以避免降级。"
-      fi
-      xray version || true
-      return 0
-    fi
-  fi
 
   info "准备安装 Xray-core ${tag}：$asset"
   info "下载官方 ZIP 与同 Release digest 文件。"
@@ -981,13 +910,6 @@ install_or_upgrade_xray_release_verified(){
   unzip -oq "$zip" -d "$extract_dir" || die "解压 Xray ZIP 失败。"
   xray_bin="$(find "$extract_dir" -type f -name xray -print -quit)"
   [[ -n "$xray_bin" && -f "$xray_bin" ]] || die "Xray ZIP 中未找到 xray 二进制。"
-
-  # Re-check immediately before overwrite (race / parallel upgrade).
-  current_ver="$(xray_installed_version)"
-  if [[ -n "$current_ver" ]] && xray_version_ge "$current_ver" "$tag"; then
-    warn "安装前再次检测：当前 Xray-core ${current_ver} ≥ 候选 ${tag}，跳过覆盖以避免降级。"
-    return 0
-  fi
 
   install -d /usr/local/bin /usr/local/etc/xray /usr/local/share/xray /var/log/xray
   install -m 755 "$xray_bin" /usr/local/bin/xray
@@ -1483,24 +1405,9 @@ select_ip_stack_strategy(){
 
 protocol_enabled(){ [[ "${PROTOCOLS:-0}" == *"$1"* ]]; }
 
-
-reconcile_bestcf_state_if_needed(){
-  # 协议 5 依赖 BestCF 状态键；非交互早退前也必须对齐，否则订阅 WARN 路径误判。
-  load_state
-  if [[ "${PROTOCOLS:-0}" == *5* && "${BESTCF_ENABLED:-0}" != "1" ]]; then
-    save_kv "$STATE_FILE" BESTCF_ENABLED "1"
-    save_kv "$STATE_FILE" BESTCF_MODE "domain"
-    save_kv "$STATE_FILE" BESTCF_PER_CATEGORY_LIMIT "1"
-    save_kv "$STATE_FILE" BESTCF_TOTAL_LIMIT "1"
-    warn "检测到协议 5，已自动开启 BestCF：只生成 1 个优选域名节点；生成订阅前会自动拉取数据。"
-  fi
-}
-
 select_protocols(){
   load_state
   local p port
-  # BUG2: reconcile BestCF BEFORE non-interactive early return
-  reconcile_bestcf_state_if_needed
   # Non-interactive: skip if PROTOCOLS + ports already set
   if [[ -n "${PROTOCOLS:-}" && "${PROTOCOLS}" != "0" && -n "${CDN_PORT:-}" ]]; then
     info "使用已保存的协议配置: PROTOCOLS=${PROTOCOLS} CDN_PORT=${CDN_PORT}"
@@ -1531,7 +1438,13 @@ select_protocols(){
 
   # 协议 5 的意义是 CDN/BestCF 入口扩展。若用户选择 5，则自动开启 BestCF 域名模式；否则 5 会和普通 CDN 节点重复，没有实际意义。
   if [[ "$p" == *5* ]]; then
-    reconcile_bestcf_state_if_needed
+    if [[ "${BESTCF_ENABLED:-0}" != "1" ]]; then
+      save_kv "$STATE_FILE" BESTCF_ENABLED "1"
+      save_kv "$STATE_FILE" BESTCF_MODE "domain"
+      save_kv "$STATE_FILE" BESTCF_PER_CATEGORY_LIMIT "1"
+      save_kv "$STATE_FILE" BESTCF_TOTAL_LIMIT "1"
+      warn "检测到协议 5，已自动开启 BestCF：只生成 1 个优选域名节点；生成订阅前会自动拉取数据。"
+    fi
   fi
 
   if [[ "$p" == *1* ]]; then
@@ -3427,6 +3340,7 @@ configure_nginx(){
   cleanup_legacy_nginx_conf
   disable_nginx_packaged_default_site
   mkdir -p "$WEB_ROOT" "$WEB_ROOT/sub" "$SUB_DIR"
+  touch "$WEB_ROOT/sub/${SUB_TOKEN}"
   ensure_web_subscription_permissions
 
   local nginx_http_v6_listen="" nginx_https_v6_listen="" nginx_https_listen="" nginx_http2_directive="" nginx_version="" nginx_target_tmp=""
@@ -3665,10 +3579,7 @@ add_vless_xhttp_reality_link(){
 
 add_vless_xhttp_cdn_link(){
   local server="$1" name="$2" raw="$3" port="${4:-443}" path_enc server_uri sni_host
-  # 第 5 参数为 SNI/Host，缺省回落本机母域名 $BASE_DOMAIN —— 这是唯一正确取值：
-  # 只有本机母域名的 CF DNS 记录指向本机源站。
-  # 切勿传入 BestCF 优选域名（v0.0.40–v0.0.50 曾这样做 → CF 按那个域名的 zone 回源 → 403，
-  # 订阅里的 CFDomain 节点全部不可用）。
+  # 第 5 参数为 SNI/Host；BestCF 域名模式传入优选 FQDN，使其与证书/回源主机一致。
   sni_host="${5:-$BASE_DOMAIN}"
   server_uri=$(format_uri_host "$server")
   path_enc=$(uri_encode "$XHTTP_CDN_PATH")
@@ -4079,9 +3990,7 @@ generate_subscription(){
       after_count=$(wc -l < "$raw" 2>/dev/null || echo 0)
     fi
     if [[ "$after_count" -eq "$before_count" ]]; then
-      if [[ "${BESTCF_ENABLED:-0}" != "1" ]]; then
-        warn "协议 5 无 BestCF 节点：BestCF 开关未开或状态键缺失（BESTCF_ENABLED!=1），请检查协议配置或菜单 11。"
-      elif protocol_enabled 2; then
+      if protocol_enabled 2; then
         warn "协议 5 仍无可用 BestCF 数据；已有协议 2 母域名 CDN 节点，跳过重复 Entry 回退。"
       else
         add_vless_xhttp_cdn_link "$BASE_DOMAIN" "${NODE_NAME:-node}-CDN-XHTTP-Entry" "$raw" "${CDN_PORT:-443}"
@@ -4120,11 +4029,6 @@ generate_subscription(){
   local raw_cleaned; raw_cleaned=$(mktemp_file "${raw}.clean.XXXXXX")
   sed '/^$/d' "$raw" > "$raw_cleaned" && mv -f "$raw_cleaned" "$raw"
   base64 "$raw" | tr -d '\n' > "$b64"
-  if [[ ! -s "$b64" ]]; then
-    warn "本机订阅内容为空，拒绝发布空订阅文件。"
-    rm -f "$WEB_ROOT/sub/$SUB_TOKEN"
-    return 1
-  fi
   local nginx_group
   nginx_group="$(detect_nginx_group)"
   ensure_web_subscription_permissions
@@ -4193,69 +4097,6 @@ hy2_range_valid(){
   [[ "$start" =~ ^[0-9]+$ && "$end" =~ ^[0-9]+$ && "$start" -ge 1 && "$end" -le 65535 && "$start" -le "$end" ]]
 }
 
-
-list_hy2_redirect_rules(){
-  # 列出 live 中 HY2 风格的 UDP dport 范围 REDIRECT 规则：family|range|to_port
-  local cmd line dport to_ports
-  for cmd in iptables ip6tables; do
-    command -v "$cmd" >/dev/null 2>&1 || continue
-    while IFS= read -r line; do
-      [[ "$line" == -A\ PREROUTING* ]] || continue
-      [[ "$line" == *" -p udp"* || "$line" == *"-p udp "* ]] || continue
-      [[ "$line" == *" -j REDIRECT"* ]] || continue
-      [[ "$line" == *" --to-ports "* ]] || continue
-      dport="$(sed -n 's/.*--dport \([0-9][0-9]*:[0-9][0-9]*\).*/\1/p' <<<"$line")"
-      [[ -n "$dport" ]] || continue
-      to_ports="$(sed -n 's/.*--to-ports \([0-9][0-9]*\).*/\1/p' <<<"$line")"
-      [[ -n "$to_ports" ]] || continue
-      printf '%s|%s|%s\n' "$cmd" "$dport" "$to_ports"
-    done < <("$cmd" -t nat -S PREROUTING 2>/dev/null || true)
-  done
-}
-
-purge_stale_hy2_redirect_rules(){
-  # 删除 live 中不等于 desired_range→desired_to_port 的 HY2 风格 UDP 范围 REDIRECT；
-  # 不碰单端口或其它无关 REDIRECT。
-  local desired_range="$1" desired_to_port="$2"
-  local cmd line dport to_ports spec
-  [[ -n "$desired_range" && -n "$desired_to_port" ]] || return 0
-  for cmd in iptables ip6tables; do
-    command -v "$cmd" >/dev/null 2>&1 || continue
-    while IFS= read -r line; do
-      [[ "$line" == -A\ PREROUTING* ]] || continue
-      [[ "$line" == *" -p udp"* || "$line" == *"-p udp "* ]] || continue
-      [[ "$line" == *" -j REDIRECT"* ]] || continue
-      [[ "$line" == *" --to-ports "* ]] || continue
-      dport="$(sed -n 's/.*--dport \([0-9][0-9]*:[0-9][0-9]*\).*/\1/p' <<<"$line")"
-      [[ -n "$dport" ]] || continue
-      to_ports="$(sed -n 's/.*--to-ports \([0-9][0-9]*\).*/\1/p' <<<"$line")"
-      [[ -n "$to_ports" ]] || continue
-      if [[ "$dport" == "$desired_range" && "$to_ports" == "$desired_to_port" ]]; then
-        continue
-      fi
-      spec="${line#-A }"
-      info "清理陈旧 HY2 NAT 规则（$cmd）：$dport -> $to_ports"
-      # shellcheck disable=SC2086
-      while $cmd -t nat -D $spec 2>/dev/null; do :; done
-    done < <("$cmd" -t nat -S PREROUTING 2>/dev/null || true)
-  done
-}
-
-hy2_live_redirect_matches(){
-  # 至少一个协议族上存在 desired_range→desired_to_port 的 UDP 范围 REDIRECT。
-  local desired_range="$1" desired_to_port="$2" entry fam range to_ports rest
-  [[ -n "$desired_range" && -n "$desired_to_port" ]] || return 1
-  while IFS= read -r entry; do
-    [[ -n "$entry" ]] || continue
-    fam="${entry%%|*}"; rest="${entry#*|}"
-    range="${rest%%|*}"; to_ports="${rest##*|}"
-    if [[ "$range" == "$desired_range" && "$to_ports" == "$desired_to_port" ]]; then
-      return 0
-    fi
-  done < <(list_hy2_redirect_rules)
-  return 1
-}
-
 remove_hy2_nat_range(){
   local range="$1" to_port="$2" start end removed=0
   [[ -n "$range" && -n "$to_port" ]] || return 0
@@ -4302,10 +4143,7 @@ enable_hy2_hopping(){
   old_range="${HY2_HOP_RANGE:-}"
   old_to_port="${HY2_HOP_TO_PORT:-${HY2_PORT:-443}}"
 
-  # BUG3: 以 live iptables 为准清理陈旧 HY2 REDIRECT，不单依赖状态机里的 old_range。
-  purge_stale_hy2_redirect_rules "$range" "$to_port"
-
-  # 状态机防漏：切换跳跃范围或真实监听端口前，再按状态删除旧规则。
+  # 状态机防漏：切换跳跃范围或真实监听端口前，先删除旧规则，避免 PREROUTING 中残留旧端口段。
   if [[ -n "$old_range" && ( "$old_range" != "$range" || "$old_to_port" != "$to_port" ) ]]; then
     info "检测到 HY2 跳跃规则变更，正在卸载历史规则：$old_range -> $old_to_port"
     remove_hy2_nat_range "$old_range" "$old_to_port"
@@ -4402,16 +4240,9 @@ sync_hy2_hopping_if_needed(){
     return 0
   fi
   [[ -n "${HY2_HOP_RANGE:-}" ]] || return 0
-  local want="${HY2_PORT:-443}" have="${HY2_HOP_TO_PORT:-}" need_sync=0
+  local want="${HY2_PORT:-443}" have="${HY2_HOP_TO_PORT:-}"
   if [[ "$have" != "$want" ]]; then
     info "HY2 监听端口与跳跃目标不一致（${have:-空} -> ${want}），正在同步 iptables REDIRECT。"
-    need_sync=1
-  elif ! hy2_live_redirect_matches "$HY2_HOP_RANGE" "$want"; then
-    # BUG4: 状态看起来一致，但 live 规则缺失/陈旧时也要重应用。
-    info "HY2 跳跃 live iptables 与期望不一致（期望 ${HY2_HOP_RANGE} -> ${want}），正在重新应用。"
-    need_sync=1
-  fi
-  if [[ "$need_sync" == "1" ]]; then
     # enable_hy2_hopping uses die()/exit; run in a subshell so a hop failure cannot
     # abort generate_xray_config after the Xray JSON was already applied.
     if ! ( XEM_INTERNAL_APPLY_HY2=1 enable_hy2_hopping "$HY2_HOP_RANGE" ); then
@@ -4994,12 +4825,11 @@ add_bestcf_nodes_from_file(){
 
     label="$(normalize_bestcf_label "$label" "${fallback_label}_${n}")"
     name="${NODE_NAME:-node}-${label}"
-    # BestCF 条目（优选 IP 或优选域名）只作为“连接入口”，借它的 Cloudflare 边缘 IP；
-    # SNI/Host 必须保持本机自己的母域名 $BASE_DOMAIN —— 只有它的 CF DNS 记录指向本机源站，
-    # CF 才会把流量回源到本机。若把优选域名本身当 SNI/Host（v0.0.40–v0.0.50 的行为），
-    # CF 会按那个域名的 zone 去找它自己的源站 → 实测 HTTP 403（DNS points to prohibited IP），
-    # 该 CFDomain 节点完全不可用。
-    add_vless_xhttp_cdn_link "$server" "$name" "$raw" "$port"
+    if [[ "$server" =~ ^[0-9.]+$ || "$server" == *:* ]]; then
+      add_vless_xhttp_cdn_link "$server" "$name" "$raw" "$port"
+    else
+      add_vless_xhttp_cdn_link "$server" "$name" "$raw" "$port" "$server"
+    fi
 
     n=$((n+1))
     printf -v "$total_ref" '%s' "$(( ${!total_ref} + 1 ))"
@@ -5785,11 +5615,6 @@ merge_remote_subscriptions(){
   cat "$SUB_DIR/local.raw" "$remote_raw" 2>/dev/null | sed '/^$/d' | awk '!seen[$0]++' > "$merged"
   # COMPATIBILITY FIX: avoid GNU-specific base64 -w0.
   base64 "$merged" | tr -d '\n' > "$merged_b64"
-  if [[ ! -s "$merged_b64" ]]; then
-    warn "合并订阅内容为空，拒绝发布空订阅文件。"
-    rm -f "$WEB_ROOT/sub/$MERGED_SUB_TOKEN"
-    return 1
-  fi
   local nginx_group
   nginx_group="$(detect_nginx_group)"
   ensure_web_subscription_permissions
@@ -6096,7 +5921,7 @@ main_menu(){
   load_state
   while true; do
     echo
-    echo "===== Xray Edge Manager ${XEM_VERSION} ====="
+    echo "===== Xray Edge Manager v0.0.45-hy2-canonical ====="
     echo "1. 首次部署向导，推荐"
     echo "2. 安装/升级基础依赖"
     echo "3. 安装/升级 Xray-core"

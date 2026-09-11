@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Xray Edge Manager / Xray Anti-Block Manager
-# v0.0.51-cfdomain-sni-fix — BestCF 节点 SNI/Host 固定为本机母域名（修复 CFDomain 全部不可用）
+# v0.0.42-harden — post-apply HY2 hop sync must not die; menu version string aligned
 #
 # Features:
 # - Xray-core only, no Docker, no sing-box
@@ -22,8 +22,6 @@
 
 set -Eeuo pipefail
 umask 077
-
-XEM_VERSION="v0.0.51-cfdomain-sni-fix"
 
 # Global temp cleanup registry. Any temp file/dir registered here will be
 # removed on normal exit or interruption. Missing paths are ignored.
@@ -187,42 +185,25 @@ mktemp_dir(){
 
 acquire_lock(){
   # 清理已退出进程留下的锁文件，避免菜单被永久挡住。
-  # 必须 rm 掉旧 inode：仅 truncate 时，若仍有异常持有者/残留，flock 可能一直失败。
   local _lock_pid _retry=0
-  mkdir -p "$(dirname "$LOCK_FILE")" 2>/dev/null || true
-  while [[ $_retry -lt 3 ]]; do
+  while [[ $_retry -lt 2 ]]; do
     _lock_pid=""
     if [[ -f "$LOCK_FILE" ]]; then
       _lock_pid=$(head -n1 "$LOCK_FILE" 2>/dev/null || true)
       _lock_pid="${_lock_pid//[[:space:]]/}"
     fi
-    if [[ -n "$_lock_pid" && "$_lock_pid" =~ ^[0-9]+$ ]] && ! kill -0 "$_lock_pid" 2>/dev/null; then
+    if [[ -n "$_lock_pid" ]] && ! kill -0 "$_lock_pid" 2>/dev/null; then
       warn "检测到僵尸锁 (PID $_lock_pid 已退出)，自动清理。"
-      rm -f "$LOCK_FILE" 2>/dev/null || true
+      : > "$LOCK_FILE"
       _retry=$((_retry + 1))
       continue
     fi
     break
   done
-  touch "$LOCK_FILE" 2>/dev/null || true
   exec 9>"$LOCK_FILE"
   if ! flock -n 9; then
-    _lock_pid=$(head -n1 "$LOCK_FILE" 2>/dev/null || true)
-    _lock_pid="${_lock_pid//[[:space:]]/}"
-    if [[ -n "$_lock_pid" && "$_lock_pid" =~ ^[0-9]+$ ]] && ! kill -0 "$_lock_pid" 2>/dev/null; then
-      warn "flock 失败但记录 PID $_lock_pid 已退出，强制重建锁文件。"
-      exec 9<&- 9>&- 2>/dev/null || true
-      rm -f "$LOCK_FILE" 2>/dev/null || true
-      touch "$LOCK_FILE" 2>/dev/null || true
-      exec 9>"$LOCK_FILE"
-      if ! flock -n 9; then
-        err "检测到另一个 xray-edge-manager 实例正在运行，请稍后再试。"
-        exit 1
-      fi
-    else
-      err "检测到另一个 xray-edge-manager 实例正在运行，请稍后再试。"
-      exit 1
-    fi
+    err "检测到另一个 xray-edge-manager 实例正在运行，请稍后再试。"
+    exit 1
   fi
   : > "$LOCK_FILE"
   printf '%s\n' "$$" >&9
@@ -260,7 +241,7 @@ allowed_state_key(){
     DOMAIN_V4|DOMAIN_V6|IPV4_ENABLED|IPV6_ENABLED|CF_ZONE_NAME|CDN_NETWORK|HY2_SNI|WEB_ROOT|LAST_SUBSCRIPTION_NODE_COUNT|LAST_SUBSCRIPTION_REGEN|LAST_PUBLIC_IP_DETECT)
       return 0
       ;;
-    CF_API_TOKEN|CF_ZONE_ID)
+    CF_API_TOKEN|CF_ZONE_NAME|CF_ZONE_ID)
       return 0
       ;;
     *)
@@ -364,12 +345,10 @@ ask(){
   local prompt="$1" default="${2:-}" ans msg
   if [[ -n "$default" ]]; then msg="$prompt [$default]: "; else msg="$prompt: "; fi
 
-  # IMPORTANT: when stdin is a pipe/file (non-interactive answer scripts), NEVER
-  # read /dev/tty — otherwise later confirms (e.g. CF origin firewall) consume
-  # leftover stdin answers and appear "mis-eaten".
-  # Interactive terminals may still prefer /dev/tty so prompts work when stdout
-  # is redirected.
-  if [[ -t 0 ]] && { exec 3<>/dev/tty; } 2>/dev/null; then
+  # Robust interactive input: some non-interactive shells report /dev/tty as
+  # present but fail when opening it. Open it once and fall back cleanly to
+  # stdin/stderr, avoiding noisy "/dev/tty: No such device" diagnostics.
+  if { exec 3<>/dev/tty; } 2>/dev/null; then
     printf '%s' "$msg" >&3 || true
     IFS= read -r ans <&3 || ans=""
     exec 3<&- 3>&- || true
@@ -431,35 +410,6 @@ version_ge(){
   fi
   return 1
 }
-# Normalize Xray tag/version strings for comparison (strip leading v, take first token).
-xray_version_normalize(){
-  local v="${1:-}"
-  v="${v#v}"
-  v="${v#V}"
-  v="${v%%[[:space:]]*}"
-  # Drop common build metadata suffixes after +
-  v="${v%%+*}"
-  printf '%s' "$v"
-}
-
-xray_version_ge(){
-  local a b
-  a="$(xray_version_normalize "$1")"
-  b="$(xray_version_normalize "$2")"
-  [[ -n "$a" && -n "$b" ]] || return 1
-  version_ge "$a" "$b"
-}
-
-xray_installed_version(){
-  local line ver
-  [[ -x /usr/local/bin/xray ]] || { printf '%s' ""; return 0; }
-  line="$(/usr/local/bin/xray version 2>/dev/null | head -n1 || true)"
-  # e.g. "Xray 26.6.1 (Xray, Penetrates Everything.) ..."
-  ver="$(sed -n 's/^[Xx]ray[[:space:]]\+\([0-9][^[:space:]]*\).*/\1/p' <<<"$line")"
-  printf '%s' "$ver"
-}
-
-
 
 validate_base_domain(){
   local d="$1"
@@ -879,7 +829,6 @@ install_or_upgrade_xray_release_verified(){
   need_root
   ensure_runtime_dirs
   local asset release_json release_obj tag asset_url dgst_url tmp zip dgst expected actual extract_dir xray_bin dat f
-  local allow_prerelease pin_version current_ver
 
   asset="$(xray_release_asset_name)" || die "当前架构暂不支持自动匹配 Xray 官方 Release：$(uname -m)"
   # SECURITY FIX: use APP_DIR instead of /tmp to avoid symlink race in multi-user systems.
@@ -894,50 +843,25 @@ install_or_upgrade_xray_release_verified(){
     -H "Accept: application/vnd.github+json" \
     -o "$release_json" "$XRAY_CORE_RELEASE_API?per_page=50" || die "获取 Xray-core 官方 Release 列表失败。"
 
+  local allow_prerelease release_filter
   allow_prerelease="${XEM_XRAY_ALLOW_PRERELEASE:-0}"
   [[ "$allow_prerelease" == "1" ]] || allow_prerelease=0
-  pin_version="${XEM_XRAY_PIN_VERSION:-}"
-  if [[ -n "$pin_version" ]]; then
-    info "已设置 XEM_XRAY_PIN_VERSION=${pin_version}：将安装该精确标签（允许 prerelease）。"
-  elif [[ "$allow_prerelease" == "1" ]]; then
-    warn "Xray-core 安装允许官方 prerelease（XEM_XRAY_ALLOW_PRERELEASE=1）：按最高 semver 标签选取；默认安装最新稳定版并校验官方 .dgst。"
+  if [[ "$allow_prerelease" == "1" ]]; then
+    release_filter='map(select(.draft|not))'
+    warn "Xray-core 安装允许官方 prerelease（XEM_XRAY_ALLOW_PRERELEASE=1）：用于跟进最新协议；默认安装最新稳定版并校验官方 .dgst。"
+  else
+    release_filter='map(select((.draft|not) and (.prerelease|not)))'
   fi
 
   # Select one release object first, then take ZIP and .dgst from the same
   # release. Do not use `jq ... | head -n1` under pipefail: when GitHub returns
   # many releases, head may close the pipe early and jq exits with SIGPIPE,
   # causing a silent script exit before any die() message is printed.
-  if [[ -n "$pin_version" ]]; then
-    release_obj=$(jq -c --arg asset "$asset" --arg pin "$pin_version" '
-      map(select(.draft|not)) |
-      map(select(
-        .tag_name == $pin
-        or .tag_name == ("v" + $pin)
-        or ("v" + .tag_name) == $pin
-      )) |
-      map(select(any(.assets[]?; .name == $asset) and any(.assets[]?; .name == ($asset + ".dgst")))) |
-      .[0] // empty
-    ' "$release_json") || die "解析 Xray-core Release JSON 失败。"
-  elif [[ "$allow_prerelease" == "1" ]]; then
-    # Highest semver among matching assets (not GitHub API .[0] order).
-    release_obj=$(jq -c --arg asset "$asset" '
-      map(select(.draft|not)) |
-      map(select(any(.assets[]?; .name == $asset) and any(.assets[]?; .name == ($asset + ".dgst")))) |
-      sort_by(
-        .tag_name
-        | sub("^v";"")
-        | split("-")[0]
-        | split(".")
-        | map(tonumber? // 0)
-      ) | reverse | .[0] // empty
-    ' "$release_json") || die "解析 Xray-core Release JSON 失败。"
-  else
-    release_obj=$(jq -c --arg asset "$asset" '
-      map(select((.draft|not) and (.prerelease|not))) |
-      map(select(any(.assets[]?; .name == $asset) and any(.assets[]?; .name == ($asset + ".dgst")))) |
-      .[0] // empty
-    ' "$release_json") || die "解析 Xray-core Release JSON 失败。"
-  fi
+  release_obj=$(jq -c --arg asset "$asset" --argjson allow_pre "$allow_prerelease" '
+    (if $allow_pre == 1 then map(select(.draft|not)) else map(select((.draft|not) and (.prerelease|not))) end) |
+    map(select(any(.assets[]?; .name == $asset) and any(.assets[]?; .name == ($asset + ".dgst")))) |
+    .[0] // empty
+  ' "$release_json") || die "解析 Xray-core Release JSON 失败。"
 
   [[ -n "$release_obj" && "$release_obj" != "null" ]] || die "未在 Xray-core 官方 Release 中找到 $asset 及其 .dgst 校验文件。"
 
@@ -946,20 +870,6 @@ install_or_upgrade_xray_release_verified(){
   dgst_url=$(jq -r --arg asset "$asset" '.assets[]? | select(.name == ($asset + ".dgst")) | .browser_download_url' <<<"$release_obj") || die "解析 Xray digest 下载地址失败。"
 
   [[ -n "$tag" && -n "$asset_url" && -n "$dgst_url" && "$asset_url" != "null" && "$dgst_url" != "null" ]] || die "未在 Xray-core 官方 Release 中找到 $asset 及其 .dgst 校验文件。"
-
-  # BUG1: never silently downgrade an already-newer installed Xray.
-  current_ver="$(xray_installed_version)"
-  if [[ -n "$current_ver" ]]; then
-    if xray_version_ge "$current_ver" "$tag"; then
-      if [[ "$(xray_version_normalize "$current_ver")" == "$(xray_version_normalize "$tag")" ]]; then
-        log "当前 Xray-core 已是 ${current_ver}（候选 ${tag}），跳过覆盖安装。"
-      else
-        warn "当前 Xray-core ${current_ver} 不低于候选 ${tag}，跳过安装以避免降级。"
-      fi
-      xray version || true
-      return 0
-    fi
-  fi
 
   info "准备安装 Xray-core ${tag}：$asset"
   info "下载官方 ZIP 与同 Release digest 文件。"
@@ -981,13 +891,6 @@ install_or_upgrade_xray_release_verified(){
   unzip -oq "$zip" -d "$extract_dir" || die "解压 Xray ZIP 失败。"
   xray_bin="$(find "$extract_dir" -type f -name xray -print -quit)"
   [[ -n "$xray_bin" && -f "$xray_bin" ]] || die "Xray ZIP 中未找到 xray 二进制。"
-
-  # Re-check immediately before overwrite (race / parallel upgrade).
-  current_ver="$(xray_installed_version)"
-  if [[ -n "$current_ver" ]] && xray_version_ge "$current_ver" "$tag"; then
-    warn "安装前再次检测：当前 Xray-core ${current_ver} ≥ 候选 ${tag}，跳过覆盖以避免降级。"
-    return 0
-  fi
 
   install -d /usr/local/bin /usr/local/etc/xray /usr/local/share/xray /var/log/xray
   install -m 755 "$xray_bin" /usr/local/bin/xray
@@ -1206,19 +1109,7 @@ configure_node_name(){
   else
     default_name="node"
   fi
-  if [[ -n "${NODE_NAME:-}" ]]; then
-    name=$(sanitize_node_name "$NODE_NAME")
-    save_kv "$STATE_FILE" NODE_NAME "$name"
-    info "已使用节点名称：$name"
-    return 0
-  fi
-  if [[ ! -t 0 ]]; then
-    name=$(sanitize_node_name "$default_name")
-    save_kv "$STATE_FILE" NODE_NAME "$name"
-    info "非交互模式：节点名称默认 $name"
-    return 0
-  fi
-  name=$(ask "请输入节点名称，用于订阅中区分机器，例如 jp1/us1/oracle-tokyo" "$default_name")
+  name=$(ask "请输入节点名称，用于订阅中区分机器，例如 jp1/us1/oracle-tokyo" "${NODE_NAME:-$default_name}")
   name=$(sanitize_node_name "$name")
   save_kv "$STATE_FILE" NODE_NAME "$name"
   log "节点名称已设置：$name"
@@ -1400,6 +1291,11 @@ cf_upsert_record(){
   done
 }
 
+stack_protocols_has(){ [[ "$1" == *"$2"* ]]; }
+stack_has_xhttp_reality(){ [[ "$1" == *"1"* ]]; }
+stack_has_cdn(){ [[ "$1" == *"2"* || "$1" == *"5"* ]]; }
+stack_has_hy2(){ [[ "$1" == *"3"* ]]; }
+stack_has_vision(){ [[ "$1" == *"4"* ]]; }
 stack_has_direct_protocol(){ [[ "$1" == *"1"* || "$1" == *"3"* || "$1" == *"4"* ]]; }
 
 normalize_stack_protocols(){
@@ -1483,24 +1379,9 @@ select_ip_stack_strategy(){
 
 protocol_enabled(){ [[ "${PROTOCOLS:-0}" == *"$1"* ]]; }
 
-
-reconcile_bestcf_state_if_needed(){
-  # 协议 5 依赖 BestCF 状态键；非交互早退前也必须对齐，否则订阅 WARN 路径误判。
-  load_state
-  if [[ "${PROTOCOLS:-0}" == *5* && "${BESTCF_ENABLED:-0}" != "1" ]]; then
-    save_kv "$STATE_FILE" BESTCF_ENABLED "1"
-    save_kv "$STATE_FILE" BESTCF_MODE "domain"
-    save_kv "$STATE_FILE" BESTCF_PER_CATEGORY_LIMIT "1"
-    save_kv "$STATE_FILE" BESTCF_TOTAL_LIMIT "1"
-    warn "检测到协议 5，已自动开启 BestCF：只生成 1 个优选域名节点；生成订阅前会自动拉取数据。"
-  fi
-}
-
 select_protocols(){
   load_state
   local p port
-  # BUG2: reconcile BestCF BEFORE non-interactive early return
-  reconcile_bestcf_state_if_needed
   # Non-interactive: skip if PROTOCOLS + ports already set
   if [[ -n "${PROTOCOLS:-}" && "${PROTOCOLS}" != "0" && -n "${CDN_PORT:-}" ]]; then
     info "使用已保存的协议配置: PROTOCOLS=${PROTOCOLS} CDN_PORT=${CDN_PORT}"
@@ -1531,7 +1412,13 @@ select_protocols(){
 
   # 协议 5 的意义是 CDN/BestCF 入口扩展。若用户选择 5，则自动开启 BestCF 域名模式；否则 5 会和普通 CDN 节点重复，没有实际意义。
   if [[ "$p" == *5* ]]; then
-    reconcile_bestcf_state_if_needed
+    if [[ "${BESTCF_ENABLED:-0}" != "1" ]]; then
+      save_kv "$STATE_FILE" BESTCF_ENABLED "1"
+      save_kv "$STATE_FILE" BESTCF_MODE "domain"
+      save_kv "$STATE_FILE" BESTCF_PER_CATEGORY_LIMIT "1"
+      save_kv "$STATE_FILE" BESTCF_TOTAL_LIMIT "1"
+      warn "检测到协议 5，已自动开启 BestCF：只生成 1 个优选域名节点；生成订阅前会自动拉取数据。"
+    fi
   fi
 
   if [[ "$p" == *1* ]]; then
@@ -2059,19 +1946,6 @@ validate_reality_target(){
 choose_reality_target(){
   load_state
   local c target _asn_country="" _asn_org=""
-  if [[ -n "${REALITY_TARGET:-}" ]] && validate_hostname "${REALITY_TARGET%%:*}" && validate_reality_target "$REALITY_TARGET"; then
-    info "已使用 REALITY 伪装目标：$REALITY_TARGET"
-    return 0
-  fi
-  if [[ ! -t 0 ]]; then
-    target="${REALITY_TARGET:-www.ebay.com}"
-    if ! validate_hostname "${target%%:*}" || ! validate_reality_target "$target"; then
-      target="www.ebay.com"
-    fi
-    save_kv "$STATE_FILE" REALITY_TARGET "$target"
-    info "非交互模式：REALITY 伪装目标默认 $target"
-    return 0
-  fi
   if command -v asn >/dev/null 2>&1; then
     _asn_country=$(asn -j 2>/dev/null | jq -r ".country_name // empty" 2>/dev/null || true)
     _asn_org=$(asn -j 2>/dev/null | jq -r ".org // empty" 2>/dev/null || true)
@@ -2424,33 +2298,10 @@ atomic_move_into_place(){
   mv -f "$src" "$dst"
 }
 
-
-latest_backup_matching(){
-  # Prefer mapfile over `ls | head` under `set -o pipefail` (SIGPIPE can discard the path).
-  local pattern="$1"
-  local -a files=()
-  mapfile -t files < <(ls -1t "$BACKUP_DIR"/$pattern 2>/dev/null || true)
-  [[ "${#files[@]}" -gt 0 && -n "${files[0]:-}" && -f "${files[0]}" ]] || return 1
-  printf '%s\n' "${files[0]}"
-}
-
-wait_unit_active(){
-  # After systemctl restart returns, a unit may still be "activating" briefly.
-  # Poll is-active so a slow start is not mistaken for failure (false rollback).
-  local unit="$1" timeout_s="${2:-15}" i
-  for ((i=0; i<timeout_s; i++)); do
-    if systemctl is-active --quiet "$unit" 2>/dev/null; then
-      return 0
-    fi
-    sleep 1
-  done
-  systemctl is-active --quiet "$unit" 2>/dev/null
-}
-
 restore_latest_xray_config(){
   load_state
   local bak="${LAST_XRAY_BACKUP:-}"
-  if [[ -z "$bak" || ! -f "$bak" ]]; then bak="$(latest_backup_matching 'config.json.*.bak' || true)"; fi
+  [[ -n "$bak" && -f "$bak" ]] || bak=$(ls -1t "$BACKUP_DIR"/config.json.*.bak 2>/dev/null | head -n1 || true)
   [[ -n "$bak" && -f "$bak" ]] || { warn "未找到可回滚的 Xray 配置备份。"; return 1; }
   atomic_copy_into_place "$bak" "$XRAY_CONFIG" || { warn "Xray 配置回滚失败：$bak -> $XRAY_CONFIG"; return 1; }
   warn "已原子回滚 Xray 配置：$bak -> $XRAY_CONFIG"
@@ -2459,7 +2310,7 @@ restore_latest_xray_config(){
 restore_latest_nginx_config(){
   load_state
   local bak="${LAST_NGINX_BACKUP:-}"
-  if [[ -z "$bak" || ! -f "$bak" ]]; then bak="$(latest_backup_matching 'nginx.*.bak' || true)"; fi
+  [[ -n "$bak" && -f "$bak" ]] || bak=$(ls -1t "$BACKUP_DIR"/nginx.*.bak 2>/dev/null | head -n1 || true)
   [[ -n "$bak" && -f "$bak" ]] || { warn "未找到可回滚的 Nginx 配置备份。"; return 1; }
   atomic_copy_into_place "$bak" "$NGINX_SITE" || { warn "Nginx 配置回滚失败：$bak -> $NGINX_SITE"; return 1; }
   warn "已原子回滚 Nginx 配置：$bak -> $NGINX_SITE"
@@ -2981,11 +2832,11 @@ validate_warp_ipv6_endpoints_for_ipv6_only(){
   local src="$1" bad
   bad="$(jq -r '
     def ipv6_ep_ok:
-      test("^\[[0-9A-Fa-f:.]+\]:[0-9]+$")
+      test("^\\[[0-9A-Fa-f:.]+\\]:[0-9]+$")
       and ((capture(":(?<port>[0-9]+)$").port | tonumber? // 0) >= 1)
       and ((capture(":(?<port>[0-9]+)$").port | tonumber? // 0) <= 65535);
-    [.settings.peers[]?.endpoint // empty | select(ipv6_ep_ok | not)] | .[0:5] | .[]?
-  ' "$src")"
+    .settings.peers[]?.endpoint // empty | select(ipv6_ep_ok | not)
+  ' "$src" | head -n 5)"
   if [[ -n "$bad" ]]; then
     err "纯 IPv6 机器使用 warp-v4 时，WARP peer endpoint 必须是 IPv6 字面量且端口有效。"
     err "示例：[2606:4700:d0::a29f:c001]:2408"
@@ -3174,7 +3025,7 @@ EOF2
 
   if protocol_enabled 2 || protocol_enabled 5; then
     append_json_obj "$in_tmp" first_in <<EOF2
-    {"tag":"in-xhttp-cdn-local","listen":"127.0.0.1","port":${XHTTP_CDN_LOCAL_PORT},"protocol":"vless","settings":{"clients":[{"id":"${UUID}","email":"xhttp-cdn"}],"decryption":"none"},"streamSettings":{"method":"xhttp","network":"xhttp","security":"none","xhttpSettings":{"path":"${XHTTP_CDN_PATH}","mode":"auto","extra":{"xPaddingBytes":"100-1000","noSSEHeader":true}},"sockopt":{"trustedXForwardedFor":["X-Xem-Cdn-Trusted"]}}}
+    {"tag":"in-xhttp-cdn-local","listen":"127.0.0.1","port":${XHTTP_CDN_LOCAL_PORT},"protocol":"vless","settings":{"clients":[{"id":"${UUID}","email":"xhttp-cdn"}],"decryption":"none"},"streamSettings":{"method":"xhttp","network":"xhttp","security":"none","xhttpSettings":{"path":"${XHTTP_CDN_PATH}","mode":"auto","extra":{"xPaddingBytes":"100-1000","noSSEHeader":true}}}}
 EOF2
     cdn_xhttp_ready=1
     [[ "$bind" == "1" ]] && append_route_for_inbound "$route_tmp" first_route "in-xhttp-cdn-local" "cdn" "$outbound_mode"
@@ -3182,39 +3033,15 @@ EOF2
 
   if protocol_enabled 3; then
     if [[ -n "$bind_ip4" && "${IPV4_PROTOCOLS:-0}" == *3* ]]; then
-      # Xray HY2 inbound: settings.clients[].auth (json tag; 26.3.27 ignores "users") + network=hysteria + TLS/h3.
-      # Do NOT put auth in hysteriaSettings (outbound field). Salamander/masquerade are opt-in.
-      local hy2_stream_v4
-      hy2_stream_v4=$(cat <<EOF_HY2_STREAM
-{"network":"hysteria","security":"tls","tlsSettings":{"alpn":["h3"],"certificates":[{"certificateFile":"${XRAY_CERT_DIR}/${BASE_DOMAIN}/fullchain.pem","keyFile":"${XRAY_CERT_DIR}/${BASE_DOMAIN}/privkey.pem"}]},"hysteriaSettings":{"version":2,"udpIdleTimeout":120}}
-EOF_HY2_STREAM
-)
-      if [[ "${HY2_SALAMANDER:-0}" == "1" && -n "${HY2_OBFS:-}" ]]; then
-        hy2_stream_v4=$(jq -c --arg pw "${HY2_OBFS}" '.finalmask={"udp":[{"type":"salamander","settings":{"password":$pw}}]}' <<<"$hy2_stream_v4")
-      fi
-      if [[ "${HY2_MASQUERADE:-0}" == "1" ]]; then
-        hy2_stream_v4=$(jq -c --arg url "https://${REALITY_TARGET:-$BASE_DOMAIN}" '.hysteriaSettings.masquerade={"type":"proxy","url":$url,"rewriteHost":true,"insecure":false}' <<<"$hy2_stream_v4")
-      fi
       append_json_obj "$in_tmp" first_in <<EOF2
-    {"tag":"in-v4-hysteria2-udp","listen":"${bind_ip4}","port":${HY2_PORT},"protocol":"hysteria","settings":{"version":2,"clients":[{"auth":"${HY2_AUTH}","email":"v4-hy2"}]},"streamSettings":${hy2_stream_v4}}
+    {"tag":"in-v4-hysteria2-udp","listen":"${bind_ip4}","port":${HY2_PORT},"protocol":"hysteria","settings":{"version":2,"users":[{"auth":"${HY2_AUTH}","email":"v4-hy2"}]},"streamSettings":{"method":"hysteria","network":"hysteria","security":"tls","tlsSettings":{"alpn":["h3"],"certificates":[{"certificateFile":"${XRAY_CERT_DIR}/${BASE_DOMAIN}/fullchain.pem","keyFile":"${XRAY_CERT_DIR}/${BASE_DOMAIN}/privkey.pem"}]},"hysteriaSettings":{"version":2,"auth":"${HY2_AUTH}","udpIdleTimeout":120,"masquerade":{"type":"proxy","url":"https://${REALITY_TARGET:-$BASE_DOMAIN}","rewriteHost":true,"insecure":false}},"finalmask":{"quicParams":{"congestion":"bbr"},"udp":[{"type":"salamander","settings":{"password":"${HY2_OBFS}"}}]}}}
 EOF2
       v4_hy2_ready=1
       [[ "$bind" == "1" ]] && append_route_for_inbound "$route_tmp" first_route "in-v4-hysteria2-udp" "v4" "$outbound_mode"
     fi
     if [[ -n "$bind_ip6" && "${IPV6_PROTOCOLS:-0}" == *3* ]]; then
-      local hy2_stream_v6
-      hy2_stream_v6=$(cat <<EOF_HY2_STREAM
-{"network":"hysteria","security":"tls","tlsSettings":{"alpn":["h3"],"certificates":[{"certificateFile":"${XRAY_CERT_DIR}/${BASE_DOMAIN}/fullchain.pem","keyFile":"${XRAY_CERT_DIR}/${BASE_DOMAIN}/privkey.pem"}]},"hysteriaSettings":{"version":2,"udpIdleTimeout":120}}
-EOF_HY2_STREAM
-)
-      if [[ "${HY2_SALAMANDER:-0}" == "1" && -n "${HY2_OBFS:-}" ]]; then
-        hy2_stream_v6=$(jq -c --arg pw "${HY2_OBFS}" '.finalmask={"udp":[{"type":"salamander","settings":{"password":$pw}}]}' <<<"$hy2_stream_v6")
-      fi
-      if [[ "${HY2_MASQUERADE:-0}" == "1" ]]; then
-        hy2_stream_v6=$(jq -c --arg url "https://${REALITY_TARGET:-$BASE_DOMAIN}" '.hysteriaSettings.masquerade={"type":"proxy","url":$url,"rewriteHost":true,"insecure":false}' <<<"$hy2_stream_v6")
-      fi
       append_json_obj "$in_tmp" first_in <<EOF2
-    {"tag":"in-v6-hysteria2-udp","listen":"${bind_ip6}","port":${HY2_PORT},"protocol":"hysteria","settings":{"version":2,"clients":[{"auth":"${HY2_AUTH}","email":"v6-hy2"}]},"streamSettings":${hy2_stream_v6}}
+    {"tag":"in-v6-hysteria2-udp","listen":"${bind_ip6}","port":${HY2_PORT},"protocol":"hysteria","settings":{"version":2,"users":[{"auth":"${HY2_AUTH}","email":"v6-hy2"}]},"streamSettings":{"method":"hysteria","network":"hysteria","security":"tls","tlsSettings":{"alpn":["h3"],"certificates":[{"certificateFile":"${XRAY_CERT_DIR}/${BASE_DOMAIN}/fullchain.pem","keyFile":"${XRAY_CERT_DIR}/${BASE_DOMAIN}/privkey.pem"}]},"hysteriaSettings":{"version":2,"auth":"${HY2_AUTH}","udpIdleTimeout":120,"masquerade":{"type":"proxy","url":"https://${REALITY_TARGET:-$BASE_DOMAIN}","rewriteHost":true,"insecure":false}},"finalmask":{"quicParams":{"congestion":"bbr"},"udp":[{"type":"salamander","settings":{"password":"${HY2_OBFS}"}}]}}}
 EOF2
       v6_hy2_ready=1
       [[ "$bind" == "1" ]] && append_route_for_inbound "$route_tmp" first_route "in-v6-hysteria2-udp" "v6" "$outbound_mode"
@@ -3427,6 +3254,7 @@ configure_nginx(){
   cleanup_legacy_nginx_conf
   disable_nginx_packaged_default_site
   mkdir -p "$WEB_ROOT" "$WEB_ROOT/sub" "$SUB_DIR"
+  touch "$WEB_ROOT/sub/${SUB_TOKEN}"
   ensure_web_subscription_permissions
 
   local nginx_http_v6_listen="" nginx_https_v6_listen="" nginx_https_listen="" nginx_http2_directive="" nginx_version="" nginx_target_tmp=""
@@ -3457,8 +3285,6 @@ configure_nginx(){
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto https;
-        # Presence-only trust gate for Xray sockopt.trustedXForwardedFor (not an IP list).
-        proxy_set_header X-Xem-Cdn-Trusted 1;
         proxy_buffering off;
         proxy_request_buffering off;
         proxy_read_timeout 3600s;
@@ -3665,10 +3491,7 @@ add_vless_xhttp_reality_link(){
 
 add_vless_xhttp_cdn_link(){
   local server="$1" name="$2" raw="$3" port="${4:-443}" path_enc server_uri sni_host
-  # 第 5 参数为 SNI/Host，缺省回落本机母域名 $BASE_DOMAIN —— 这是唯一正确取值：
-  # 只有本机母域名的 CF DNS 记录指向本机源站。
-  # 切勿传入 BestCF 优选域名（v0.0.40–v0.0.50 曾这样做 → CF 按那个域名的 zone 回源 → 403，
-  # 订阅里的 CFDomain 节点全部不可用）。
+  # 第 5 参数为 SNI/Host；BestCF 域名模式传入优选 FQDN，使其与证书/回源主机一致。
   sni_host="${5:-$BASE_DOMAIN}"
   server_uri=$(format_uri_host "$server")
   path_enc=$(uri_encode "$XHTTP_CDN_PATH")
@@ -3702,19 +3525,15 @@ hy2_hop_range_for_stack(){
 }
 
 add_hy2_link(){
-  # $4: hop = require mport; direct = never mport; empty = mport when hop range ready
-  local server="$1" name="$2" raw="$3" mode="${4:-}" server_uri mport_param="" hop_range="" stack="v4"
+  local server="$1" name="$2" raw="$3" server_uri mport_param="" hop_range="" stack="v4"
   server_uri=$(format_uri_host "$server")
   [[ "$server" == v6.* || "$server" == *:* ]] && stack="v6"
   hop_range="$(hy2_hop_range_for_stack "$stack")"
-  if [[ "$mode" == "hop" && -z "$hop_range" ]]; then
-    return 0
-  fi
-  if [[ "$mode" != "direct" && -n "$hop_range" ]]; then
+  if [[ -n "$hop_range" ]]; then
     mport_param="&mport=${hop_range/:/-}"
   fi
   local obfs_param=""
-  if [[ "${HY2_SALAMANDER:-0}" == "1" && -n "${HY2_OBFS:-}" ]]; then
+  if [[ -n "${HY2_OBFS:-}" ]]; then
     obfs_param="&obfs=salamander&obfs-password=${HY2_OBFS}"
   fi
   echo "hysteria2://${HY2_AUTH}@${server_uri}:${HY2_PORT:-443}?sni=${BASE_DOMAIN}&insecure=0&alpn=h3${mport_param}${obfs_param}#$(uri_encode "$name")" >> "$raw"
@@ -3793,7 +3612,7 @@ generate_mihomo_reference(){
   local f="$SUB_DIR/mihomo-reference.yaml"
   cat > "$f" <<EOF2
 # 仅供参考：对外订阅仍只发布 base64。
-# 客户端请用 Mihomo 开发板/Alpha。已带连接复用与填充；不要再开 smux。
+# 面向 Mihomo 开发板/Alpha（需支持 xhttp-opts.reuse-settings）。不要叠加 smux。
 proxies:
 EOF2
   if protocol_enabled 1; then
@@ -3820,7 +3639,6 @@ EOF2
     xhttp-opts:
       mode: auto
       path: ${XHTTP_REALITY_PATH}
-      x-padding-bytes: "100-1000"
       reuse-settings:
         max-concurrency: "16-32"
         c-max-reuse-times: "0"
@@ -3850,7 +3668,6 @@ EOF2
     xhttp-opts:
       mode: auto
       path: ${XHTTP_REALITY_PATH}
-      x-padding-bytes: "100-1000"
       reuse-settings:
         max-concurrency: "16-32"
         c-max-reuse-times: "0"
@@ -3880,7 +3697,6 @@ EOF2
       host: ${BASE_DOMAIN}
       mode: auto
       path: ${XHTTP_CDN_PATH}
-      x-padding-bytes: "100-1000"
       reuse-settings:
         max-concurrency: "16-32"
         c-max-reuse-times: "0"
@@ -3909,7 +3725,6 @@ EOF2
       host: ${BASE_DOMAIN}
       mode: auto
       path: ${XHTTP_CDN_PATH}
-      x-padding-bytes: "100-1000"
       reuse-settings:
         max-concurrency: "16-32"
         c-max-reuse-times: "0"
@@ -3918,19 +3733,11 @@ EOF2
   fi
 
   if protocol_enabled 3; then
-    # Prefer HOP nodes first: some DCs drop inbound UDP on the listen port (e.g. 443) upstream of the NIC.
-    _hy2_mihomo_one() {
-      local stack="$1" host="$2" hop_range="$3" with_hop="$4"
-      local name
-      if [[ "$with_hop" == "1" ]]; then
-        name="${NODE_NAME:-node}-${stack}-HY2-HOP"
-      else
-        name="${NODE_NAME:-node}-${stack}-HY2-UDP${HY2_PORT:-443}"
-      fi
+    if [[ -n "${PUBLIC_IPV4:-}" && "${IPV4_PROTOCOLS:-0}" == *3* ]] && node_ready V4_HY2_READY; then
       cat >> "$f" <<EOF2
-  - name: ${name}
+  - name: ${NODE_NAME:-node}-v4-HY2-UDP${HY2_PORT:-443}
     type: hysteria2
-    server: ${host}
+    server: v4.${BASE_DOMAIN}
     port: ${HY2_PORT:-443}
     password: ${HY2_AUTH}
     sni: ${BASE_DOMAIN}
@@ -3938,40 +3745,44 @@ EOF2
     alpn:
       - h3
 EOF2
-      if [[ "${HY2_SALAMANDER:-0}" == "1" && -n "${HY2_OBFS:-}" ]]; then
+      if [[ -n "${HY2_OBFS:-}" ]]; then
         cat >> "$f" <<EOF2
     obfs: salamander
     obfs-password: ${HY2_OBFS}
 EOF2
       fi
-      if [[ "$with_hop" == "1" ]]; then
-        cat >> "$f" <<EOF2
-    ports: ${hop_range/:/-}
-    hop-interval: 20
-EOF2
-      fi
-    }
-    if [[ -n "${PUBLIC_IPV4:-}" && "${IPV4_PROTOCOLS:-0}" == *3* ]] && node_ready V4_HY2_READY; then
       local hop_range_v4
       hop_range_v4="$(hy2_hop_range_for_stack v4)"
-      if [[ -n "$hop_range_v4" ]]; then
-        _hy2_mihomo_one v4 "v4.${BASE_DOMAIN}" "$hop_range_v4" 1
-        _hy2_mihomo_one v4 "v4.${BASE_DOMAIN}" "" 0
-      else
-        _hy2_mihomo_one v4 "v4.${BASE_DOMAIN}" "" 0
-      fi
+      [[ -n "$hop_range_v4" ]] && cat >> "$f" <<EOF2
+    ports: ${hop_range_v4/:/-}
+    hop-interval: "10-30"
+EOF2
     fi
     if [[ -n "${PUBLIC_IPV6:-}" && "${IPV6_PROTOCOLS:-0}" == *3* ]] && node_ready V6_HY2_READY; then
+      cat >> "$f" <<EOF2
+  - name: ${NODE_NAME:-node}-v6-HY2-UDP${HY2_PORT:-443}
+    type: hysteria2
+    server: v6.${BASE_DOMAIN}
+    port: ${HY2_PORT:-443}
+    password: ${HY2_AUTH}
+    sni: ${BASE_DOMAIN}
+    skip-cert-verify: false
+    alpn:
+      - h3
+EOF2
+      if [[ -n "${HY2_OBFS:-}" ]]; then
+        cat >> "$f" <<EOF2
+    obfs: salamander
+    obfs-password: ${HY2_OBFS}
+EOF2
+      fi
       local hop_range_v6
       hop_range_v6="$(hy2_hop_range_for_stack v6)"
-      if [[ -n "$hop_range_v6" ]]; then
-        _hy2_mihomo_one v6 "v6.${BASE_DOMAIN}" "$hop_range_v6" 1
-        _hy2_mihomo_one v6 "v6.${BASE_DOMAIN}" "" 0
-      else
-        _hy2_mihomo_one v6 "v6.${BASE_DOMAIN}" "" 0
-      fi
+      [[ -n "$hop_range_v6" ]] && cat >> "$f" <<EOF2
+    ports: ${hop_range_v6/:/-}
+    hop-interval: "10-30"
+EOF2
     fi
-    unset -f _hy2_mihomo_one
   fi
 
   if protocol_enabled 4; then
@@ -4062,53 +3873,23 @@ generate_subscription(){
     add_vless_xhttp_cdn_link "$BASE_DOMAIN" "${NODE_NAME:-node}-CDN-XHTTP-Origin" "$raw" "${CDN_PORT:-443}"
   fi
 
-  # 5 = CDN 入口扩展：只发 BestCF 节点。无数据时先重试拉取；仍失败则：
-  # - 若同时开了协议 2，不再重复塞母域名 Entry（协议 2 已有 Origin）
-  # - 若只有协议 5，才退回一条母域名 Entry，避免订阅空白
+  # 5 = CDN 入口扩展。优先生成 BestCF 节点；若 BestCF 数据还没拉取，则保留一个母域名入口，防止节点为空。
   if protocol_enabled 5 && node_ready CDN_XHTTP_READY; then
     local before_count after_count
     before_count=$(wc -l < "$raw" 2>/dev/null || echo 0)
     generate_bestcf_subscription_nodes "$raw"
     after_count=$(wc -l < "$raw" 2>/dev/null || echo 0)
     if [[ "$after_count" -eq "$before_count" ]]; then
-      warn "协议 5 本轮无 BestCF 节点，正在重试拉取远端数据。"
-      # ensure_bestcf_data_if_needed skips when BESTCF_FETCHED_THIS_RUN=1
-      export BESTCF_FETCHED_THIS_RUN=0
-      fetch_bestcf_all || true
-      generate_bestcf_subscription_nodes "$raw"
-      after_count=$(wc -l < "$raw" 2>/dev/null || echo 0)
-    fi
-    if [[ "$after_count" -eq "$before_count" ]]; then
-      if [[ "${BESTCF_ENABLED:-0}" != "1" ]]; then
-        warn "协议 5 无 BestCF 节点：BestCF 开关未开或状态键缺失（BESTCF_ENABLED!=1），请检查协议配置或菜单 11。"
-      elif protocol_enabled 2; then
-        warn "协议 5 仍无可用 BestCF 数据；已有协议 2 母域名 CDN 节点，跳过重复 Entry 回退。"
-      else
-        add_vless_xhttp_cdn_link "$BASE_DOMAIN" "${NODE_NAME:-node}-CDN-XHTTP-Entry" "$raw" "${CDN_PORT:-443}"
-        warn "协议 5 仍无可用 BestCF 数据，且未启用协议 2：临时回退一条母域名 CDN Entry，请稍后菜单 11 重拉 BestCF。"
-      fi
+      add_vless_xhttp_cdn_link "$BASE_DOMAIN" "${NODE_NAME:-node}-CDN-XHTTP-Entry" "$raw" "${CDN_PORT:-443}"
+      warn "协议 5 未找到可用 BestCF 数据，已自动退回母域名 CDN Entry。"
     fi
   elif protocol_enabled 2 && node_ready CDN_XHTTP_READY; then
     generate_bestcf_subscription_nodes "$raw"
   fi
 
   if protocol_enabled 3; then
-    if [[ -n "${PUBLIC_IPV4:-}" && "${IPV4_PROTOCOLS:-0}" == *3* ]] && node_ready V4_HY2_READY; then
-      if [[ -n "$(hy2_hop_range_for_stack v4)" ]]; then
-        add_hy2_link "v4.${BASE_DOMAIN}" "${NODE_NAME:-node}-v4-HY2-HOP" "$raw" hop
-        add_hy2_link "v4.${BASE_DOMAIN}" "${NODE_NAME:-node}-v4-HY2-UDP${HY2_PORT:-443}" "$raw" direct
-      else
-        add_hy2_link "v4.${BASE_DOMAIN}" "${NODE_NAME:-node}-v4-HY2-UDP${HY2_PORT:-443}" "$raw" direct
-      fi
-    fi
-    if [[ -n "${PUBLIC_IPV6:-}" && "${IPV6_PROTOCOLS:-0}" == *3* ]] && node_ready V6_HY2_READY; then
-      if [[ -n "$(hy2_hop_range_for_stack v6)" ]]; then
-        add_hy2_link "v6.${BASE_DOMAIN}" "${NODE_NAME:-node}-v6-HY2-HOP" "$raw" hop
-        add_hy2_link "v6.${BASE_DOMAIN}" "${NODE_NAME:-node}-v6-HY2-UDP${HY2_PORT:-443}" "$raw" direct
-      else
-        add_hy2_link "v6.${BASE_DOMAIN}" "${NODE_NAME:-node}-v6-HY2-UDP${HY2_PORT:-443}" "$raw" direct
-      fi
-    fi
+    [[ -n "${PUBLIC_IPV4:-}" && "${IPV4_PROTOCOLS:-0}" == *3* ]] && node_ready V4_HY2_READY && add_hy2_link "v4.${BASE_DOMAIN}" "${NODE_NAME:-node}-v4-HY2-UDP${HY2_PORT:-443}" "$raw"
+    [[ -n "${PUBLIC_IPV6:-}" && "${IPV6_PROTOCOLS:-0}" == *3* ]] && node_ready V6_HY2_READY && add_hy2_link "v6.${BASE_DOMAIN}" "${NODE_NAME:-node}-v6-HY2-UDP${HY2_PORT:-443}" "$raw"
   fi
 
   if protocol_enabled 4; then
@@ -4120,11 +3901,6 @@ generate_subscription(){
   local raw_cleaned; raw_cleaned=$(mktemp_file "${raw}.clean.XXXXXX")
   sed '/^$/d' "$raw" > "$raw_cleaned" && mv -f "$raw_cleaned" "$raw"
   base64 "$raw" | tr -d '\n' > "$b64"
-  if [[ ! -s "$b64" ]]; then
-    warn "本机订阅内容为空，拒绝发布空订阅文件。"
-    rm -f "$WEB_ROOT/sub/$SUB_TOKEN"
-    return 1
-  fi
   local nginx_group
   nginx_group="$(detect_nginx_group)"
   ensure_web_subscription_permissions
@@ -4193,69 +3969,6 @@ hy2_range_valid(){
   [[ "$start" =~ ^[0-9]+$ && "$end" =~ ^[0-9]+$ && "$start" -ge 1 && "$end" -le 65535 && "$start" -le "$end" ]]
 }
 
-
-list_hy2_redirect_rules(){
-  # 列出 live 中 HY2 风格的 UDP dport 范围 REDIRECT 规则：family|range|to_port
-  local cmd line dport to_ports
-  for cmd in iptables ip6tables; do
-    command -v "$cmd" >/dev/null 2>&1 || continue
-    while IFS= read -r line; do
-      [[ "$line" == -A\ PREROUTING* ]] || continue
-      [[ "$line" == *" -p udp"* || "$line" == *"-p udp "* ]] || continue
-      [[ "$line" == *" -j REDIRECT"* ]] || continue
-      [[ "$line" == *" --to-ports "* ]] || continue
-      dport="$(sed -n 's/.*--dport \([0-9][0-9]*:[0-9][0-9]*\).*/\1/p' <<<"$line")"
-      [[ -n "$dport" ]] || continue
-      to_ports="$(sed -n 's/.*--to-ports \([0-9][0-9]*\).*/\1/p' <<<"$line")"
-      [[ -n "$to_ports" ]] || continue
-      printf '%s|%s|%s\n' "$cmd" "$dport" "$to_ports"
-    done < <("$cmd" -t nat -S PREROUTING 2>/dev/null || true)
-  done
-}
-
-purge_stale_hy2_redirect_rules(){
-  # 删除 live 中不等于 desired_range→desired_to_port 的 HY2 风格 UDP 范围 REDIRECT；
-  # 不碰单端口或其它无关 REDIRECT。
-  local desired_range="$1" desired_to_port="$2"
-  local cmd line dport to_ports spec
-  [[ -n "$desired_range" && -n "$desired_to_port" ]] || return 0
-  for cmd in iptables ip6tables; do
-    command -v "$cmd" >/dev/null 2>&1 || continue
-    while IFS= read -r line; do
-      [[ "$line" == -A\ PREROUTING* ]] || continue
-      [[ "$line" == *" -p udp"* || "$line" == *"-p udp "* ]] || continue
-      [[ "$line" == *" -j REDIRECT"* ]] || continue
-      [[ "$line" == *" --to-ports "* ]] || continue
-      dport="$(sed -n 's/.*--dport \([0-9][0-9]*:[0-9][0-9]*\).*/\1/p' <<<"$line")"
-      [[ -n "$dport" ]] || continue
-      to_ports="$(sed -n 's/.*--to-ports \([0-9][0-9]*\).*/\1/p' <<<"$line")"
-      [[ -n "$to_ports" ]] || continue
-      if [[ "$dport" == "$desired_range" && "$to_ports" == "$desired_to_port" ]]; then
-        continue
-      fi
-      spec="${line#-A }"
-      info "清理陈旧 HY2 NAT 规则（$cmd）：$dport -> $to_ports"
-      # shellcheck disable=SC2086
-      while $cmd -t nat -D $spec 2>/dev/null; do :; done
-    done < <("$cmd" -t nat -S PREROUTING 2>/dev/null || true)
-  done
-}
-
-hy2_live_redirect_matches(){
-  # 至少一个协议族上存在 desired_range→desired_to_port 的 UDP 范围 REDIRECT。
-  local desired_range="$1" desired_to_port="$2" entry fam range to_ports rest
-  [[ -n "$desired_range" && -n "$desired_to_port" ]] || return 1
-  while IFS= read -r entry; do
-    [[ -n "$entry" ]] || continue
-    fam="${entry%%|*}"; rest="${entry#*|}"
-    range="${rest%%|*}"; to_ports="${rest##*|}"
-    if [[ "$range" == "$desired_range" && "$to_ports" == "$desired_to_port" ]]; then
-      return 0
-    fi
-  done < <(list_hy2_redirect_rules)
-  return 1
-}
-
 remove_hy2_nat_range(){
   local range="$1" to_port="$2" start end removed=0
   [[ -n "$range" && -n "$to_port" ]] || return 0
@@ -4271,41 +3984,27 @@ remove_hy2_nat_range(){
   [[ "$removed" == "1" ]] && info "已清理 HY2 历史 NAT 规则：UDP $start-$end -> $to_port" || true
 }
 
-hy2_hop_fail(){
-  # Interactive path keeps die(); boot/sync INTERNAL path must not abort the caller hard.
-  local msg="$1"
-  if [[ "${XEM_INTERNAL_APPLY_HY2:-0}" == "1" ]]; then
-    warn "$msg"
-    return 1
-  fi
-  die "$msg"
-}
-
 enable_hy2_hopping(){
   load_state
   if [[ "${XEM_INTERNAL_APPLY_HY2:-0}" == "1" ]]; then
-    command -v iptables >/dev/null 2>&1 || { hy2_hop_fail "缺少 iptables，无法恢复 HY2 端口跳跃规则。"; return 1; }
+    command -v iptables >/dev/null 2>&1 || die "缺少 iptables，无法恢复 HY2 端口跳跃规则。"
   else
     ensure_iptables
   fi
   local range="$1" start end to_port old_range old_to_port ip4_ok=0 ip6_ok=0
   to_port="${HY2_PORT:-443}"
-  hy2_range_valid "$range" || { hy2_hop_fail "端口范围格式错误。"; return 1; }
-  valid_port "$to_port" || { hy2_hop_fail "HY2_PORT 无效：$to_port"; return 1; }
+  hy2_range_valid "$range" || die "端口范围格式错误。"
+  valid_port "$to_port" || die "HY2_PORT 无效：$to_port"
   start="${range%%:*}"; end="${range##*:}"
   # REDIRECT of the real listen port onto itself breaks the HY2 listener.
   if [[ "$to_port" -ge "$start" && "$to_port" -le "$end" ]]; then
-    hy2_hop_fail "跳跃范围 $start-$end 不能包含 HY2 真实监听端口 $to_port，否则 REDIRECT 会自环。" || true
-    return 1
+    die "跳跃范围 $start-$end 不能包含 HY2 真实监听端口 $to_port，否则 REDIRECT 会自环。"
   fi
 
   old_range="${HY2_HOP_RANGE:-}"
   old_to_port="${HY2_HOP_TO_PORT:-${HY2_PORT:-443}}"
 
-  # BUG3: 以 live iptables 为准清理陈旧 HY2 REDIRECT，不单依赖状态机里的 old_range。
-  purge_stale_hy2_redirect_rules "$range" "$to_port"
-
-  # 状态机防漏：切换跳跃范围或真实监听端口前，再按状态删除旧规则。
+  # 状态机防漏：切换跳跃范围或真实监听端口前，先删除旧规则，避免 PREROUTING 中残留旧端口段。
   if [[ -n "$old_range" && ( "$old_range" != "$range" || "$old_to_port" != "$to_port" ) ]]; then
     info "检测到 HY2 跳跃规则变更，正在卸载历史规则：$old_range -> $old_to_port"
     remove_hy2_nat_range "$old_range" "$old_to_port"
@@ -4319,8 +4018,7 @@ enable_hy2_hopping(){
   if iptables -t nat -A PREROUTING -p udp --dport "$start:$end" -j REDIRECT --to-ports "$to_port"; then
     ip4_ok=1
   else
-    hy2_hop_fail "iptables 端口跳跃规则添加失败。" || true
-    return 1
+    die "iptables 端口跳跃规则添加失败。"
   fi
   if command -v ip6tables >/dev/null 2>&1; then
     if ip6tables -t nat -A PREROUTING -p udp --dport "$start:$end" -j REDIRECT --to-ports "$to_port" 2>/dev/null; then
@@ -4364,7 +4062,7 @@ enable_hy2_hopping(){
     install_hy2_hopping_service
     regenerate_subscriptions_after_change
   fi
-  log "端口跳跃规则已设置。请确认云安全组放行 UDP $start-${end}（部分机房外网 UDP ${to_port} 本身不可达，请以跳跃段为主）。"
+  log "端口跳跃规则已设置。请确认云安全组放行 UDP $start-${end}。"
 }
 
 install_hy2_hopping_service(){
@@ -4402,16 +4100,9 @@ sync_hy2_hopping_if_needed(){
     return 0
   fi
   [[ -n "${HY2_HOP_RANGE:-}" ]] || return 0
-  local want="${HY2_PORT:-443}" have="${HY2_HOP_TO_PORT:-}" need_sync=0
+  local want="${HY2_PORT:-443}" have="${HY2_HOP_TO_PORT:-}"
   if [[ "$have" != "$want" ]]; then
     info "HY2 监听端口与跳跃目标不一致（${have:-空} -> ${want}），正在同步 iptables REDIRECT。"
-    need_sync=1
-  elif ! hy2_live_redirect_matches "$HY2_HOP_RANGE" "$want"; then
-    # BUG4: 状态看起来一致，但 live 规则缺失/陈旧时也要重应用。
-    info "HY2 跳跃 live iptables 与期望不一致（期望 ${HY2_HOP_RANGE} -> ${want}），正在重新应用。"
-    need_sync=1
-  fi
-  if [[ "$need_sync" == "1" ]]; then
     # enable_hy2_hopping uses die()/exit; run in a subshell so a hop failure cannot
     # abort generate_xray_config after the Xray JSON was already applied.
     if ! ( XEM_INTERNAL_APPLY_HY2=1 enable_hy2_hopping "$HY2_HOP_RANGE" ); then
@@ -4425,28 +4116,10 @@ sync_hy2_hopping_if_needed(){
 configure_hy2_hopping_prompt(){
   load_state
   [[ "${PROTOCOLS:-0}" == *3* ]] || return 0
-  # Opt-out: HY2_DISABLE_HOP=1 skips hopping (not recommended — some DCs drop UDP 443 upstream).
-  if [[ "${HY2_DISABLE_HOP:-0}" == "1" ]]; then
-    info "HY2_DISABLE_HOP=1：跳过 HY2 端口跳跃（订阅将只有单端口，部分机房外网可能不可达）。"
-    return 0
+  if confirm "是否开启 Hysteria2 UDP 端口跳跃（抗单端口 QoS，推荐）？范围 ${DEFAULT_HY2_HOP_RANGE}" "Y"; then
+    local range; range=$(ask "请输入跳跃端口范围，格式 start:end" "${HY2_HOP_RANGE:-$DEFAULT_HY2_HOP_RANGE}")
+    enable_hy2_hopping "$range"
   fi
-  if [[ -n "${HY2_HOP_RANGE:-}" ]]; then
-    info "已使用 HY2 跳跃范围：${HY2_HOP_RANGE} -> ${HY2_PORT:-443}"
-    enable_hy2_hopping "$HY2_HOP_RANGE" || warn "HY2 跳跃应用失败，可稍后菜单 12 重试。"
-    return 0
-  fi
-  local range="${DEFAULT_HY2_HOP_RANGE}"
-  if [[ -t 0 ]]; then
-    info "默认开启 HY2 UDP 端口跳跃 ${range}（部分机房外网 UDP ${HY2_PORT:-443} 在到达网卡前被丢，跳跃段更稳）。"
-    if confirm "是否关闭端口跳跃？（一般选 N；关闭后订阅仅单端口）" "N"; then
-      warn "已按选择跳过 HY2 端口跳跃。"
-      return 0
-    fi
-    range=$(ask "请输入跳跃端口范围，格式 start:end" "$range")
-  else
-    info "非交互模式：默认开启 HY2 跳跃 ${range}"
-  fi
-  enable_hy2_hopping "$range" || warn "HY2 跳跃应用失败，可稍后菜单 12 重试。"
 }
 
 cf_fallback_ips_v4(){
@@ -4568,17 +4241,6 @@ disable_cf_origin_firewall(){
 
 configure_cf_origin_firewall_prompt(){
   load_state
-  # Prefill / re-run: honor saved choice so piped installs do not re-prompt and
-  # accidentally consume the wrong stdin answer.
-  if [[ "${ENABLE_CF_ORIGIN_FIREWALL:-}" == "1" ]]; then
-    info "已按状态启用 Cloudflare 源站入口限制（ENABLE_CF_ORIGIN_FIREWALL=1）。"
-    enable_cf_origin_firewall
-    return 0
-  fi
-  if [[ "${ENABLE_CF_ORIGIN_FIREWALL:-}" == "0" ]]; then
-    info "已按状态跳过 Cloudflare 源站入口限制（ENABLE_CF_ORIGIN_FIREWALL=0）。"
-    return 0
-  fi
   warn "开启后，TCP 80/${CDN_PORT:-443} 的非 Cloudflare 来源会被丢弃；纯节点机推荐开启，有其它直连网站业务请选 N。"
   if confirm "是否限制订阅/伪装站/CDN 源站 TCP 80/${CDN_PORT:-443} 只允许 Cloudflare 回源？直接回车 = Y；不影响 HY2 UDP 443" "Y"; then
     enable_cf_origin_firewall
@@ -4595,8 +4257,7 @@ handle_firewall_ports(){
   [[ "${PROTOCOLS:-0}" == *1* ]] && tcp_ports+=("${XHTTP_REALITY_PORT:-2443}")
   [[ "${PROTOCOLS:-0}" == *4* ]] && tcp_ports+=("${REALITY_VISION_PORT:-3443}")
   [[ "${PROTOCOLS:-0}" == *3* ]] && udp_ports+=("${HY2_PORT:-443}")
-  # Hop range is only meaningful while protocol 3 is enabled; avoid opening a large UDP span otherwise.
-  [[ "${PROTOCOLS:-0}" == *3* && -n "${HY2_HOP_RANGE:-}" ]] && udp_ports+=("${HY2_HOP_RANGE/:/-}")
+  [[ -n "${HY2_HOP_RANGE:-}" ]] && udp_ports+=("${HY2_HOP_RANGE/:/-}")
   if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi active; then
     for p in "${tcp_ports[@]}"; do ufw allow "${p}/tcp" || true; done
     for p in "${udp_ports[@]}"; do ufw allow "${p}/udp" || true; done
@@ -4631,7 +4292,8 @@ restart_services(){
     fi
     die "Xray 重启失败，已回滚。"
   fi
-  if ! wait_unit_active xray 15; then
+  sleep 1
+  if ! systemctl is-active --quiet xray; then
     restore_latest_xray_config || true
     ensure_xray_service || true
     if xray_test_config "$XRAY_CONFIG" >/dev/null 2>&1; then
@@ -4654,7 +4316,8 @@ restart_services(){
       fi
       die "Nginx reload/restart 失败，已回滚。"
     fi
-    if ! wait_unit_active nginx 15; then
+    sleep 1
+    if ! systemctl is-active --quiet nginx; then
       restore_latest_nginx_config || true
       if nginx -t >/dev/null 2>&1; then
         systemctl restart nginx 2>/dev/null || true
@@ -4894,6 +4557,7 @@ fetch_bestcf_all(){
   return 0
 }
 
+fetch_bestcf_domains(){ fetch_bestcf_all; }
 
 bestcf_file_count(){
   local f="$1"
@@ -4994,12 +4658,11 @@ add_bestcf_nodes_from_file(){
 
     label="$(normalize_bestcf_label "$label" "${fallback_label}_${n}")"
     name="${NODE_NAME:-node}-${label}"
-    # BestCF 条目（优选 IP 或优选域名）只作为“连接入口”，借它的 Cloudflare 边缘 IP；
-    # SNI/Host 必须保持本机自己的母域名 $BASE_DOMAIN —— 只有它的 CF DNS 记录指向本机源站，
-    # CF 才会把流量回源到本机。若把优选域名本身当 SNI/Host（v0.0.40–v0.0.50 的行为），
-    # CF 会按那个域名的 zone 去找它自己的源站 → 实测 HTTP 403（DNS points to prohibited IP），
-    # 该 CFDomain 节点完全不可用。
-    add_vless_xhttp_cdn_link "$server" "$name" "$raw" "$port"
+    if [[ "$server" =~ ^[0-9.]+$ || "$server" == *:* ]]; then
+      add_vless_xhttp_cdn_link "$server" "$name" "$raw" "$port"
+    else
+      add_vless_xhttp_cdn_link "$server" "$name" "$raw" "$port" "$server"
+    fi
 
     n=$((n+1))
     printf -v "$total_ref" '%s' "$(( ${!total_ref} + 1 ))"
@@ -5079,18 +4742,9 @@ backup_sysctl_config(){
 }
 
 apply_stable_network_tuning(){
-  # Stable defaults only (BBR+fq when available). No aggressive/experimental knobs.
-  # Skip: XEM_SKIP_NET_TUNING=1
-  if [[ "${XEM_SKIP_NET_TUNING:-0}" == "1" ]]; then
-    info "XEM_SKIP_NET_TUNING=1：跳过稳定型网络优化。"
-    return 0
-  fi
-  local tmp cc available current qdisc
+  local tmp cc available current
   backup_sysctl_config
 
-  if [[ "$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)" != *bbr* ]]; then
-    modprobe tcp_bbr 2>/dev/null || true
-  fi
   available="$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)"
   current="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)"
   cc="bbr"
@@ -5098,16 +4752,11 @@ apply_stable_network_tuning(){
     cc="${current:-cubic}"
     warn "当前内核未显示支持 BBR：${available:-unknown}，将保持拥塞控制为 ${cc}。"
   fi
-  # BBR pairs with fq; cake is optional and not forced (some hosts lack sch_cake).
-  qdisc="fq"
-  if [[ "${XEM_QDISC:-}" == "cake" ]] && modprobe sch_cake 2>/dev/null; then
-    qdisc="cake"
-  fi
 
   mkdir -p "$(dirname "$SYSCTL_FILE")"
   tmp="$(mktemp_file "${SYSCTL_FILE}.tmp.XXXXXX")"
   cat > "$tmp" <<EOF2
-net.core.default_qdisc=$qdisc
+net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=$cc
 net.ipv4.tcp_fastopen=3
 net.ipv4.tcp_mtu_probing=1
@@ -5123,13 +4772,13 @@ EOF2
   chmod 644 "$tmp" 2>/dev/null || true
   mv -f "$tmp" "$SYSCTL_FILE"
   sysctl --system >/dev/null || warn "sysctl --system 返回非零；请用菜单 5 查看当前状态。"
-  log "已应用稳定型网络优化：拥塞控制=${cc}，队列=${qdisc}。"
+  log "已应用稳定型网络优化。"
 }
 
 restore_network_tuning(){
   load_state
   local bak="${LAST_SYSCTL_BACKUP:-}"
-  if [[ -z "$bak" || ! -f "$bak" ]]; then bak="$(latest_backup_matching 'sysctl.*.bak' || true)"; fi
+  [[ -n "$bak" && -f "$bak" ]] || bak=$(ls -1t "$BACKUP_DIR"/sysctl.*.bak 2>/dev/null | head -n1 || true)
   if [[ -n "$bak" && -f "$bak" ]]; then
     install -m 644 "$bak" "$SYSCTL_FILE"
     sysctl --system >/dev/null || true
@@ -5237,7 +4886,6 @@ deployment_summary(){
   protocol_enabled 4 && echo "  REALITY+Vision: TCP ${REALITY_VISION_PORT:-3443}"
   protocol_enabled 5 && echo "  XHTTP+TLS+CDN 入口扩展: TCP ${CDN_PORT:-443} -> 127.0.0.1:${XHTTP_CDN_LOCAL_PORT:-31301}"
   [[ -n "${HY2_HOP_RANGE:-}" ]] && echo "  HY2 端口跳跃: UDP ${HY2_HOP_RANGE/:/-} -> ${HY2_HOP_TO_PORT:-${HY2_PORT:-443}}"
-  protocol_enabled 3 && echo "  HY2 客户端：优先 *-HY2-HOP（带 ports/mport）；单端口 UDP 可能外网不通"
   echo "Xray 运行用户: ${XRAY_USER}"
   echo "出口策略: $(normalize_ip_outbound_mode "${IP_OUTBOUND_MODE:-}")"
   if [[ "$(normalize_ip_outbound_mode "${IP_OUTBOUND_MODE:-}")" == "auto" ]]; then
@@ -5262,59 +4910,10 @@ deployment_summary(){
 }
 
 
-
-# Check HY2 listen + hop, and remind clients which node to use.
-# Cannot fully prove "upstream drops UDP 443" from the VPS alone (hairpin often still works);
-# we verify local listen/hop rules and print an explicit client tip.
-probe_hy2_client_path(){
-  load_state
-  protocol_enabled 3 || return 0
-  local port="${HY2_PORT:-443}" hop="" listen_ok=0 hop_ok=0
-  hop="$(hy2_hop_range_for_stack v4)"
-  [[ -z "$hop" ]] && hop="${HY2_HOP_RANGE:-}"
-
-  echo "----- HY2 连通提示 -----"
-  if command -v ss >/dev/null 2>&1; then
-    if ss -ulnp 2>/dev/null | grep -E ":${port}\\b" | grep -qi xray; then
-      log "本机 xray 正在听 UDP ${port}。"
-      listen_ok=1
-    else
-      warn "未在 ss 中看到 xray 监听 UDP ${port}（若刚重启可稍后再查）。"
-    fi
-  else
-    warn "没有 ss 命令，跳过 UDP 监听确认。"
-  fi
-
-  if [[ -n "$hop" ]]; then
-    local start="${hop%%:*}" end="${hop##*:}"
-    if command -v iptables >/dev/null 2>&1 && iptables -t nat -S PREROUTING 2>/dev/null | grep -qE "REDIRECT.*${start}:${end}|dport ${start}:${end}"; then
-      log "已检测到 UDP 端口跳跃规则：${start}-${end} -> ${port}。"
-      hop_ok=1
-    elif [[ "${HY2_HOP_V4_READY:-}" == "1" || -n "${HY2_HOP_RANGE:-}" ]]; then
-      warn "状态里有跳跃范围 ${hop}，但 iptables 里可能还没挂上；可执行菜单 12 或：xem --apply-hy2-hopping"
-      hop_ok=0
-    else
-      warn "尚未配置端口跳跃。"
-    fi
-  else
-    warn "未启用 HY2 端口跳跃。部分机房外网 UDP ${port} 会在到达网卡前被丢掉。"
-  fi
-
-  echo "【请客户端这样用】"
-  if [[ "$hop_ok" -eq 1 || -n "$hop" ]]; then
-    log "请优先用订阅里的 *-HY2-HOP（或带 mport / ports 的节点）。不要只连 UDP ${port} 单端口。"
-    info "说明：本机听 ${port} 通，不等于外网 UDP ${port} 通。今天遇到的典型情况是上游丢掉 UDP ${port}，跳跃段仍可用。"
-  else
-    warn "当前没有可用跳跃。请开启跳跃并重生成订阅，再用 *-HY2-HOP；否则外网 HY2 可能一直超时。"
-  fi
-  echo "------------------------"
-}
-
 deployment_healthcheck(){
   load_state
   local failed=0 mode warp_file
   echo "===== 部署后生产自检 ====="
-  info "网络：拥塞控制=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo ?) 队列=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo ?)"
 
   if [[ -f "$XRAY_CONFIG" ]]; then
     if ( xray_test_config "$XRAY_CONFIG" ) >/dev/null 2>&1; then
@@ -5396,11 +4995,6 @@ deployment_healthcheck(){
     fi
   fi
 
-  # HY2: remind hop preference (does not fail the whole healthcheck by itself)
-  if protocol_enabled 3; then
-    probe_hy2_client_path || true
-  fi
-
   if [[ "$failed" -eq 0 ]]; then
     log "部署后生产自检通过。"
   else
@@ -5412,8 +5006,6 @@ deployment_healthcheck(){
 install_full(){
   need_root
   install_deps
-  # Default path: enable BBR/fq (or safe fallback) once per clean install — not only menu 5.
-  apply_stable_network_tuning || warn "稳定型网络优化未完全成功，可稍后菜单 5 重试；继续部署。"
   install_or_upgrade_xray
   update_geodata
   prepare_base_domain_for_install
@@ -5641,6 +5233,14 @@ resolve_remote_host_for_curl(){
   printf '%s' "$selected"
 }
 
+# Backward-compatible boolean wrapper. Prefer resolve_remote_host_for_curl so
+# curl can be pinned with --resolve and cannot perform a second DNS lookup.
+resolve_and_check_ssrf(){
+  local hostname="$1" _ip
+  _ip="$(resolve_remote_host_for_curl "$hostname")" || return 1
+  [[ -n "$_ip" ]]
+}
+
 
 filter_subscription_lines(){
   local input="$1" output="$2"
@@ -5785,11 +5385,6 @@ merge_remote_subscriptions(){
   cat "$SUB_DIR/local.raw" "$remote_raw" 2>/dev/null | sed '/^$/d' | awk '!seen[$0]++' > "$merged"
   # COMPATIBILITY FIX: avoid GNU-specific base64 -w0.
   base64 "$merged" | tr -d '\n' > "$merged_b64"
-  if [[ ! -s "$merged_b64" ]]; then
-    warn "合并订阅内容为空，拒绝发布空订阅文件。"
-    rm -f "$WEB_ROOT/sub/$MERGED_SUB_TOKEN"
-    return 1
-  fi
   local nginx_group
   nginx_group="$(detect_nginx_group)"
   ensure_web_subscription_permissions
@@ -6096,7 +5691,7 @@ main_menu(){
   load_state
   while true; do
     echo
-    echo "===== Xray Edge Manager ${XEM_VERSION} ====="
+    echo "===== Xray Edge Manager v0.0.42-harden ====="
     echo "1. 首次部署向导，推荐"
     echo "2. 安装/升级基础依赖"
     echo "3. 安装/升级 Xray-core"
@@ -6125,7 +5720,7 @@ main_menu(){
       1) install_full; pause ;;
       2) install_deps; pause ;;
       3) install_or_upgrade_xray; if [[ -f "$XRAY_CONFIG" ]]; then restart_services; else warn "尚未生成 Xray 配置，跳过服务重启。"; fi; pause ;;
-      4) update_geodata; if [[ -f "$XRAY_CONFIG" ]] && xray_test_config "$XRAY_CONFIG" >/dev/null 2>&1; then systemctl restart xray 2>/dev/null || warn "Xray 重启失败，请稍后执行菜单 17 检查。"; else warn "Xray 配置不存在或测试未通过，跳过重启。"; fi; if systemctl is-enabled --quiet xem-geodata-update.timer 2>/dev/null; then if confirm "geodata 周更定时器已启用，是否关闭？" "N"; then disable_geodata_timer; fi; elif confirm "是否启用每周一凌晨 4-5 点安全自动更新 geodata？" "N"; then enable_geodata_timer; fi; pause ;;
+      4) update_geodata; if [[ -f "$XRAY_CONFIG" ]] && xray_test_config "$XRAY_CONFIG" >/dev/null 2>&1; then systemctl restart xray 2>/dev/null || warn "Xray 重启失败，请稍后执行菜单 17 检查。"; else warn "Xray 配置不存在或测试未通过，跳过重启。"; fi; if confirm "是否启用每周一凌晨 4-5 点安全自动更新 geodata？" "N"; then enable_geodata_timer; fi; pause ;;
       5)
         network_status
         echo "1. 应用稳定型网络优化"
@@ -6194,10 +5789,7 @@ case "${1:-}" in
     if [[ -n "${HY2_HOP_RANGE:-}" ]]; then
       # Boot/oneshot path: restore NAT only. Do not regenerate subscriptions
       # (avoids BestCF network fetch and www rewrite on every reboot).
-      # Soft-fail: invalid legacy range/port must not leave the oneshot in failed state every boot.
-      if ! XEM_INTERNAL_APPLY_HY2=1 enable_hy2_hopping "$HY2_HOP_RANGE"; then
-        warn "开机恢复 HY2 端口跳跃未成功；请稍后在菜单中检查跳跃范围是否包含监听口或 iptables 是否可用。"
-      fi
+      XEM_INTERNAL_APPLY_HY2=1 enable_hy2_hopping "$HY2_HOP_RANGE"
     fi
     exit 0
     ;;

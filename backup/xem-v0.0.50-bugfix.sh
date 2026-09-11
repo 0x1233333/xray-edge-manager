@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Xray Edge Manager / Xray Anti-Block Manager
-# v0.0.51-cfdomain-sni-fix — BestCF 节点 SNI/Host 固定为本机母域名（修复 CFDomain 全部不可用）
+# v0.0.50-bugfix — no Xray downgrade/PIN, HOP live iptables, BESTCF reconcile, empty sub guard
 #
 # Features:
 # - Xray-core only, no Docker, no sing-box
@@ -23,7 +23,7 @@
 set -Eeuo pipefail
 umask 077
 
-XEM_VERSION="v0.0.51-cfdomain-sni-fix"
+XEM_VERSION="v0.0.50-bugfix"
 
 # Global temp cleanup registry. Any temp file/dir registered here will be
 # removed on normal exit or interruption. Missing paths are ignored.
@@ -3665,10 +3665,7 @@ add_vless_xhttp_reality_link(){
 
 add_vless_xhttp_cdn_link(){
   local server="$1" name="$2" raw="$3" port="${4:-443}" path_enc server_uri sni_host
-  # 第 5 参数为 SNI/Host，缺省回落本机母域名 $BASE_DOMAIN —— 这是唯一正确取值：
-  # 只有本机母域名的 CF DNS 记录指向本机源站。
-  # 切勿传入 BestCF 优选域名（v0.0.40–v0.0.50 曾这样做 → CF 按那个域名的 zone 回源 → 403，
-  # 订阅里的 CFDomain 节点全部不可用）。
+  # 第 5 参数为 SNI/Host；BestCF 域名模式传入优选 FQDN，使其与证书/回源主机一致。
   sni_host="${5:-$BASE_DOMAIN}"
   server_uri=$(format_uri_host "$server")
   path_enc=$(uri_encode "$XHTTP_CDN_PATH")
@@ -4994,12 +4991,11 @@ add_bestcf_nodes_from_file(){
 
     label="$(normalize_bestcf_label "$label" "${fallback_label}_${n}")"
     name="${NODE_NAME:-node}-${label}"
-    # BestCF 条目（优选 IP 或优选域名）只作为“连接入口”，借它的 Cloudflare 边缘 IP；
-    # SNI/Host 必须保持本机自己的母域名 $BASE_DOMAIN —— 只有它的 CF DNS 记录指向本机源站，
-    # CF 才会把流量回源到本机。若把优选域名本身当 SNI/Host（v0.0.40–v0.0.50 的行为），
-    # CF 会按那个域名的 zone 去找它自己的源站 → 实测 HTTP 403（DNS points to prohibited IP），
-    # 该 CFDomain 节点完全不可用。
-    add_vless_xhttp_cdn_link "$server" "$name" "$raw" "$port"
+    if [[ "$server" =~ ^[0-9.]+$ || "$server" == *:* ]]; then
+      add_vless_xhttp_cdn_link "$server" "$name" "$raw" "$port"
+    else
+      add_vless_xhttp_cdn_link "$server" "$name" "$raw" "$port" "$server"
+    fi
 
     n=$((n+1))
     printf -v "$total_ref" '%s' "$(( ${!total_ref} + 1 ))"
