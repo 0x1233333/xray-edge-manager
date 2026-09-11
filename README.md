@@ -1,4 +1,8 @@
-- **v0.0.55-mihomo-stable-note**: 更正**「Mihomo 必须用开发版/Alpha」的过时说明**。实测本脚本用到的全部字段 —— XHTTP 的 `reuse-settings`(XMUX) 与 `x-padding-bytes`、HY2 的 `ports` 与 `hop-interval` —— **Mihomo 稳定版自 1.19.28 起已支持**：稳定版与 Alpha 均能 `mihomo -t` 通过并跑通流量（四层验证），**不需要特意换开发版内核**。改动含：生成的 `mihomo-reference.yaml` 头部说明、README「Clash Meta / Mihomo 兼容性」表与建议客户端段、仓库内 `skills/xem-deploy` 的「客户端」节（原文写「必须用开发板/Alpha」）。
+- **v0.0.57-hy2-masq-sockopt**: 四项定点修复。① **HY2 masquerade 默认开启**（`HY2_MASQUERADE` 默认 `0→1`）：代码早已能写 `hysteriaSettings.masquerade`，但 13 台机器 state.env 都没设该键，等于全关；探测 HY2 会暴露 Xray 指纹。显式 `HY2_MASQUERADE=0` 仍可关。② **mihomo 参考 YAML 补 CFDomain 节点**：`generate_mihomo_reference` 原先只写 v4/v6 REALITY / CDN / HY2，漏了订阅里已有的优选域名入口；复用 v0.0.54 的 `collect_reachable_bestcf_entries`，SNI/`servername`/`host` 必须是母域名（v0.0.51 修复），收集为空则静默跳过以免写坏参考 YAML。③ **4 个 TCP 直连入站加 sockopt**（`tcpFastOpen`/`tcpNoDelay`/`tcpCongestion=bbr`/`tcpKeepAliveInterval=30`）：原先只有 `in-xhttp-cdn-local` 有 sockopt 且是 `trustedXForwardedFor` 信任闸门，其它入站未调优。加的是 `in-v4/v6-xhttp-reality` 与 `in-v4/v6-reality-vision` 这 4 个 TCP 入站；**HY2 入站（UDP）不加** —— `tcpCongestion`/`tcpFastOpen` 等字段对 UDP 无意义。**不加** `trustedXForwardedFor`/`acceptProxyProtocol`/`tproxy`/`mark`/`dialerProxy`，也不动 CDN 入站。④ **菜单 9 遇 CF API 超时不再整体中断**：`cf_upsert_record` 的 curl 失败改为 warn 并继续（DNS 记录多半已在）；订阅刷新后自检文件存在/非空/节点数>0，失败打醒目 `[ERR] 订阅未生成或为空`，菜单 9 结束打印 `[SUMMARY] 菜单9 完成: 配置=OK 订阅=FAIL(...)` 且保持退出码 0 以便回主菜单。此前 `set -e` 在 `curl: (28) Resolving timed out` 处直接退出，订阅根本没重新生成，旧文件还在，从外部看「一切正常」。
+
+- **v0.0.56-mihomo-note-fix**: 修 v0.0.55 引入的一个缺陷 —— 生成的 `mihomo-reference.yaml` 头部说明里写了反引号包裹的命令名，而该文件是用**不带引号的 heredoc**（`cat > "$f" <<EOF2`，需展开 `${NODE_NAME}` 等变量）写出的，反引号会被 **shell 当命令执行**、内容被替换成命令输出（实测生成文件里变成「均能  通过」，突兀且会往部署日志里塞一条 `command not found`）。改为纯文字描述，不带反引号。**教训**：往不带引号的 heredoc 里加文字时，`$`、反引号、`\` 都必须转义或回避 —— 本仓库这类 heredoc（`<<EOF2`）共 30 处，加文案前先确认。
+
+- **v0.0.55-mihomo-stable-note**: 更正**「Mihomo 必须用开发版/Alpha」的过时说明**。实测本脚本用到的全部字段 —— XHTTP 的 `reuse-settings`(XMUX) 与 `x-padding-bytes`、HY2 的 `ports` 与 `hop-interval` —— **Mihomo 稳定版自 1.19.28 起已支持**：稳定版与 Alpha 均能通过配置自检并跑通流量（四层验证），**不需要特意换开发版内核**。改动含：生成的 `mihomo-reference.yaml` 头部说明、README「Clash Meta / Mihomo 兼容性」表与建议客户端段、仓库内 `skills/xem-deploy` 的「客户端」节（原文写「必须用开发板/Alpha」）。
 
 - **v0.0.54-bestcf-reachability-probe**: 优选域名筛选加**第三级——实测探测**（新增 `bestcf_entry_probe_ok`）。前两级（能解析 + 落 CF 边缘段）**不足以判定可用**：实测 `cdn.2020111.xyz` 解析到 `104.16.123.96`/`104.16.124.96`（都在 CF 段内），但请求返回 **HTTP 403 `error code: 1034`** —— 该域名的 CNAME 链终点是 `www.cloudflare.com`（跨账号 CNAME，被 CF 拒绝），这种节点写进订阅必然连不上。现在收集时对每个候选**真发一次请求**（连其边缘 IP，但 SNI/Host 用本机母域名，要求 `200`），凑满所需数量即停，另设 30 次探测上限避免脏数据拖慢菜单 9。网络异常时 `fail-open` 不阻断，由调用方回退未过滤数据。
 
@@ -25,7 +29,7 @@
 
 一键在 VPS 上部署 **Xray-core 边缘抗封锁节点**：REALITY 直连 + Cloudflare CDN 中转 + Xray Hysteria2 (HY2) + BestCF 优选入口 + Nginx 伪装站/订阅 + 可选 WARP 出站。
 
-当前脚本版本：`v0.0.55-mihomo-stable-note`（仓库入口脚本一般为 `xem.sh`）。
+当前脚本版本：`v0.0.57-hy2-masq-sockopt`（仓库入口脚本一般为 `xem.sh`）。
 
 ---
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Xray Edge Manager / Xray Anti-Block Manager
-# v0.0.57-hy2-masq-sockopt — HY2 masquerade 默认开；mihomo 补 CFDomain；6 入站 sockopt；菜单9 DNS 失败不中断
+# v0.0.56-mihomo-note-fix — 修 v0.0.55 引入的反引号缺陷（在不带引号的 heredoc 里会把内容当命令执行）
 #
 # Features:
 # - Xray-core only, no Docker, no sing-box
@@ -23,7 +23,7 @@
 set -Eeuo pipefail
 umask 077
 
-XEM_VERSION="v0.0.57-hy2-masq-sockopt"
+XEM_VERSION="v0.0.56-mihomo-note-fix"
 
 # Global temp cleanup registry. Any temp file/dir registered here will be
 # removed on normal exit or interruption. Missing paths are ignored.
@@ -257,7 +257,7 @@ allowed_state_key(){
     V4_XHTTP_REALITY_READY|V6_XHTTP_REALITY_READY|V4_HY2_READY|V6_HY2_READY|V4_VISION_READY|V6_VISION_READY|CDN_XHTTP_READY)
       return 0
       ;;
-    DOMAIN_V4|DOMAIN_V6|IPV4_ENABLED|IPV6_ENABLED|CF_ZONE_NAME|CDN_NETWORK|HY2_SNI|HY2_MASQUERADE|WEB_ROOT|LAST_SUBSCRIPTION_NODE_COUNT|LAST_SUBSCRIPTION_REGEN|LAST_PUBLIC_IP_DETECT)
+    DOMAIN_V4|DOMAIN_V6|IPV4_ENABLED|IPV6_ENABLED|CF_ZONE_NAME|CDN_NETWORK|HY2_SNI|WEB_ROOT|LAST_SUBSCRIPTION_NODE_COUNT|LAST_SUBSCRIPTION_REGEN|LAST_PUBLIC_IP_DETECT)
       return 0
       ;;
     CF_API_TOKEN|CF_ZONE_ID)
@@ -1373,18 +1373,10 @@ cf_upsert_record(){
   assert_managed_dns_scope "$name" "$type"
   warn_cf_dns_exclusive_domain
   info "Upsert DNS: $type $name -> $content proxied=$proxied"
-  # DNS 记录多半已存在：CF API 超时/失败不致命，warn 后继续，避免 set -e 打断菜单 9 后续的配置/订阅刷新。
-  if ! list=$(curl -fsS --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time "$CURL_MAX_TIME" -G "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/dns_records" \
+  list=$(curl -fsS --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time "$CURL_MAX_TIME" -G "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/dns_records" \
     -H "Authorization: Bearer $CF_API_TOKEN" \
-    --data-urlencode "type=$type" --data-urlencode "name=$name" --data-urlencode "per_page=100"); then
-    warn "CF API 查询失败，跳过 DNS upsert：$type $name（记录多半已存在，继续）"
-    return 0
-  fi
-  if ! echo "$list" | jq -e '.success == true' >/dev/null; then
-    warn "Cloudflare DNS 记录查询失败：$type $name（记录多半已存在，继续）"
-    echo "$list" >&2
-    return 0
-  fi
+    --data-urlencode "type=$type" --data-urlencode "name=$name" --data-urlencode "per_page=100") || return 1
+  echo "$list" | jq -e '.success == true' >/dev/null || { err "Cloudflare DNS 记录查询失败：$type $name"; echo "$list" >&2; return 1; }
 
   mapfile -t ids < <(echo "$list" | jq -r '.result[]?.id // empty')
   rec_id=$(echo "$list" | jq -r --arg content "$content" '[.result[]? | select(.content == $content) | .id][0] // empty')
@@ -1394,9 +1386,9 @@ cf_upsert_record(){
     '{type:$type,name:$name,content:$content,ttl:1,proxied:$proxied}')
 
   if [[ -n "$rec_id" ]]; then
-    cf_api PATCH "/zones/$CF_ZONE_ID/dns_records/$rec_id" "$payload" >/dev/null || warn "CF API 更新 DNS 失败：$type $name（记录多半已存在，继续）"
+    cf_api PATCH "/zones/$CF_ZONE_ID/dns_records/$rec_id" "$payload" >/dev/null
   else
-    cf_api POST "/zones/$CF_ZONE_ID/dns_records" "$payload" >/dev/null || warn "CF API 创建 DNS 失败：$type $name（记录多半已存在，继续）"
+    cf_api POST "/zones/$CF_ZONE_ID/dns_records" "$payload" >/dev/null
   fi
 
   # Only collapse duplicate records for the exact managed name/type. This never
@@ -3166,14 +3158,14 @@ EOF2
   if protocol_enabled 1; then
     if [[ -n "$bind_ip4" && "${IPV4_PROTOCOLS:-0}" == *1* ]]; then
       append_json_obj "$in_tmp" first_in <<EOF2
-    {"tag":"in-v4-xhttp-reality","listen":"${bind_ip4}","port":${XHTTP_REALITY_PORT},"protocol":"vless","settings":{"clients":[{"id":"${UUID}","email":"v4-xhttp-reality"}],"decryption":"none"},"streamSettings":{"method":"xhttp","network":"xhttp","security":"reality","xhttpSettings":{"path":"${XHTTP_REALITY_PATH}","mode":"auto","extra":{"xPaddingBytes":"100-1000","noSSEHeader":true}},"realitySettings":{"show":false,"dest":"${REALITY_TARGET}:443","target":"${REALITY_TARGET}:443","serverNames":["${REALITY_TARGET}"],"privateKey":"${REALITY_PRIVATE_KEY}","shortIds":["${SHORT_ID}","${SHORT_ID_B}","${SHORT_ID_C}"]},"sockopt":{"tcpFastOpen":true,"tcpNoDelay":true,"tcpCongestion":"bbr","tcpKeepAliveInterval":30}}}
+    {"tag":"in-v4-xhttp-reality","listen":"${bind_ip4}","port":${XHTTP_REALITY_PORT},"protocol":"vless","settings":{"clients":[{"id":"${UUID}","email":"v4-xhttp-reality"}],"decryption":"none"},"streamSettings":{"method":"xhttp","network":"xhttp","security":"reality","xhttpSettings":{"path":"${XHTTP_REALITY_PATH}","mode":"auto","extra":{"xPaddingBytes":"100-1000","noSSEHeader":true}},"realitySettings":{"show":false,"dest":"${REALITY_TARGET}:443","target":"${REALITY_TARGET}:443","serverNames":["${REALITY_TARGET}"],"privateKey":"${REALITY_PRIVATE_KEY}","shortIds":["${SHORT_ID}","${SHORT_ID_B}","${SHORT_ID_C}"]}}}
 EOF2
       v4_xhttp_ready=1
       [[ "$bind" == "1" ]] && append_route_for_inbound "$route_tmp" first_route "in-v4-xhttp-reality" "v4" "$outbound_mode"
     fi
     if [[ -n "$bind_ip6" && "${IPV6_PROTOCOLS:-0}" == *1* ]]; then
       append_json_obj "$in_tmp" first_in <<EOF2
-    {"tag":"in-v6-xhttp-reality","listen":"${bind_ip6}","port":${XHTTP_REALITY_PORT},"protocol":"vless","settings":{"clients":[{"id":"${UUID}","email":"v6-xhttp-reality"}],"decryption":"none"},"streamSettings":{"method":"xhttp","network":"xhttp","security":"reality","xhttpSettings":{"path":"${XHTTP_REALITY_PATH}","mode":"auto","extra":{"xPaddingBytes":"100-1000","noSSEHeader":true}},"realitySettings":{"show":false,"dest":"${REALITY_TARGET}:443","target":"${REALITY_TARGET}:443","serverNames":["${REALITY_TARGET}"],"privateKey":"${REALITY_PRIVATE_KEY}","shortIds":["${SHORT_ID}","${SHORT_ID_B}","${SHORT_ID_C}"]},"sockopt":{"tcpFastOpen":true,"tcpNoDelay":true,"tcpCongestion":"bbr","tcpKeepAliveInterval":30}}}
+    {"tag":"in-v6-xhttp-reality","listen":"${bind_ip6}","port":${XHTTP_REALITY_PORT},"protocol":"vless","settings":{"clients":[{"id":"${UUID}","email":"v6-xhttp-reality"}],"decryption":"none"},"streamSettings":{"method":"xhttp","network":"xhttp","security":"reality","xhttpSettings":{"path":"${XHTTP_REALITY_PATH}","mode":"auto","extra":{"xPaddingBytes":"100-1000","noSSEHeader":true}},"realitySettings":{"show":false,"dest":"${REALITY_TARGET}:443","target":"${REALITY_TARGET}:443","serverNames":["${REALITY_TARGET}"],"privateKey":"${REALITY_PRIVATE_KEY}","shortIds":["${SHORT_ID}","${SHORT_ID_B}","${SHORT_ID_C}"]}}}
 EOF2
       v6_xhttp_ready=1
       [[ "$bind" == "1" ]] && append_route_for_inbound "$route_tmp" first_route "in-v6-xhttp-reality" "v6" "$outbound_mode"
@@ -3191,7 +3183,7 @@ EOF2
   if protocol_enabled 3; then
     if [[ -n "$bind_ip4" && "${IPV4_PROTOCOLS:-0}" == *3* ]]; then
       # Xray HY2 inbound: settings.clients[].auth (json tag; 26.3.27 ignores "users") + network=hysteria + TLS/h3.
-      # Do NOT put auth in hysteriaSettings (outbound field). Salamander is opt-in; masquerade defaults on.
+      # Do NOT put auth in hysteriaSettings (outbound field). Salamander/masquerade are opt-in.
       local hy2_stream_v4
       hy2_stream_v4=$(cat <<EOF_HY2_STREAM
 {"network":"hysteria","security":"tls","tlsSettings":{"alpn":["h3"],"certificates":[{"certificateFile":"${XRAY_CERT_DIR}/${BASE_DOMAIN}/fullchain.pem","keyFile":"${XRAY_CERT_DIR}/${BASE_DOMAIN}/privkey.pem"}]},"hysteriaSettings":{"version":2,"udpIdleTimeout":120}}
@@ -3200,7 +3192,7 @@ EOF_HY2_STREAM
       if [[ "${HY2_SALAMANDER:-0}" == "1" && -n "${HY2_OBFS:-}" ]]; then
         hy2_stream_v4=$(jq -c --arg pw "${HY2_OBFS}" '.finalmask={"udp":[{"type":"salamander","settings":{"password":$pw}}]}' <<<"$hy2_stream_v4")
       fi
-      if [[ "${HY2_MASQUERADE:-1}" == "1" ]]; then
+      if [[ "${HY2_MASQUERADE:-0}" == "1" ]]; then
         hy2_stream_v4=$(jq -c --arg url "https://${REALITY_TARGET:-$BASE_DOMAIN}" '.hysteriaSettings.masquerade={"type":"proxy","url":$url,"rewriteHost":true,"insecure":false}' <<<"$hy2_stream_v4")
       fi
       append_json_obj "$in_tmp" first_in <<EOF2
@@ -3218,7 +3210,7 @@ EOF_HY2_STREAM
       if [[ "${HY2_SALAMANDER:-0}" == "1" && -n "${HY2_OBFS:-}" ]]; then
         hy2_stream_v6=$(jq -c --arg pw "${HY2_OBFS}" '.finalmask={"udp":[{"type":"salamander","settings":{"password":$pw}}]}' <<<"$hy2_stream_v6")
       fi
-      if [[ "${HY2_MASQUERADE:-1}" == "1" ]]; then
+      if [[ "${HY2_MASQUERADE:-0}" == "1" ]]; then
         hy2_stream_v6=$(jq -c --arg url "https://${REALITY_TARGET:-$BASE_DOMAIN}" '.hysteriaSettings.masquerade={"type":"proxy","url":$url,"rewriteHost":true,"insecure":false}' <<<"$hy2_stream_v6")
       fi
       append_json_obj "$in_tmp" first_in <<EOF2
@@ -3232,14 +3224,14 @@ EOF2
   if protocol_enabled 4; then
     if [[ -n "$bind_ip4" && "${IPV4_PROTOCOLS:-0}" == *4* ]]; then
       append_json_obj "$in_tmp" first_in <<EOF2
-    {"tag":"in-v4-reality-vision","listen":"${bind_ip4}","port":${REALITY_VISION_PORT},"protocol":"vless","settings":{"clients":[{"id":"${UUID}","flow":"xtls-rprx-vision","email":"v4-reality-vision"}],"decryption":"none"},"streamSettings":{"method":"raw","network":"raw","security":"reality","realitySettings":{"show":false,"dest":"${REALITY_TARGET}:443","target":"${REALITY_TARGET}:443","serverNames":["${REALITY_TARGET}"],"privateKey":"${REALITY_PRIVATE_KEY}","shortIds":["${SHORT_ID}","${SHORT_ID_B}","${SHORT_ID_C}"]},"sockopt":{"tcpFastOpen":true,"tcpNoDelay":true,"tcpCongestion":"bbr","tcpKeepAliveInterval":30}}}
+    {"tag":"in-v4-reality-vision","listen":"${bind_ip4}","port":${REALITY_VISION_PORT},"protocol":"vless","settings":{"clients":[{"id":"${UUID}","flow":"xtls-rprx-vision","email":"v4-reality-vision"}],"decryption":"none"},"streamSettings":{"method":"raw","network":"raw","security":"reality","realitySettings":{"show":false,"dest":"${REALITY_TARGET}:443","target":"${REALITY_TARGET}:443","serverNames":["${REALITY_TARGET}"],"privateKey":"${REALITY_PRIVATE_KEY}","shortIds":["${SHORT_ID}","${SHORT_ID_B}","${SHORT_ID_C}"]}}}
 EOF2
       v4_vision_ready=1
       [[ "$bind" == "1" ]] && append_route_for_inbound "$route_tmp" first_route "in-v4-reality-vision" "v4" "$outbound_mode"
     fi
     if [[ -n "$bind_ip6" && "${IPV6_PROTOCOLS:-0}" == *4* ]]; then
       append_json_obj "$in_tmp" first_in <<EOF2
-    {"tag":"in-v6-reality-vision","listen":"${bind_ip6}","port":${REALITY_VISION_PORT},"protocol":"vless","settings":{"clients":[{"id":"${UUID}","flow":"xtls-rprx-vision","email":"v6-reality-vision"}],"decryption":"none"},"streamSettings":{"method":"raw","network":"raw","security":"reality","realitySettings":{"show":false,"dest":"${REALITY_TARGET}:443","target":"${REALITY_TARGET}:443","serverNames":["${REALITY_TARGET}"],"privateKey":"${REALITY_PRIVATE_KEY}","shortIds":["${SHORT_ID}","${SHORT_ID_B}","${SHORT_ID_C}"]},"sockopt":{"tcpFastOpen":true,"tcpNoDelay":true,"tcpCongestion":"bbr","tcpKeepAliveInterval":30}}}
+    {"tag":"in-v6-reality-vision","listen":"${bind_ip6}","port":${REALITY_VISION_PORT},"protocol":"vless","settings":{"clients":[{"id":"${UUID}","flow":"xtls-rprx-vision","email":"v6-reality-vision"}],"decryption":"none"},"streamSettings":{"method":"raw","network":"raw","security":"reality","realitySettings":{"show":false,"dest":"${REALITY_TARGET}:443","target":"${REALITY_TARGET}:443","serverNames":["${REALITY_TARGET}"],"privateKey":"${REALITY_PRIVATE_KEY}","shortIds":["${SHORT_ID}","${SHORT_ID_B}","${SHORT_ID_C}"]}}}
 EOF2
       v6_vision_ready=1
       [[ "$bind" == "1" ]] && append_route_for_inbound "$route_tmp" first_route "in-v6-reality-vision" "v6" "$outbound_mode"
@@ -4060,51 +4052,6 @@ EOF2
 EOF2
     fi
   fi
-
-  # CFDomain 仅作参考：收集为空则静默跳过，不回退未过滤数据、不写坏 YAML。
-  _mihomo_append_cfdomain() {
-    [[ "${BESTCF_ENABLED:-0}" == "1" && "${BESTCF_MODE:-domain}" == "domain" ]] || return 0
-    [[ -s "$BESTCF_DIR/bestcf-domain.txt" ]] || return 0
-    local limit="${BESTCF_TOTAL_LIMIT:-1}" filtered srv port label
-    [[ "$limit" =~ ^[0-9]+$ ]] || limit=1
-    [[ "$limit" -lt 1 ]] && limit=1
-    [[ "$limit" -gt 25 ]] && limit=25
-    filtered="$(collect_reachable_bestcf_entries "$BESTCF_DIR/bestcf-domain.txt" "$limit")"
-    [[ -n "$filtered" && -s "$filtered" ]] || return 0
-    while IFS='|' read -r srv port label; do
-      [[ -n "${srv:-}" && -n "${label:-}" ]] || continue
-      [[ -n "${port:-}" ]] || port=443
-      cat >> "$f" <<EOF2
-  - name: ${NODE_NAME:-node}-${label}
-    type: vless
-    server: ${srv}
-    port: ${port}
-    uuid: ${UUID}
-    udp: true
-    tls: true
-    servername: ${BASE_DOMAIN}
-    client-fingerprint: chrome
-    alpn:
-      - h2
-    encryption: "none"
-    packet-encoding: xudp
-    flow: ""
-    skip-cert-verify: false
-    network: xhttp
-    xhttp-opts:
-      host: ${BASE_DOMAIN}
-      mode: auto
-      path: ${XHTTP_CDN_PATH}
-      x-padding-bytes: "100-1000"
-      reuse-settings:
-        max-concurrency: "16-32"
-        c-max-reuse-times: "0"
-        h-max-reusable-secs: "1800-3000"
-EOF2
-    done < "$filtered"
-  }
-  _mihomo_append_cfdomain
-  unset -f _mihomo_append_cfdomain
   log "Mihomo 参考片段已生成：$f"
 }
 
@@ -4223,41 +4170,10 @@ generate_subscription(){
   echo "订阅链接： $(sub_url "$SUB_TOKEN")"
 }
 
-# Distinguishes "config regenerated" from "subscription actually published".
-# Always returns 0 so set -e callers (especially menu 9) can still reach the summary.
-verify_subscription_generated(){
-  load_state
-  local raw="$SUB_DIR/local.raw"
-  local pub="$WEB_ROOT/sub/${SUB_TOKEN:-}"
-  local count=0
-  XEM_SUB_REGEN_STATUS="OK"
-  if [[ -z "${SUB_TOKEN:-}" || ! -s "$pub" ]]; then
-    err "订阅未生成或为空"
-    XEM_SUB_REGEN_STATUS="FAIL(订阅文件不存在或为空)"
-    return 0
-  fi
-  if [[ ! -s "$raw" ]]; then
-    err "订阅未生成或为空"
-    XEM_SUB_REGEN_STATUS="FAIL(local.raw 不存在或为空)"
-    return 0
-  fi
-  count=$(grep -cve '^[[:space:]]*$' "$raw" 2>/dev/null || true)
-  [[ "$count" =~ ^[0-9]+$ ]] || count=0
-  if [[ "$count" -le 0 ]]; then
-    err "订阅未生成或为空"
-    XEM_SUB_REGEN_STATUS="FAIL(节点数为0)"
-    return 0
-  fi
-  return 0
-}
-
 regenerate_subscriptions_after_change(){
   load_state
-  XEM_SUB_REGEN_STATUS="OK"
   if [[ -z "${BASE_DOMAIN:-}" ]]; then
     warn "未设置母域名，跳过自动刷新订阅。"
-    err "订阅未生成或为空"
-    XEM_SUB_REGEN_STATUS="FAIL(未设置母域名)"
     return 0
   fi
 
@@ -4266,12 +4182,8 @@ regenerate_subscriptions_after_change(){
   #   /sub/$MERGED_SUB_TOKEN  = local + remotes; if no remotes exist, it equals local-only
   # This prevents first-install summaries from printing a merged subscription URL
   # that does not exist yet and would return 404.
-  if generate_subscription; then
-    merge_remote_subscriptions || warn "合并订阅自动刷新失败，请稍后手动执行菜单 14 -> 8。"
-  else
-    warn "本机订阅自动刷新失败，请稍后手动执行菜单 14 -> 1。"
-  fi
-  verify_subscription_generated
+  generate_subscription || { warn "本机订阅自动刷新失败，请稍后手动执行菜单 14 -> 1。"; return 0; }
+  merge_remote_subscriptions || warn "合并订阅自动刷新失败，请稍后手动执行菜单 14 -> 8。"
 }
 ensure_iptables(){
   command -v iptables >/dev/null 2>&1 && return 0
@@ -6391,24 +6303,7 @@ main_menu(){
       6) setup_cloudflare; create_dns_records; pause ;;
       7) issue_certificate; pause ;;
       8) asn_report; pause ;;
-      9)
-        asn_report
-        select_ip_stack_strategy
-        select_protocols
-        assert_deploy_stack_ready
-        create_dns_records || warn "DNS 更新未完全成功，继续后续配置与订阅（记录多半已存在）。"
-        choose_reality_target
-        ensure_hy2_certificate_ready
-        generate_xray_config
-        configure_nginx
-        restart_services
-        regenerate_subscriptions_after_change
-        deployment_healthcheck
-        # 始终打印摘要（不止 FAIL）：jpwx 实战 —— 订阅没重生成时旧文件仍在、从外部看
-        # "一切正常"，只能靠这行确认本轮订阅到底有没有重生。OK 也必须打。
-        echo "[SUMMARY] 菜单9 完成: 配置=OK 订阅=${XEM_SUB_REGEN_STATUS:-UNKNOWN}" >&2
-        pause
-        ;;
+      9) asn_report; select_ip_stack_strategy; select_protocols; assert_deploy_stack_ready; create_dns_records; choose_reality_target; ensure_hy2_certificate_ready; generate_xray_config; configure_nginx; restart_services; regenerate_subscriptions_after_change; deployment_healthcheck; pause ;;
       10) configure_nginx; pause ;;
       11) bestcf_menu ;;
       12) configure_hy2_hopping_prompt; pause ;;

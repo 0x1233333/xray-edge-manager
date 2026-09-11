@@ -28,7 +28,7 @@ description: >-
 ## 系统重装后：干净安装步骤
 
 1. 新系统装好基础工具（curl、jq、systemd 等；脚本 `install_deps` 也会装）。
-2. 取 PR 公开 `xem.sh`（当前线：**v0.0.55-mihomo-stable-note** 起）。
+2. 取 PR 公开 `xem.sh`（当前线：**v0.0.57-hy2-masq-sockopt** 起）。
 3. root 跑首次部署（`install_full` / 菜单完整安装）：
    - **默认**会跑稳定型网络优化（BBR+`fq`，见下）。
    - 配 CF / 域名 / 协议；HY2 **默认开端口跳跃**。
