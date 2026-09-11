@@ -1,3 +1,5 @@
+- **v0.0.55-mihomo-stable-note**: 更正**「Mihomo 必须用开发版/Alpha」的过时说明**。实测本脚本用到的全部字段 —— XHTTP 的 `reuse-settings`(XMUX) 与 `x-padding-bytes`、HY2 的 `ports` 与 `hop-interval` —— **Mihomo 稳定版自 1.19.28 起已支持**：稳定版与 Alpha 均能 `mihomo -t` 通过并跑通流量（四层验证），**不需要特意换开发版内核**。改动含：生成的 `mihomo-reference.yaml` 头部说明、README「Clash Meta / Mihomo 兼容性」表与建议客户端段、仓库内 `skills/xem-deploy` 的「客户端」节（原文写「必须用开发板/Alpha」）。
+
 - **v0.0.54-bestcf-reachability-probe**: 优选域名筛选加**第三级——实测探测**（新增 `bestcf_entry_probe_ok`）。前两级（能解析 + 落 CF 边缘段）**不足以判定可用**：实测 `cdn.2020111.xyz` 解析到 `104.16.123.96`/`104.16.124.96`（都在 CF 段内），但请求返回 **HTTP 403 `error code: 1034`** —— 该域名的 CNAME 链终点是 `www.cloudflare.com`（跨账号 CNAME，被 CF 拒绝），这种节点写进订阅必然连不上。现在收集时对每个候选**真发一次请求**（连其边缘 IP，但 SNI/Host 用本机母域名，要求 `200`），凑满所需数量即停，另设 30 次探测上限避免脏数据拖慢菜单 9。网络异常时 `fail-open` 不阻断，由调用方回退未过滤数据。
 
 - **v0.0.53-bestcf-multi-domain**: 优选域名（`CFDomain_*`）节点数量**可配置 + 可达性过滤**，默认仍为 1（完全向后兼容）。
@@ -23,7 +25,7 @@
 
 一键在 VPS 上部署 **Xray-core 边缘抗封锁节点**：REALITY 直连 + Cloudflare CDN 中转 + Xray Hysteria2 (HY2) + BestCF 优选入口 + Nginx 伪装站/订阅 + 可选 WARP 出站。
 
-当前脚本版本：`v0.0.54-bestcf-reachability-probe`（仓库入口脚本一般为 `xem.sh`）。
+当前脚本版本：`v0.0.55-mihomo-stable-note`（仓库入口脚本一般为 `xem.sh`）。
 
 ---
 
@@ -236,12 +238,12 @@ REALITY_BLACKLIST=("www.microsoft.com" "microsoft.com" "login.microsoftonline.co
 
 | 协议 | 分享链接要点 | 客户端要求 |
 |------|----------------|------------|
-| XHTTP + REALITY | `type=xhttp`，`security=reality`，`mode=auto` | **Clash Meta / Mihomo 较新 dev 内核**（需支持 xhttp） |
+| XHTTP + REALITY | `type=xhttp`，`security=reality`，`mode=auto` | **Clash Meta / Mihomo**（需支持 xhttp；稳定版 1.19.28+ 即可） |
 | XHTTP + CDN | `type=xhttp`，`security=tls`，`host`/`sni`=母域名或优选 FQDN | 同上 |
 | Vision | `type=tcp`，`flow=xtls-rprx-vision`，`security=reality` | Meta 常规 REALITY+Vision 支持 |
 | HY2 | `hysteria2://`，`alpn=h3`，可选 `mport` 跳跃 | 客户端需 **Hysteria2** 实现；**旧 Clash 内核不够** |
 
-建议客户端：**Mihomo 开发板/Alpha**（xhttp `reuse-settings` / XMUX；HY2 参考 YAML 含 `ports` + `hop-interval: 20`）。Clash Verge Rev 选开发板内核。不要给 XHTTP 节点叠 smux。v2rayN / sing-box 仍可用通用订阅，但 XMUX 字段以 Mihomo 参考 YAML 为准。  
+建议客户端：**Mihomo 稳定版 1.19.28+ 或 Alpha 均可** —— XHTTP 的 `reuse-settings` / XMUX 与 `x-padding-bytes`、HY2 的 `ports` + `hop-interval`，**稳定版自 1.19.28 起已支持**（实测 `mihomo -t` 通过并跑通流量），**不必非用开发版**。Clash Verge Rev 用其内置稳定内核即可。不要给 XHTTP 节点叠 smux。v2rayN / sing-box 仍可用通用订阅，但 XMUX 字段以 Mihomo 参考 YAML 为准。  
 本脚本 **不使用 WebSocket(ws)** 作为主传输；CDN 与直连主力均为 **xhttp**。
 
 ---

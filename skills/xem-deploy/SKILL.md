@@ -2,7 +2,7 @@
 name: xem-deploy
 description: >-
   Use when deploying or debugging xray-edge-manager (xem.sh) on a VPS, fixing
-  HY2/REALITY/XHTTP subscription issues, regenerating Mihomo Alpha client
+  HY2/REALITY/XHTTP subscription issues, regenerating Mihomo client
   configs, or doing a clean reinstall after OS wipe. Covers BBR/sysctl defaults,
   hop vs UDP443, clients JSON key, and what must never be committed publicly.
 ---
@@ -19,19 +19,21 @@ description: >-
 
 ## 客户端
 
-- 必须用 **Mihomo 开发板 / Alpha**（需要 `reuse-settings` / `x-padding-bytes`）。
+- 客户端 **Mihomo 稳定版 1.19.28+ 或 Alpha 均可**：`reuse-settings` / `x-padding-bytes`、
+  HY2 的 `ports` / `hop-interval` 自稳定版 1.19.28 起已支持（实测 `mihomo -t` 通过 + 跑通流量）。
+  **过时说法**：旧文档写「必须用开发版/Alpha」—— 已不成立，不必让用户特意换内核。
 - **不要**叠 smux。
 - HY2 优先 `*-HY2-HOP`（`ports` / URI `mport`）。单端口 UDP443 外网可能不通。
 
 ## 系统重装后：干净安装步骤
 
 1. 新系统装好基础工具（curl、jq、systemd 等；脚本 `install_deps` 也会装）。
-2. 取 PR 公开 `xem.sh`（当前线：**v0.0.50-bugfix** 起）。
+2. 取 PR 公开 `xem.sh`（当前线：**v0.0.55-mihomo-stable-note** 起）。
 3. root 跑首次部署（`install_full` / 菜单完整安装）：
    - **默认**会跑稳定型网络优化（BBR+`fq`，见下）。
    - 配 CF / 域名 / 协议；HY2 **默认开端口跳跃**。
 4. 云面板放行：TCP 业务口 + **UDP 跳跃段**（默认 `20000-20499`）；UDP 主端口（如 443）也建议放，但部分机房上游仍可能丢。
-5. 部署自检通过后重生订阅；客户端用 Alpha 导入。
+5. 部署自检通过后重生订阅；客户端导入（**稳定版 1.19.28+ 或 Alpha 均可**）。
 6. 全量验收（见文末表）。
 
 回填/热修：先备份 `state.env` 与 Xray/Nginx 配置，再改，再 `xray run -test`，再重启。
