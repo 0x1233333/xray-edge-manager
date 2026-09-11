@@ -1,3 +1,11 @@
+- **v0.0.51-cfdomain-sni-fix**: 修复 **BestCF / CFDomain 节点全部不可用**。`add_bestcf_nodes_from_file` 不再把优选域名本身当作 SNI/Host（那样 CF 会按**那个域名的 zone** 回源 → `HTTP 403 DNS points to prohibited IP`，根本到不了本机源站），改为始终使用本机母域名 `$BASE_DOMAIN`；优选域名/优选 IP 只作为**连接入口**（借其 Cloudflare 边缘 IP）。该缺陷自 v0.0.40 引入，v0.0.40–v0.0.50 全部受影响（`xem20260629正式版` 行为正确，本次恢复一致）。复现与修法对照见下。
+
+  ```bash
+  # 缺陷（v0.0.40–v0.0.50）：优选域名条目把域名自己当 SNI/Host
+  add_vless_xhttp_cdn_link "$server" "$name" "$raw" "$port" "$server"   # ❌ CF 403
+  # 修复：SNI/Host 回落本机母域名（优选域名仍作 target/入口）
+  add_vless_xhttp_cdn_link "$server" "$name" "$raw" "$port"             # ✅
+  ```
 - **v0.0.50-bugfix**: 七项修复——① 禁止静默降级 Xray（`xray_version_ge` / 安装前跳过）；② `XEM_XRAY_PIN_VERSION` 精确钉版（允许该标签 prerelease）；③ `XEM_XRAY_ALLOW_PRERELEASE=1` 时按最高 semver 选取而非 API `.[0]`；④ `select_protocols` 非交互早退前 `reconcile_bestcf_state_if_needed`；⑤ HY2 跳跃按 live iptables 清理/同步（`purge_stale_hy2_redirect_rules` / `hy2_live_redirect_matches`）；⑥ 去掉 `configure_nginx` 对订阅文件的空 `touch`，生成后拒绝发布空 b64；⑦ `XEM_VERSION` 横幅与 `allowed_state_key` 去重 `CF_ZONE_NAME`。
 - **v0.0.49-net-default**: 首次部署 `install_full` 默认应用稳定型网络优化（有 BBR 则开 BBR + `fq`；无则保留现有拥塞控制；可 `XEM_SKIP_NET_TUNING=1` 跳过 / `XEM_QDISC=cake` 选用 cake）。`skills/xem-deploy` 同步干净重装与验收清单。
 - **v0.0.48-hy2-probe-pad**: Mihomo 参考 YAML 为 XHTTP 补上与服务端一致的 `x-padding-bytes: "100-1000"`；部署自检增加 HY2 监听/跳跃确认，并明文提示优先用 `*-HY2-HOP`；仓库增加 `skills/xem-deploy/SKILL.md` 供 Agent 使用。
