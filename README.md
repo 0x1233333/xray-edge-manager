@@ -1,6 +1,8 @@
+- **v0.0.54-bestcf-reachability-probe**: 优选域名筛选加**第三级——实测探测**（新增 `bestcf_entry_probe_ok`）。前两级（能解析 + 落 CF 边缘段）**不足以判定可用**：实测 `cdn.2020111.xyz` 解析到 `104.16.123.96`/`104.16.124.96`（都在 CF 段内），但请求返回 **HTTP 403 `error code: 1034`** —— 该域名的 CNAME 链终点是 `www.cloudflare.com`（跨账号 CNAME，被 CF 拒绝），这种节点写进订阅必然连不上。现在收集时对每个候选**真发一次请求**（连其边缘 IP，但 SNI/Host 用本机母域名，要求 `200`），凑满所需数量即停，另设 30 次探测上限避免脏数据拖慢菜单 9。网络异常时 `fail-open` 不阻断，由调用方回退未过滤数据。
+
 - **v0.0.53-bestcf-multi-domain**: 优选域名（`CFDomain_*`）节点数量**可配置 + 可达性过滤**，默认仍为 1（完全向后兼容）。
   ① **可配数量**：此前 `generate_bestcf_subscription_nodes` 的 `domain` 分支硬编码 `1 total 1` —— 所有机器的优选域名节点都取 `bestcf-domain.txt` 的**第一条**（`bestcf.030101.xyz`），该域名一旦解析异常/被墙，**全部机器的 CFDomain 节点同时失效**（单点故障）。现改为读取 `BESTCF_TOTAL_LIMIT`（钳制 1–25，非法值回退 1），并在菜单 11 新增模式 **3（3 个优选域名节点）**。
-  ② **可达性过滤**（新增 `filter_reachable_bestcf_entries` / `is_cf_edge_ip`）：只保留**能解析出 IPv4** 且**该 IPv4 落在 Cloudflare 边缘段**的条目，再顺序取前 N 条。原因：数据源 25 条里混有**失效域名**（无 A 记录，如 `bestcf.top`）与**非 CF 域名**（解析到自己真实 IP，如 `www.visa.cn` → `123.138.202.33`，请求根本不会到 CF 边缘）—— 盲取前 3 条实测就有 1 条死的。过滤结果为空（如 DNS 临时故障）时**回退未过滤数据**，不会产出 0 个节点。节点 label 过滤后重编号为连续的 `CFDomain_1..N`。
+  ② **可达性过滤**（`collect_reachable_bestcf_entries` / `is_cf_edge_ip`）：只保留**能解析出 IPv4** 且**该 IPv4 落在 Cloudflare 边缘段**的条目，再顺序取前 N 条。原因：数据源 25 条里混有**失效域名**（无 A 记录，如 `bestcf.top`）与**非 CF 域名**（解析到自己真实 IP，如 `www.visa.cn` → `123.138.202.33`，请求根本不会到 CF 边缘）—— 盲取前 3 条实测就有 1 条死的。收集结果为空（如 DNS 临时故障）时**回退未过滤数据**，不会产出 0 个节点。
 
 - **v0.0.52-camo-hardening**: 伪装站加固，消除两处**对外可探测**的反代指纹。① nginx 站点模板的兜底从 `try_files $uri $uri/ /index.html` 改为 `=404` —— 旧写法会让 `/.env`、`/wp-admin/`、任意随机路径都返回 **200 + 首页**，扫描器一眼识破；同时新增 `robots.txt`（`text/plain`）、`favicon.ico`（存在则给、否则 404）与敏感扩展名（`.env`/`.git`/`.bak`/`.sql`…）404 拦截。② `install_random_camouflage` 每次安装/升级时清理上游 `v2ray-agent/fodder` zip 带进来的 **macOS 打包残留**（`__MACOSX/`、`._*`、`.DS_Store`）与 v2ray-agent 的空标记文件 `check` —— 它们是真实文件，nginx 会照常对外提供（实测 `/__MACOSX/._index.html` → 200、`/check` → 200），改 `try_files` 无法覆盖，必须实删。13/13 台命中。③ 顺带修掉一处**静默失效的既有安全清理**：`find … -prune -o -type l -delete` 中 `-delete` 会隐式开启 `-depth`，而 `-depth` 生效时 `-prune` 失效 → find 报错退出、**符号链接从未被真正清理**（注释声称已做防护）。全仓库统一改用 `-exec rm -f -- {} +`。
 - **v0.0.51-cfdomain-sni-fix**: 修复 **BestCF / CFDomain 节点全部不可用**。`add_bestcf_nodes_from_file` 不再把优选域名本身当作 SNI/Host（那样 CF 会按**那个域名的 zone** 回源 → `HTTP 403 DNS points to prohibited IP`，根本到不了本机源站），改为始终使用本机母域名 `$BASE_DOMAIN`；优选域名/优选 IP 只作为**连接入口**（借其 Cloudflare 边缘 IP）。该缺陷自 v0.0.40 引入，v0.0.40–v0.0.50 全部受影响（`xem20260629正式版` 行为正确，本次恢复一致）。复现与修法对照见下。
@@ -21,7 +23,7 @@
 
 一键在 VPS 上部署 **Xray-core 边缘抗封锁节点**：REALITY 直连 + Cloudflare CDN 中转 + Xray Hysteria2 (HY2) + BestCF 优选入口 + Nginx 伪装站/订阅 + 可选 WARP 出站。
 
-当前脚本版本：`v0.0.53-bestcf-multi-domain`（仓库入口脚本一般为 `xem.sh`）。
+当前脚本版本：`v0.0.54-bestcf-reachability-probe`（仓库入口脚本一般为 `xem.sh`）。
 
 ---
 
