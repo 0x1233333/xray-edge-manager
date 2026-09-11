@@ -3390,9 +3390,7 @@ install_random_camouflage(){
       fi
       shopt -u dotglob nullglob
       # SECURITY: remove any symlinks copied from the zip.
-      # （原写法 -prune ... -delete 实际不生效：-delete 隐式开启 -depth 会让 -prune 失效，
-      #   find 报错退出、符号链接从未被清理。改用 -exec rm -f -- {} +。）
-      find "$WEB_ROOT" -path "$WEB_ROOT/sub" -prune -o -type l -exec rm -f -- {} + 2>/dev/null || true
+      find "$WEB_ROOT" -path "$WEB_ROOT/sub" -prune -o -type l -delete 2>/dev/null || true
       [[ -f "$WEB_ROOT/index.html" ]] || echo '<!doctype html><html><body><h1>Welcome</h1><p>It works.</p></body></html>' > "$WEB_ROOT/index.html"
       log "伪装站模板已安装：${zip}"
       ok=1
@@ -3410,13 +3408,10 @@ EOF2
   # 空文件 check。它们是真·文件，nginx 会照常对外提供
   # （实测 /__MACOSX/._index.html → 200、/check → 200），构成明显的反代指纹。
   # 必须在每次安装/升级时兜底清理（下载失败走内置页时也要清，故放在此处而非解压分支内）。
-  # 注意：绝不能用 find 的 -delete 动作配合 -prune —— -delete 会隐式开启 -depth，
-  # 而 -depth 生效时 -prune 失效，find 会直接报错退出、删除动作根本不执行。
-  # 因此这里统一用 -exec rm -f -- {} +。
   find "$WEB_ROOT" -path "$WEB_ROOT/sub" -prune -o -name '__MACOSX' -type d -exec rm -rf -- {} + 2>/dev/null || true
-  find "$WEB_ROOT" -path "$WEB_ROOT/sub" -prune -o -name '._*' -type f -exec rm -f -- {} + 2>/dev/null || true
-  find "$WEB_ROOT" -path "$WEB_ROOT/sub" -prune -o -name '.DS_Store' -type f -exec rm -f -- {} + 2>/dev/null || true
-  find "$WEB_ROOT" -path "$WEB_ROOT/sub" -prune -o -name 'check' -type f -empty -exec rm -f -- {} + 2>/dev/null || true
+  find "$WEB_ROOT" -path "$WEB_ROOT/sub" -prune -o -name '._*' -type f -delete 2>/dev/null || true
+  find "$WEB_ROOT" -path "$WEB_ROOT/sub" -prune -o -name '.DS_Store' -type f -delete 2>/dev/null || true
+  find "$WEB_ROOT" -path "$WEB_ROOT/sub" -prune -o -name 'check' -type f -empty -delete 2>/dev/null || true
   # RC10 HARDENING: publish the camouflage site, but never loosen /sub.
   find "$WEB_ROOT" -path "$WEB_ROOT/sub" -prune -o -type d -exec chmod 755 {} + 2>/dev/null || true
   find "$WEB_ROOT" -path "$WEB_ROOT/sub/*" -prune -o -type f -exec chmod 644 {} + 2>/dev/null || true

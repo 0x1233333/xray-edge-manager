@@ -1,3 +1,4 @@
+- **v0.0.52-camo-hardening**: 伪装站加固，消除两处**对外可探测**的反代指纹。① nginx 站点模板的兜底从 `try_files $uri $uri/ /index.html` 改为 `=404` —— 旧写法会让 `/.env`、`/wp-admin/`、任意随机路径都返回 **200 + 首页**，扫描器一眼识破；同时新增 `robots.txt`（`text/plain`）、`favicon.ico`（存在则给、否则 404）与敏感扩展名（`.env`/`.git`/`.bak`/`.sql`…）404 拦截。② `install_random_camouflage` 每次安装/升级时清理上游 `v2ray-agent/fodder` zip 带进来的 **macOS 打包残留**（`__MACOSX/`、`._*`、`.DS_Store`）与 v2ray-agent 的空标记文件 `check` —— 它们是真实文件，nginx 会照常对外提供（实测 `/__MACOSX/._index.html` → 200、`/check` → 200），改 `try_files` 无法覆盖，必须实删。13/13 台命中。③ 顺带修掉一处**静默失效的既有安全清理**：`find … -prune -o -type l -delete` 中 `-delete` 会隐式开启 `-depth`，而 `-depth` 生效时 `-prune` 失效 → find 报错退出、**符号链接从未被真正清理**（注释声称已做防护）。全仓库统一改用 `-exec rm -f -- {} +`。
 - **v0.0.51-cfdomain-sni-fix**: 修复 **BestCF / CFDomain 节点全部不可用**。`add_bestcf_nodes_from_file` 不再把优选域名本身当作 SNI/Host（那样 CF 会按**那个域名的 zone** 回源 → `HTTP 403 DNS points to prohibited IP`，根本到不了本机源站），改为始终使用本机母域名 `$BASE_DOMAIN`；优选域名/优选 IP 只作为**连接入口**（借其 Cloudflare 边缘 IP）。该缺陷自 v0.0.40 引入，v0.0.40–v0.0.50 全部受影响（`xem20260629正式版` 行为正确，本次恢复一致）。复现与修法对照见下。
 
   ```bash
@@ -16,7 +17,7 @@
 
 一键在 VPS 上部署 **Xray-core 边缘抗封锁节点**：REALITY 直连 + Cloudflare CDN 中转 + Xray Hysteria2 (HY2) + BestCF 优选入口 + Nginx 伪装站/订阅 + 可选 WARP 出站。
 
-当前脚本版本：`v0.0.51-cfdomain-sni-fix`（仓库入口脚本一般为 `xem.sh`）。
+当前脚本版本：`v0.0.52-camo-hardening`（仓库入口脚本一般为 `xem.sh`）。
 
 ---
 
