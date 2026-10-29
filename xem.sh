@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Xray Edge Manager / Xray Anti-Block Manager
-# v0.0.57-hy2-masq-sockopt — HY2 masquerade 默认开；mihomo 补 CFDomain；6 入站 sockopt；菜单9 DNS 失败不中断
+# v0.0.58-mlkem-origin-443 — mihomo 补 support-x25519mlkem768；新增 --cf-origin-port / --check-port-drift
 #
 # Features:
 # - Xray-core only, no Docker, no sing-box
@@ -23,7 +23,7 @@
 set -Eeuo pipefail
 umask 077
 
-XEM_VERSION="v0.0.57-hy2-masq-sockopt"
+XEM_VERSION="v0.0.58-mlkem-origin-443"
 
 # Global temp cleanup registry. Any temp file/dir registered here will be
 # removed on normal exit or interruption. Missing paths are ignored.
@@ -1377,11 +1377,11 @@ cf_upsert_record(){
   if ! list=$(curl -fsS --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time "$CURL_MAX_TIME" -G "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/dns_records" \
     -H "Authorization: Bearer $CF_API_TOKEN" \
     --data-urlencode "type=$type" --data-urlencode "name=$name" --data-urlencode "per_page=100"); then
-    warn "CF API 查询失败，跳过 DNS upsert：$type $name（记录多半已存在，继续）"
+    warn "CF API 查询失败，跳过 DNS upsert：$type ${name}（记录多半已存在，继续）"
     return 0
   fi
   if ! echo "$list" | jq -e '.success == true' >/dev/null; then
-    warn "Cloudflare DNS 记录查询失败：$type $name（记录多半已存在，继续）"
+    warn "Cloudflare DNS 记录查询失败：$type ${name}（记录多半已存在，继续）"
     echo "$list" >&2
     return 0
   fi
@@ -1394,9 +1394,9 @@ cf_upsert_record(){
     '{type:$type,name:$name,content:$content,ttl:1,proxied:$proxied}')
 
   if [[ -n "$rec_id" ]]; then
-    cf_api PATCH "/zones/$CF_ZONE_ID/dns_records/$rec_id" "$payload" >/dev/null || warn "CF API 更新 DNS 失败：$type $name（记录多半已存在，继续）"
+    cf_api PATCH "/zones/$CF_ZONE_ID/dns_records/$rec_id" "$payload" >/dev/null || warn "CF API 更新 DNS 失败：$type ${name}（记录多半已存在，继续）"
   else
-    cf_api POST "/zones/$CF_ZONE_ID/dns_records" "$payload" >/dev/null || warn "CF API 创建 DNS 失败：$type $name（记录多半已存在，继续）"
+    cf_api POST "/zones/$CF_ZONE_ID/dns_records" "$payload" >/dev/null || warn "CF API 创建 DNS 失败：$type ${name}（记录多半已存在，继续）"
   fi
 
   # Only collapse duplicate records for the exact managed name/type. This never
@@ -1406,6 +1406,160 @@ cf_upsert_record(){
     warn "删除重复 A/AAAA 记录：$type $name id=$id"
     cf_api DELETE "/zones/$CF_ZONE_ID/dns_records/$id" >/dev/null || warn "删除重复 DNS 记录失败：$id"
   done
+}
+
+# ============================================================
+# Cloudflare Origin Rule 回源端口
+# ------------------------------------------------------------
+# REALITY 占用 TCP 443 之后，nginx 只能让位到 2096（CF 允许的回源端口之一）。
+# CF 默认按 URL scheme 回源 443 → 拿到回落站证书 → 站点 525。
+# 修法是一台一条 Origin Rule：该主机回源端口 = 2096。
+# 🔴 expression 必须逐台列名，禁 wildcard 通配：通配会把还没迁移的子域一起搬到
+#    2096，它们的站点立刻 521。
+# ============================================================
+cf_origin_rule_fetch(){
+  local endpoint="$1" body code
+  body="$(curl -sS --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time "$CURL_MAX_TIME" \
+    -H "Authorization: Bearer ${CF_API_TOKEN}" -H "Content-Type: application/json" \
+    -w $'\n%{http_code}' "https://api.cloudflare.com/client/v4${endpoint}" 2>/dev/null)" || return 1
+  code="${body##*$'\n'}"
+  body="${body%$'\n'*}"
+  case "$code" in
+    200) ;;
+    404) printf '%s\n' '{"rules":[]}'; return 0 ;;
+    403) warn "Cloudflare 拒绝 Origin Rule 读取（HTTP 403）：Token 需要 Zone 级 Rulesets/Origin Write，作用域选该 Zone，Account Rulesets 无效。" ; return 1 ;;
+    *) warn "Cloudflare Origin Rule 读取返回 HTTP ${code}"; return 1 ;;
+  esac
+  printf '%s' "$body" | jq -e '.success == true' >/dev/null 2>&1 || { warn "Cloudflare 返回失败：$(printf '%s' "$body" | jq -r '.errors[0].message // "unknown"' 2>/dev/null)"; return 1; }
+  printf '%s' "$body" | jq -c '.result // {}'
+}
+
+cf_api_retry(){
+  local method="$1" endpoint="$2" data="${3:-}" i
+  for i in 1 2 3; do
+    if cf_api "$method" "$endpoint" "$data" 2>/dev/null; then return 0; fi
+    warn "Cloudflare API ${method} ${endpoint} 失败（第 ${i}/3 次）"
+    [[ "$i" -lt 3 ]] && sleep 3
+  done
+  return 1
+}
+
+# stdin: Origin Rule entrypoint 的 .result；参数: host port
+# stdout: 新的 rules 数组（紧凑 JSON）。同端口已有规则且形状不是 http.host in {...} 时返回 3。
+cf_origin_rules_upsert_json(){
+  local host="$1" port="$2" out
+  out="$(jq -c --arg host "$host" --argjson port "$port" '
+    def hostset: test("^\\(http\\.host in \\{[^}]*\\}\\)$");
+    def hosts:
+      gsub("^\\(http\\.host in \\{"; "") | gsub("\\}\\)$"; "")
+      | split(" ") | map(select(length > 0) | gsub("\""; ""));
+    def rebuild($l): "(http.host in {" + ($l | map("\"" + . + "\"") | join(" ")) + "})";
+    (.rules // []) as $r
+    | ($r | to_entries | map(select((.value.action_parameters.origin.port // 0) == $port))) as $hits
+    | if ($hits | length) == 0 then
+        {ok: ($r + [{
+          description: ("origin " + ($port | tostring) + " for migrated hosts"),
+          action: "set_origin",
+          action_parameters: {origin: {port: $port}},
+          expression: ("(http.host in {\"" + $host + "\"})"),
+          enabled: true
+        }])}
+      elif ([$hits[] | select(.value.expression | hostset)] | length) == 0 then
+        {refuse: "该回源端口已有规则，但 expression 不是 http.host in {...} 形状（疑似 wildcard 通配）；脚本不自动改写，请到 CF 控制台手动把主机并入。"}
+      else
+        ($hits[0].key) as $idx
+        | ($r[$idx].expression | hosts) as $list
+        | if ($list | index($host)) then {ok: $r, changed: false}
+          else
+            ($list + [$host] | sort) as $n
+            | {ok: ($r | .[$idx].expression = rebuild($n)), changed: true}
+          end
+      end
+  ' 2>/dev/null)" || return 1
+  if printf '%s' "$out" | jq -e 'has("refuse")' >/dev/null 2>&1; then
+    warn "$(printf '%s' "$out" | jq -r '.refuse')"
+    return 3
+  fi
+  printf '%s' "$out" | jq -c '.ok'
+}
+
+apply_cf_origin_port(){
+  local port="${1:-}" host cur_rules new_rules old_rules payload endpoint
+  require_cmds curl jq
+  load_state
+  [[ -n "$port" ]] || port="${CDN_PORT:-443}"
+  host="${BASE_DOMAIN:-}"
+  [[ -n "${CF_API_TOKEN:-}" && -n "${CF_ZONE_ID:-}" ]] || die "Cloudflare API 未配置（需要 CF_API_TOKEN + CF_ZONE_ID）。"
+  [[ -n "$host" ]] || die "未设置 BASE_DOMAIN。"
+  valid_port "$port" || die "回源端口非法：$port"
+  endpoint="/zones/${CF_ZONE_ID}/rulesets/phases/http_request_origin/entrypoint"
+  cur_rules="$(cf_origin_rule_fetch "$endpoint")" || die "读取 Cloudflare Origin Rule 失败（见上方原因）。"
+  old_rules="$(printf '%s' "$cur_rules" | jq -c '.rules // []')"
+  info "当前 Origin Rule $(printf '%s' "$cur_rules" | jq -r '(.rules // []) | length') 条；目标 $host -> origin.port=$port"
+  new_rules="$(printf '%s' "$cur_rules" | cf_origin_rules_upsert_json "$host" "$port")" || die "无法自动改写 Origin Rule（见上方提示）。"
+  if [[ "$new_rules" == "$old_rules" ]]; then
+    log "无需改动：Origin Rule 已包含 ${host}（origin.port=${port}）。"
+    return 0
+  fi
+  if [[ "${XEM_CF_ORIGIN_DRY_RUN:-0}" == "1" ]]; then
+    printf '%s' "$new_rules" | jq .
+    log "dry-run（XEM_CF_ORIGIN_DRY_RUN=1）：未写回 Cloudflare。"
+    return 0
+  fi
+  payload="$(jq -nc --argjson rules "$new_rules" '{rules:$rules}')"
+  cf_api_retry PUT "$endpoint" "$payload" >/dev/null || die "写回 Origin Rule 失败（3 次重试均失败）。"
+  cur_rules="$(cf_origin_rule_fetch "$endpoint")" || die "写回后回读失败，请到 CF 控制台确认。"
+  if printf '%s' "$cur_rules" | jq -e --arg h "$host" --argjson p "$port" \
+      'any((.rules // [])[]; ((.action_parameters.origin.port // 0) == $p) and (.expression | contains($h)))' >/dev/null 2>&1; then
+    log "Origin Rule 已写回并回读确认：$host -> origin.port=${port}（共 $(printf '%s' "$cur_rules" | jq -r '(.rules // []) | length') 条规则）"
+  else
+    die "写回后回读未见 ${host}（origin.port=${port}）—— 别当成功，去 CF 控制台核对。"
+  fi
+}
+
+# 端口漂移检查：手改过 config.json / nginx，却没写回 state.env 时，
+# 下一次菜单 9 / 17 会静默把它们重建回旧端口 —— 443 迁移最常见的翻车点。
+check_port_drift(){
+  local cfg nginx tag port want ngx drift=0
+  load_state
+  cfg="${XRAY_CONFIG:-/usr/local/etc/xray/config.json}"
+  nginx="${NGINX_SITE:-/etc/nginx/conf.d/xray-edge-manager.conf}"
+  if [[ ! -f "$cfg" ]]; then
+    warn "找不到 ${cfg}，跳过端口漂移检查。"
+    return 0
+  fi
+  require_cmds jq
+  while IFS=$'\t' read -r tag port; do
+    [[ -n "${tag:-}" && "$tag" != "null" ]] || continue
+    case "$tag" in
+      in-v4-xhttp-reality|in-v6-xhttp-reality) want="${XHTTP_REALITY_PORT:-}" ;;
+      in-v4-reality-vision|in-v6-reality-vision) want="${REALITY_VISION_PORT:-}" ;;
+      in-v4-hysteria2-udp|in-v6-hysteria2-udp) want="${HY2_PORT:-443}" ;;
+      in-xhttp-cdn-local) want="${XHTTP_CDN_LOCAL_PORT:-}" ;;
+      *)
+        err "未知入站：tag=$tag port=$port 不在 state.env 里 —— 菜单 9 重建会静默丢掉它。"
+        drift=1
+        continue
+        ;;
+    esac
+    if [[ -n "$want" && "$port" != "$want" ]]; then
+      err "端口漂移：$tag 现在是 ${port}，state.env 记的是 $want —— 菜单 9/17 会改回去。"
+      drift=1
+    fi
+  done < <(jq -r '.inbounds[]? | [.tag, (.port|tostring)] | @tsv' "$cfg" 2>/dev/null || true)
+  if [[ -f "$nginx" && -n "${CDN_PORT:-}" ]]; then
+    ngx="$(grep -Eo 'listen[[:space:]]+(\[::\]:)?[0-9]{2,5}[[:space:]]+ssl' "$nginx" | grep -Eo '[0-9]{2,5}' | head -n1 || true)"
+    if [[ -n "$ngx" && "$ngx" != "$CDN_PORT" ]]; then
+      err "Nginx HTTPS 监听 ${ngx}，state.env CDN_PORT=$CDN_PORT —— 菜单 9 会重写 nginx 配置。"
+      drift=1
+    fi
+  fi
+  if [[ "$drift" -eq 1 ]]; then
+    err "结论：手改的端口没写回 state.env。先把 state.env 里的端口改成现值，再跑菜单 9，否则改动被静默回退。"
+    return 2
+  fi
+  log "端口一致性检查通过：config.json / nginx / state.env 一致。"
+  return 0
 }
 
 stack_has_direct_protocol(){ [[ "$1" == *"1"* || "$1" == *"3"* || "$1" == *"4"* ]]; }
@@ -1622,7 +1776,7 @@ select_protocols(){
         warn "未写入入站到出站路由；监听仍会按 v4/v6 精确绑定。"
         ;;
       *)
-        warn "未知出口策略：$outbound_choice，已使用 auto。"
+        warn "未知出口策略：${outbound_choice}，已使用 auto。"
         save_kv "$STATE_FILE" IP_OUTBOUND_MODE "auto"
         save_kv "$STATE_FILE" ENABLE_IP_STACK_BINDING "1"
         ;;
@@ -3006,7 +3160,7 @@ validate_warp_ipv6_endpoints_for_ipv6_only(){
 validate_and_append_warp_outbound(){
   local file="$1" first_ref="$2" warp_file clean_tmp tmp
   warp_file="$(warp_outbound_file_path)"
-  [[ -f "$warp_file" ]] || die "未找到 WARP outbound JSON：$warp_file。请先使用 wgcf-cli generate --xray 生成，并复制到该路径。"
+  [[ -f "$warp_file" ]] || die "未找到 WARP outbound JSON：${warp_file}。请先使用 wgcf-cli generate --xray 生成，并复制到该路径。"
   [[ ! -L "$warp_file" ]] || die "拒绝读取符号链接 WARP outbound 文件：$warp_file"
 
   clean_tmp="$(mktemp_file "$APP_DIR/tmp/warp-outbound.clean.XXXXXX.json")"
@@ -3838,6 +3992,10 @@ generate_mihomo_reference(){
 # (x-padding-bytes / reuse-settings aka XMUX / hop-interval / ports) 稳定版 1.19.28 起已支持，
 # 实测稳定版与 Alpha 均能通过配置自检并跑通流量，不必非用开发版。
 # 已带连接复用与填充；不要再开 smux。
+# REALITY 节点统一带 support-x25519mlkem768: true —— Xray ≥ 26.10 的 REALITY 默认走
+# X25519MLKEM768 混合密钥交换，Mihomo 系客户端（OpenClash / Clash Verge / CMFA）默认把
+# MLKEM 从 ClientHello 里删掉，服务端验不过 → 全线 "REALITY authentication failed"。
+# 注意：该字段是客户端侧开关，服务端改 minClientVer 无效。
 proxies:
 EOF2
   if protocol_enabled 1; then
@@ -3861,6 +4019,7 @@ EOF2
     reality-opts:
       public-key: ${REALITY_PUBLIC_KEY}
       short-id: ${SHORT_ID}
+      support-x25519mlkem768: true
     xhttp-opts:
       mode: auto
       path: ${XHTTP_REALITY_PATH}
@@ -3891,6 +4050,7 @@ EOF2
     reality-opts:
       public-key: ${REALITY_PUBLIC_KEY}
       short-id: ${SHORT_ID}
+      support-x25519mlkem768: true
     xhttp-opts:
       mode: auto
       path: ${XHTTP_REALITY_PATH}
@@ -4037,6 +4197,7 @@ EOF2
     reality-opts:
       public-key: ${REALITY_PUBLIC_KEY}
       short-id: ${SHORT_ID}
+      support-x25519mlkem768: true
 EOF2
     fi
     if [[ -n "${PUBLIC_IPV6:-}" && "${IPV6_PROTOCOLS:-0}" == *4* ]] && node_ready V6_VISION_READY; then
@@ -4057,6 +4218,7 @@ EOF2
     reality-opts:
       public-key: ${REALITY_PUBLIC_KEY}
       short-id: ${SHORT_ID}
+      support-x25519mlkem768: true
 EOF2
     fi
   fi
@@ -4358,7 +4520,7 @@ purge_stale_hy2_redirect_rules(){
         continue
       fi
       spec="${line#-A }"
-      info "清理陈旧 HY2 NAT 规则（$cmd）：$dport -> $to_ports"
+      info "清理陈旧 HY2 NAT 规则（${cmd}）：$dport -> $to_ports"
       # shellcheck disable=SC2086
       while $cmd -t nat -D $spec 2>/dev/null; do :; done
     done < <("$cmd" -t nat -S PREROUTING 2>/dev/null || true)
@@ -4419,7 +4581,7 @@ enable_hy2_hopping(){
   start="${range%%:*}"; end="${range##*:}"
   # REDIRECT of the real listen port onto itself breaks the HY2 listener.
   if [[ "$to_port" -ge "$start" && "$to_port" -le "$end" ]]; then
-    hy2_hop_fail "跳跃范围 $start-$end 不能包含 HY2 真实监听端口 $to_port，否则 REDIRECT 会自环。" || true
+    hy2_hop_fail "跳跃范围 $start-$end 不能包含 HY2 真实监听端口 ${to_port}，否则 REDIRECT 会自环。" || true
     return 1
   fi
 
@@ -4988,9 +5150,9 @@ fetch_bestcf_all(){
       info "BestCF 已刷新资产：$asset"
     else
       if [[ -s "$BESTCF_DIR/$asset" ]]; then
-        warn "BestCF 本轮未获取到 $asset，已保留旧缓存。"
+        warn "BestCF 本轮未获取到 ${asset}，已保留旧缓存。"
       else
-        warn "BestCF 本轮未获取到 $asset，且本地无缓存。"
+        warn "BestCF 本轮未获取到 ${asset}，且本地无缓存。"
       fi
     fi
   done
@@ -6404,7 +6566,7 @@ main_menu(){
         restart_services
         regenerate_subscriptions_after_change
         deployment_healthcheck
-        # 始终打印摘要（不止 FAIL）：jpwx 实战 —— 订阅没重生成时旧文件仍在、从外部看
+        # 始终打印摘要（不止 FAIL）：实战踩过 —— 订阅没重生成时旧文件仍在、从外部看
         # "一切正常"，只能靠这行确认本轮订阅到底有没有重生。OK 也必须打。
         echo "[SUMMARY] 菜单9 完成: 配置=OK 订阅=${XEM_SUB_REGEN_STATUS:-UNKNOWN}" >&2
         pause
@@ -6475,6 +6637,21 @@ case "${1:-}" in
       apply_cf_origin_firewall
     fi
     exit 0
+    ;;
+  --cf-origin-port)
+    need_root
+    acquire_lock
+    load_state
+    apply_cf_origin_port "${2:-}"
+    exit 0
+    ;;
+  --check-port-drift)
+    need_root
+    acquire_lock
+    load_state
+    _drift_rc=0
+    check_port_drift || _drift_rc=$?
+    exit "$_drift_rc"
     ;;
   --healthcheck)
     need_root

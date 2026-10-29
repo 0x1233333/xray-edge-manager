@@ -1,3 +1,4 @@
+- **v0.0.58-mlkem-origin-443**: 三项收口，全部来自一次「整队 REALITY 迁 443」的实战。① **mihomo 参考 YAML 补 `support-x25519mlkem768: true`**（4 个 REALITY 节点全覆盖）：Xray ≥26.10 的 REALITY 默认走 X25519MLKEM768 混合密钥交换，Mihomo 系客户端（OpenClash / Clash Verge / CMFA）默认把 MLKEM 从 ClientHello 里删掉 → 服务端验不过 → **全线 `REALITY authentication failed`**；而 HY2、第三方机场、xray 内核客户端都正常，很容易被误判成「服务端密钥坏了」去重发订阅。此字段是**客户端侧开关**，服务端补 `minClientVer` 实测无效。② **新增 `xem --cf-origin-port [PORT]`**：REALITY 拿走 TCP 443 后 nginx 让位 2096，CF 仍按 scheme 回源 443 → 站点 **525**；该子命令读 `http_request_origin` entrypoint → 把本机 BASE 主机**并集**进目标端口的规则 → 写回 → **回读校验主机确实在规则里**，`curl` 超时（000）重试 3 次间隔 3s。`expression` 只接受 `(http.host in {"a" "b"})` 形状：遇到 wildcard 通配**拒绝改写**（通配会把未迁移子域一起搬到 2096 → 它们立刻 521），提示去控制台手工并。`XEM_CF_ORIGIN_DRY_RUN=1` 只打印不写。③ **新增 `xem --check-port-drift`**：手改过 `config.json` / nginx 却没写回 `state.env` 时，下一次菜单 9/17 会按旧端口重建、**静默丢掉 443**（"服务端明明改了、订阅里一条没有"的机制根源）。该子命令三方比对 `config.json` 入站 tag:port ↔ `state.env` ↔ nginx `listen`，未知入站 tag 也算漂移，非零退出。另修一处**跨环境真 bug**：脚本内 18 处 `$var` 紧跟中文标点（如 `$port，`），在 `LANG` 缺失的 C locale（systemd / cron 触发）下 bash 会把中文首字节当变量名 → `unbound variable` 直接退出；已全部改为 `${var}`。仓库新增 `scripts/`：`migrate-one-443.sh`（单台迁 443，可重入）/ `verify-443.sh`（家宽实打三发 + 出口 IP 比对）/ `publish-links-to-xem-sub.sh`（把链接幂等发布进各机 base64 订阅）。
 - **v0.0.57-hy2-masq-sockopt**: 四项定点修复。① **HY2 masquerade 默认开启**（`HY2_MASQUERADE` 默认 `0→1`）：代码早已能写 `hysteriaSettings.masquerade`，但 13 台机器 state.env 都没设该键，等于全关；探测 HY2 会暴露 Xray 指纹。显式 `HY2_MASQUERADE=0` 仍可关。② **mihomo 参考 YAML 补 CFDomain 节点**：`generate_mihomo_reference` 原先只写 v4/v6 REALITY / CDN / HY2，漏了订阅里已有的优选域名入口；复用 v0.0.54 的 `collect_reachable_bestcf_entries`，SNI/`servername`/`host` 必须是母域名（v0.0.51 修复），收集为空则静默跳过以免写坏参考 YAML。③ **4 个 TCP 直连入站加 sockopt**（`tcpFastOpen`/`tcpNoDelay`/`tcpCongestion=bbr`/`tcpKeepAliveInterval=30`）：原先只有 `in-xhttp-cdn-local` 有 sockopt 且是 `trustedXForwardedFor` 信任闸门，其它入站未调优。加的是 `in-v4/v6-xhttp-reality` 与 `in-v4/v6-reality-vision` 这 4 个 TCP 入站；**HY2 入站（UDP）不加** —— `tcpCongestion`/`tcpFastOpen` 等字段对 UDP 无意义。**不加** `trustedXForwardedFor`/`acceptProxyProtocol`/`tproxy`/`mark`/`dialerProxy`，也不动 CDN 入站。④ **菜单 9 遇 CF API 超时不再整体中断**：`cf_upsert_record` 的 curl 失败改为 warn 并继续（DNS 记录多半已在）；订阅刷新后自检文件存在/非空/节点数>0，失败打醒目 `[ERR] 订阅未生成或为空`，菜单 9 结束打印 `[SUMMARY] 菜单9 完成: 配置=OK 订阅=FAIL(...)` 且保持退出码 0 以便回主菜单。此前 `set -e` 在 `curl: (28) Resolving timed out` 处直接退出，订阅根本没重新生成，旧文件还在，从外部看「一切正常」。
 
 - **v0.0.56-mihomo-note-fix**: 修 v0.0.55 引入的一个缺陷 —— 生成的 `mihomo-reference.yaml` 头部说明里写了反引号包裹的命令名，而该文件是用**不带引号的 heredoc**（`cat > "$f" <<EOF2`，需展开 `${NODE_NAME}` 等变量）写出的，反引号会被 **shell 当命令执行**、内容被替换成命令输出（实测生成文件里变成「均能  通过」，突兀且会往部署日志里塞一条 `command not found`）。改为纯文字描述，不带反引号。**教训**：往不带引号的 heredoc 里加文字时，`$`、反引号、`\` 都必须转义或回避 —— 本仓库这类 heredoc（`<<EOF2`）共 30 处，加文案前先确认。
@@ -29,7 +30,7 @@
 
 一键在 VPS 上部署 **Xray-core 边缘抗封锁节点**：REALITY 直连 + Cloudflare CDN 中转 + Xray Hysteria2 (HY2) + BestCF 优选入口 + Nginx 伪装站/订阅 + 可选 WARP 出站。
 
-当前脚本版本：`v0.0.57-hy2-masq-sockopt`（仓库入口脚本一般为 `xem.sh`）。
+当前脚本版本：`v0.0.58-mlkem-origin-443`（仓库入口脚本一般为 `xem.sh`）。
 
 ---
 
@@ -376,3 +377,32 @@ curl -fsS "https://<BASE_DOMAIN>/sub/<SUB_TOKEN>" | head -c 40; echo
 # - CDN/BestCF: 主机为优选或 <BASE> 端口 443
 # - HY2: 主机 v4.<BASE> UDP 443，需 Meta/HY2 内核
 ```
+
+---
+
+## REALITY 走上 443（nginx 让位 2096）
+
+REALITY 放 443 比 2443/3443 更自然（伪装回落、TLS 外观一致），代价是三处必须同步改，缺一处就是「服务端能用、站点 525、订阅对不上」。
+
+| 层 | 动作 | 判据 |
+|----|------|------|
+| nginx | `listen 443` → `listen 2096`（`[::]:` 前缀保留） | `grep -cE 'listen[^;]*[^0-9]443'` = 0，`nginx -t` OK |
+| xray | 复制 `in-v4-reality-vision` 为新入站 `in-v4-reality-443`、`port=443`，`dest`/`target`/`serverNames` 三处同换成新伪装域名，复用同一 `privateKey`/`shortIds` | `xray run -test` OK；`ss -lntp` 443 归 xray、2096 归 nginx |
+| iptables | 443 去掉 `XEM_CF_ORIGIN` 跳转、`-I INPUT 1 ... --dport 443 -j ACCEPT`；2096 **用 ACCEPT**（不要用 `XEM_CF_ORIGIN`：那张链只有 CF 段，新边缘 IP 不在表里 → 站点 000） | `iptables -S INPUT | grep -E 'dport (443\|2096)'` |
+| Cloudflare | 该主机回源端口 = 2096：`xem --cf-origin-port 2096` | 回读规则里能看到该主机 |
+
+一键单台：`ssh <host> 'bash -s' -- <SNI> < scripts/migrate-one-443.sh`；实打验收：`scripts/verify-443.sh <host> <SNI>`。
+
+🔴 **三条硬规矩**
+
+1. **Origin Rule 的 expression 必须逐台列名，禁通配**：`(http.host wildcard "*.BASE")` 会把还没迁移的子域一起搬到 2096，它们的站点立刻 521。脚本遇到通配形状会拒绝改写。
+2. **验收 ≠ 交付**：`config.json` 改了，`/usr/local/etc/xray/www/sub/` 里的 base64 订阅仍是上次生成的，新入站不会自动出现。三层都要核：面板节点数 / 订阅 `/c/` 里该端口条数 / 各机 sub 文件条数，三数相等才算发布完（`scripts/publish-links-to-xem-sub.sh`）。
+3. **改完必须写回 `state.env`**（`REALITY_VISION_PORT=443`、`CDN_PORT=2096`），否则下一次菜单 9/17 按旧端口重建 → 443 被静默丢弃。核对：`xem --check-port-drift`。
+
+## xray ≥ 26.10 与 mihomo：MLKEM 兼容
+
+Xray ≥26.10 的 REALITY 默认协商 **X25519MLKEM768**；Mihomo 系客户端默认 `support-x25519mlkem768: false`，会主动把 MLKEM 从 ClientHello 删掉 → 服务端验不过 → `REALITY authentication failed`。
+
+- 误判特征：HY2 通、第三方机场 REALITY 通、xray 内核客户端通，**只有连本脚本服务端的 mihomo 客户端全灭**。这不是服务端密钥坏了。
+- 修法在客户端：`reality-opts` 加 `support-x25519mlkem768: true`（v0.0.58 起 `mihomo-reference.yaml` 默认带）。
+- 纯 base64 订阅（`vless://`）没有这个参数位，客户端解析不出来 —— 所以要么用参考 YAML，要么在订阅转换层补字段。

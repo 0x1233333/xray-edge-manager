@@ -705,3 +705,22 @@ example.com
 ```
 
 [1]: https://developers.cloudflare.com/fundamentals/api/get-started/create-token/?utm_source=chatgpt.com "Create API token - Cloudflare Fundamentals"
+
+---
+
+## 附：REALITY 上 443 之后，Token 还要一条规则权限
+
+`xem --cf-origin-port` 改的是 **Origin Rule**（`http_request_origin` 阶段），和 DNS 权限是两套东西。只有 `DNS:Edit` 的 Token 能改记录，但读规则会直接 `HTTP 403`：
+
+| 需要的权限 | 作用域 | 用途 |
+|---|---|---|
+| `Zone:Read` | 指定 Zone | 查 Zone ID |
+| `DNS:Edit`（编辑区域 DNS） | 指定 Zone | A/AAAA 记录、橙云/灰云 |
+| **`Rulesets:Edit`（或 Origin Rules 编辑）** | **指定 Zone（或"所有域名"）** | 读写 `http_request_origin` 规则，即 `--cf-origin-port` |
+
+常见踩坑：
+
+- 作用域选 **"整个账户"** 时规则权限**不生效**；必须选 **指定 Zone** 或 **所有域名**。
+- `Account Rulesets` ≠ `Zone Rulesets`：账户级规则集权限对 Zone 级 Origin Rule 无效。
+- Token 建好后立刻 `GET /zones/<zone_id>/rulesets/phases/http_request_origin/entrypoint` 自测一次，`success: true` 才算到位；403 就回控制台补权限，不要在脚本里反复重试。
+- Cloudflare 的 `PUT` 偶发返回 `000`（超时）但规则其实已写入 —— 脚本内置 3 次重试 + **写后回读校验**；手工改的话，改完必须再 GET 一次确认主机真的在 `expression` 里。
