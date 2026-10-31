@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Xray Edge Manager / Xray Anti-Block Manager
-# v0.0.59-node-country — 节点名原生国家前缀 + 自定义命名模板（{cc}/{node}/{stack}/{proto}）；旧版为 v0.0.58-mlkem-origin-443
+# v0.0.60-naming-hook — 订阅重生成后自动调用命名层（国家前缀/任意命名），订阅 URL 不变；v0.0.59 起节点名原生支持国家前缀
 #
 # Features:
 # - Xray-core only, no Docker, no sing-box
@@ -23,7 +23,7 @@
 set -Eeuo pipefail
 umask 077
 
-XEM_VERSION="v0.0.59-node-country"
+XEM_VERSION="v0.0.60-naming-hook"
 
 # Global temp cleanup registry. Any temp file/dir registered here will be
 # removed on normal exit or interruption. Missing paths are ignored.
@@ -4485,6 +4485,10 @@ regenerate_subscriptions_after_change(){
     merge_remote_subscriptions || warn "合并订阅自动刷新失败，请稍后手动执行菜单 14 -> 8。"
   else
     warn "本机订阅自动刷新失败，请稍后手动执行菜单 14 -> 1。"
+  fi
+  # 命名层：给订阅里的节点名补国家前缀 / 应用任意命名覆盖（幂等；镜像上不存在就跳过）
+  if [[ -x /usr/local/bin/sub-country-prefix.sh ]]; then
+    /usr/local/bin/sub-country-prefix.sh >/dev/null 2>&1 || warn "节点命名层执行失败（订阅已生成，名字未加工）"
   fi
   verify_subscription_generated
 }
