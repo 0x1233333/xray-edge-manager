@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Xray Edge Manager / Xray Anti-Block Manager
-# v0.0.60-naming-hook — 订阅重生成后自动调用命名层（国家前缀/任意命名），订阅 URL 不变；v0.0.59 起节点名原生支持国家前缀
+# v0.0.61-keep-manual — 重生成订阅时保住手工节点；订阅后自动跑命名层（国家前缀/任意命名）；节点名原生支持国家前缀
 #
 # Features:
 # - Xray-core only, no Docker, no sing-box
@@ -23,7 +23,7 @@
 set -Eeuo pipefail
 umask 077
 
-XEM_VERSION="v0.0.60-naming-hook"
+XEM_VERSION="v0.0.61-keep-manual"
 
 # Global temp cleanup registry. Any temp file/dir registered here will be
 # removed on normal exit or interruption. Missing paths are ignored.
@@ -4343,6 +4343,21 @@ ensure_bestcf_data_if_needed(){
   fetch_bestcf_all || true
 }
 
+# 保留生成器不认识的手工节点：把上次发布里、本次 raw 中没有的条目追加回来
+_sub_append_manual_nodes(){
+  local raw="$1" prev="$2" ln nm added=0
+  [[ -s "$prev" && -f "$raw" ]] || { echo 0; return 0; }
+  while IFS= read -r ln; do
+    [[ -n "$ln" ]] || continue
+    nm="${ln##*#}"
+    [[ -n "$nm" && "$nm" != "$ln" ]] || continue
+    grep -qF "#${nm}" "$raw" && continue
+    printf '%s\n' "$ln" >> "$raw"
+    added=$((added+1))
+  done < "$prev"
+  echo "$added"
+}
+
 generate_subscription(){
   require_cmds xxd base64 sed awk jq
   load_state
@@ -4355,6 +4370,12 @@ generate_subscription(){
   load_state
   mkdir -p "$SUB_DIR" "$WEB_ROOT/sub"
   local raw="$SUB_DIR/local.raw" b64="$SUB_DIR/local.b64"
+  # 生成前快照上次发布的本地订阅，用于保住手工追加/手工改名的节点
+  local _prev_sub=""
+  if [[ -n "${SUB_TOKEN:-}" && -s "$WEB_ROOT/sub/$SUB_TOKEN" ]]; then
+    _prev_sub="$(mktemp)"
+    base64 -d "$WEB_ROOT/sub/$SUB_TOKEN" > "$_prev_sub" 2>/dev/null || : > "$_prev_sub"
+  fi
   : > "$raw"
 
   if protocol_enabled 1; then
@@ -4423,6 +4444,12 @@ generate_subscription(){
   # COMPATIBILITY FIX: avoid GNU-specific sed -i and base64 -w0.
   local raw_cleaned; raw_cleaned=$(mktemp_file "${raw}.clean.XXXXXX")
   sed '/^$/d' "$raw" > "$raw_cleaned" && mv -f "$raw_cleaned" "$raw"
+  if [[ -n "${_prev_sub:-}" && -s "$_prev_sub" ]]; then
+    local _kept
+    _kept=$(_sub_append_manual_nodes "$raw" "$_prev_sub")
+    [[ "$_kept" =~ ^[0-9]+$ ]] && [[ "$_kept" -gt 0 ]] && info "保留手工节点 ${_kept} 条（生成器之外的条目）"
+    rm -f "$_prev_sub"
+  fi
   base64 "$raw" | tr -d '\n' > "$b64"
   if [[ ! -s "$b64" ]]; then
     warn "本机订阅内容为空，拒绝发布空订阅文件。"
