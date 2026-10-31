@@ -1,0 +1,11 @@
+# 机房前缀 -> 国家码（示例）。复制到机器上的 /etc/xray-sub-country.map 后按自己的命名改。
+# 左列 = 节点名 "-" 之前那段（xem 的 NODE_NAME / 手工起的机房别名），右列 = 两字母国家码。
+# 没列出的前缀不加前缀（典型：第三方机场拉来的节点）。
+us1        US
+us2        US
+us3        US
+jp1        JP
+jp2        JP
+kr1        KR
+kr2        KR
+korea-arm  KR
