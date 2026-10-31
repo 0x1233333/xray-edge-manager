@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Xray Edge Manager / Xray Anti-Block Manager
-# v0.0.58-mlkem-origin-443 — mihomo 补 support-x25519mlkem768；新增 --cf-origin-port / --check-port-drift
+# v0.0.59-node-country — 节点名原生国家前缀 + 自定义命名模板（{cc}/{node}/{stack}/{proto}）；旧版为 v0.0.58-mlkem-origin-443
 #
 # Features:
 # - Xray-core only, no Docker, no sing-box
@@ -23,7 +23,7 @@
 set -Eeuo pipefail
 umask 077
 
-XEM_VERSION="v0.0.58-mlkem-origin-443"
+XEM_VERSION="v0.0.59-node-country"
 
 # Global temp cleanup registry. Any temp file/dir registered here will be
 # removed on normal exit or interruption. Missing paths are ignored.
@@ -257,7 +257,7 @@ allowed_state_key(){
     V4_XHTTP_REALITY_READY|V6_XHTTP_REALITY_READY|V4_HY2_READY|V6_HY2_READY|V4_VISION_READY|V6_VISION_READY|CDN_XHTTP_READY)
       return 0
       ;;
-    DOMAIN_V4|DOMAIN_V6|IPV4_ENABLED|IPV6_ENABLED|CF_ZONE_NAME|CDN_NETWORK|HY2_SNI|HY2_MASQUERADE|WEB_ROOT|LAST_SUBSCRIPTION_NODE_COUNT|LAST_SUBSCRIPTION_REGEN|LAST_PUBLIC_IP_DETECT)
+    NODE_COUNTRY|NODE_NAME_TEMPLATE|DOMAIN_V4|DOMAIN_V6|IPV4_ENABLED|IPV6_ENABLED|CF_ZONE_NAME|CDN_NETWORK|HY2_SNI|HY2_MASQUERADE|WEB_ROOT|LAST_SUBSCRIPTION_NODE_COUNT|LAST_SUBSCRIPTION_REGEN|LAST_PUBLIC_IP_DETECT)
       return 0
       ;;
     CF_API_TOKEN|CF_ZONE_ID)
@@ -1196,6 +1196,59 @@ sanitize_node_name(){
   [[ ${#name} -gt 64 ]] && name="${name:0:64}"
   [[ -n "$name" ]] || name="node"
   echo "$name"
+}
+
+# ---- 节点显示名：国家前缀 + 自定义模板（v0.0.59） ----
+# 输出形如 US-jp1-v4-XHTTP-REALITY（NODE_COUNTRY 为空时退回旧行为 jp1-v4-XHTTP-REALITY）
+node_label(){
+  local stack="${1:-}" proto="${2:-}" out
+  local node="${NODE_NAME:-node}" cc="${NODE_COUNTRY:-}"
+  cc=$(printf '%s' "$cc" | tr '[:lower:]' '[:upper:]')
+  local parts=()
+  if [[ -n "${NODE_NAME_TEMPLATE:-}" ]]; then
+    out="${NODE_NAME_TEMPLATE}"
+    out="${out//\{cc\}/$cc}"
+    out="${out//\{node\}/$node}"
+    out="${out//\{stack\}/$stack}"
+    out="${out//\{proto\}/$proto}"
+    while [[ "$out" == *--* ]]; do out="${out//--/-}"; done
+    out="${out#-}"; out="${out%-}"
+  else
+    [[ -n "$cc" ]] && parts+=("$cc")
+    [[ -n "$node" ]] && parts+=("$node")
+    [[ -n "$stack" ]] && parts+=("$stack")
+    [[ -n "$proto" ]] && parts+=("$proto")
+    out="$(IFS=-; printf '%s' "${parts[*]}")"
+  fi
+  printf '%s\n' "$out"
+}
+
+configure_node_country(){
+  load_state
+  local cc="${NODE_COUNTRY:-}" tpl="${NODE_NAME_TEMPLATE:-}" answer t
+  if [[ -z "$cc" ]]; then
+    # 未设置时从节点名猜：jp1 -> JP，ccarm -> CC（猜不准就留空，绝不硬编）
+    if [[ "${NODE_NAME:-}" =~ ^[A-Za-z]{2} ]]; then
+      cc="${NODE_NAME:0:2}"
+    fi
+  fi
+  if [[ ! -t 0 ]]; then
+    cc=$(printf '%s' "$cc" | tr '[:lower:]' '[:upper:]')
+    [[ "$cc" =~ ^[A-Z]{2}$ ]] || cc=""
+    save_kv "$STATE_FILE" NODE_COUNTRY "$cc"
+    save_kv "$STATE_FILE" NODE_NAME_TEMPLATE "${tpl:-}"
+    info "非交互模式：节点国家前缀=${cc:-无} 模板=${tpl:-默认}"
+    return 0
+  fi
+  answer=$(ask "请输入节点国家代码（两字母，留空=不加前缀），例如 US/JP/KR" "${cc:-}")
+  answer=$(printf '%s' "$answer" | tr -cd 'A-Za-z' | cut -c1-2)
+  answer=$(printf '%s' "$answer" | tr '[:lower:]' '[:upper:]')
+  [[ "$answer" =~ ^[A-Z]{2}$ ]] || answer=""
+  save_kv "$STATE_FILE" NODE_COUNTRY "$answer"
+  t=$(ask "自定义节点名模板（可留空）。占位符 {cc} {node} {stack} {proto}" "${tpl:-}")
+  t=$(printf '%s' "$t" | tr -d '[:space:]')
+  save_kv "$STATE_FILE" NODE_NAME_TEMPLATE "$t"
+  log "节点命名：国家=${answer:-无} 模板=${t:-默认}"
 }
 
 configure_node_name(){
@@ -4001,7 +4054,7 @@ EOF2
   if protocol_enabled 1; then
     if [[ -n "${PUBLIC_IPV4:-}" && "${IPV4_PROTOCOLS:-0}" == *1* ]] && node_ready V4_XHTTP_REALITY_READY; then
       cat >> "$f" <<EOF2
-  - name: ${NODE_NAME:-node}-v4-XHTTP-REALITY
+  - name: $(node_label v4 XHTTP-REALITY)
     type: vless
     server: v4.${BASE_DOMAIN}
     port: ${XHTTP_REALITY_PORT}
@@ -4032,7 +4085,7 @@ EOF2
     fi
     if [[ -n "${PUBLIC_IPV6:-}" && "${IPV6_PROTOCOLS:-0}" == *1* ]] && node_ready V6_XHTTP_REALITY_READY; then
       cat >> "$f" <<EOF2
-  - name: ${NODE_NAME:-node}-v6-XHTTP-REALITY
+  - name: $(node_label v6 XHTTP-REALITY)
     type: vless
     server: v6.${BASE_DOMAIN}
     port: ${XHTTP_REALITY_PORT}
@@ -4065,7 +4118,7 @@ EOF2
 
   if protocol_enabled 2 && node_ready CDN_XHTTP_READY; then
     cat >> "$f" <<EOF2
-  - name: ${NODE_NAME:-node}-CDN-XHTTP-Origin
+  - name: $(node_label "" CDN-XHTTP-Origin)
     type: vless
     server: ${BASE_DOMAIN}
     port: ${CDN_PORT:-443}
@@ -4094,7 +4147,7 @@ EOF2
 
   if protocol_enabled 5 && node_ready CDN_XHTTP_READY; then
     cat >> "$f" <<EOF2
-  - name: ${NODE_NAME:-node}-CDN-XHTTP-Entry
+  - name: $(node_label "" CDN-XHTTP-Entry)
     type: vless
     server: ${BASE_DOMAIN}
     port: ${CDN_PORT:-443}
@@ -4127,9 +4180,9 @@ EOF2
       local stack="$1" host="$2" hop_range="$3" with_hop="$4"
       local name
       if [[ "$with_hop" == "1" ]]; then
-        name="${NODE_NAME:-node}-${stack}-HY2-HOP"
+        name="$(node_label "$stack" HY2-HOP)"
       else
-        name="${NODE_NAME:-node}-${stack}-HY2-UDP${HY2_PORT:-443}"
+        name="$(node_label "$stack" "HY2-UDP${HY2_PORT:-443}")"
       fi
       cat >> "$f" <<EOF2
   - name: ${name}
@@ -4181,7 +4234,7 @@ EOF2
   if protocol_enabled 4; then
     if [[ -n "${PUBLIC_IPV4:-}" && "${IPV4_PROTOCOLS:-0}" == *4* ]] && node_ready V4_VISION_READY; then
       cat >> "$f" <<EOF2
-  - name: ${NODE_NAME:-node}-v4-REALITY-Vision
+  - name: $(node_label v4 REALITY-Vision)
     type: vless
     server: v4.${BASE_DOMAIN}
     port: ${REALITY_VISION_PORT}
@@ -4202,7 +4255,7 @@ EOF2
     fi
     if [[ -n "${PUBLIC_IPV6:-}" && "${IPV6_PROTOCOLS:-0}" == *4* ]] && node_ready V6_VISION_READY; then
       cat >> "$f" <<EOF2
-  - name: ${NODE_NAME:-node}-v6-REALITY-Vision
+  - name: $(node_label v6 REALITY-Vision)
     type: vless
     server: v6.${BASE_DOMAIN}
     port: ${REALITY_VISION_PORT}
@@ -4237,7 +4290,7 @@ EOF2
       [[ -n "${srv:-}" && -n "${label:-}" ]] || continue
       [[ -n "${port:-}" ]] || port=443
       cat >> "$f" <<EOF2
-  - name: ${NODE_NAME:-node}-${label}
+  - name: $(node_label "" "${label}")
     type: vless
     server: ${srv}
     port: ${port}
@@ -4305,12 +4358,12 @@ generate_subscription(){
   : > "$raw"
 
   if protocol_enabled 1; then
-    [[ -n "${PUBLIC_IPV4:-}" && "${IPV4_PROTOCOLS:-0}" == *1* ]] && node_ready V4_XHTTP_REALITY_READY && add_vless_xhttp_reality_link "v4.${BASE_DOMAIN}" "${NODE_NAME:-node}-v4-XHTTP-REALITY" "$raw"
-    [[ -n "${PUBLIC_IPV6:-}" && "${IPV6_PROTOCOLS:-0}" == *1* ]] && node_ready V6_XHTTP_REALITY_READY && add_vless_xhttp_reality_link "v6.${BASE_DOMAIN}" "${NODE_NAME:-node}-v6-XHTTP-REALITY" "$raw"
+    [[ -n "${PUBLIC_IPV4:-}" && "${IPV4_PROTOCOLS:-0}" == *1* ]] && node_ready V4_XHTTP_REALITY_READY && add_vless_xhttp_reality_link "v4.${BASE_DOMAIN}" "$(node_label v4 XHTTP-REALITY)" "$raw"
+    [[ -n "${PUBLIC_IPV6:-}" && "${IPV6_PROTOCOLS:-0}" == *1* ]] && node_ready V6_XHTTP_REALITY_READY && add_vless_xhttp_reality_link "v6.${BASE_DOMAIN}" "$(node_label v6 XHTTP-REALITY)" "$raw"
   fi
 
   if protocol_enabled 2 && node_ready CDN_XHTTP_READY; then
-    add_vless_xhttp_cdn_link "$BASE_DOMAIN" "${NODE_NAME:-node}-CDN-XHTTP-Origin" "$raw" "${CDN_PORT:-443}"
+    add_vless_xhttp_cdn_link "$BASE_DOMAIN" "$(node_label "" CDN-XHTTP-Origin)" "$raw" "${CDN_PORT:-443}"
   fi
 
   # 5 = CDN 入口扩展：只发 BestCF 节点。无数据时先重试拉取；仍失败则：
@@ -4335,7 +4388,7 @@ generate_subscription(){
       elif protocol_enabled 2; then
         warn "协议 5 仍无可用 BestCF 数据；已有协议 2 母域名 CDN 节点，跳过重复 Entry 回退。"
       else
-        add_vless_xhttp_cdn_link "$BASE_DOMAIN" "${NODE_NAME:-node}-CDN-XHTTP-Entry" "$raw" "${CDN_PORT:-443}"
+        add_vless_xhttp_cdn_link "$BASE_DOMAIN" "$(node_label "" CDN-XHTTP-Entry)" "$raw" "${CDN_PORT:-443}"
         warn "协议 5 仍无可用 BestCF 数据，且未启用协议 2：临时回退一条母域名 CDN Entry，请稍后菜单 11 重拉 BestCF。"
       fi
     fi
@@ -4346,25 +4399,25 @@ generate_subscription(){
   if protocol_enabled 3; then
     if [[ -n "${PUBLIC_IPV4:-}" && "${IPV4_PROTOCOLS:-0}" == *3* ]] && node_ready V4_HY2_READY; then
       if [[ -n "$(hy2_hop_range_for_stack v4)" ]]; then
-        add_hy2_link "v4.${BASE_DOMAIN}" "${NODE_NAME:-node}-v4-HY2-HOP" "$raw" hop
-        add_hy2_link "v4.${BASE_DOMAIN}" "${NODE_NAME:-node}-v4-HY2-UDP${HY2_PORT:-443}" "$raw" direct
+        add_hy2_link "v4.${BASE_DOMAIN}" "$(node_label v4 HY2-HOP)" "$raw" hop
+        add_hy2_link "v4.${BASE_DOMAIN}" "$(node_label v4 "HY2-UDP${HY2_PORT:-443}")" "$raw" direct
       else
-        add_hy2_link "v4.${BASE_DOMAIN}" "${NODE_NAME:-node}-v4-HY2-UDP${HY2_PORT:-443}" "$raw" direct
+        add_hy2_link "v4.${BASE_DOMAIN}" "$(node_label v4 "HY2-UDP${HY2_PORT:-443}")" "$raw" direct
       fi
     fi
     if [[ -n "${PUBLIC_IPV6:-}" && "${IPV6_PROTOCOLS:-0}" == *3* ]] && node_ready V6_HY2_READY; then
       if [[ -n "$(hy2_hop_range_for_stack v6)" ]]; then
-        add_hy2_link "v6.${BASE_DOMAIN}" "${NODE_NAME:-node}-v6-HY2-HOP" "$raw" hop
-        add_hy2_link "v6.${BASE_DOMAIN}" "${NODE_NAME:-node}-v6-HY2-UDP${HY2_PORT:-443}" "$raw" direct
+        add_hy2_link "v6.${BASE_DOMAIN}" "$(node_label v6 HY2-HOP)" "$raw" hop
+        add_hy2_link "v6.${BASE_DOMAIN}" "$(node_label v6 "HY2-UDP${HY2_PORT:-443}")" "$raw" direct
       else
-        add_hy2_link "v6.${BASE_DOMAIN}" "${NODE_NAME:-node}-v6-HY2-UDP${HY2_PORT:-443}" "$raw" direct
+        add_hy2_link "v6.${BASE_DOMAIN}" "$(node_label v6 "HY2-UDP${HY2_PORT:-443}")" "$raw" direct
       fi
     fi
   fi
 
   if protocol_enabled 4; then
-    [[ -n "${PUBLIC_IPV4:-}" && "${IPV4_PROTOCOLS:-0}" == *4* ]] && node_ready V4_VISION_READY && add_reality_vision_link "v4.${BASE_DOMAIN}" "${NODE_NAME:-node}-v4-REALITY-Vision" "$raw"
-    [[ -n "${PUBLIC_IPV6:-}" && "${IPV6_PROTOCOLS:-0}" == *4* ]] && node_ready V6_VISION_READY && add_reality_vision_link "v6.${BASE_DOMAIN}" "${NODE_NAME:-node}-v6-REALITY-Vision" "$raw"
+    [[ -n "${PUBLIC_IPV4:-}" && "${IPV4_PROTOCOLS:-0}" == *4* ]] && node_ready V4_VISION_READY && add_reality_vision_link "v4.${BASE_DOMAIN}" "$(node_label v4 REALITY-Vision)" "$raw"
+    [[ -n "${PUBLIC_IPV6:-}" && "${IPV6_PROTOCOLS:-0}" == *4* ]] && node_ready V6_VISION_READY && add_reality_vision_link "v6.${BASE_DOMAIN}" "$(node_label v6 REALITY-Vision)" "$raw"
   fi
 
   # COMPATIBILITY FIX: avoid GNU-specific sed -i and base64 -w0.
@@ -5291,7 +5344,7 @@ add_bestcf_nodes_from_file(){
     fi
 
     label="$(normalize_bestcf_label "$label" "${fallback_label}_${n}")"
-    name="${NODE_NAME:-node}-${label}"
+    name="$(node_label "" "${label}")"
     # BestCF 条目（优选 IP 或优选域名）只作为“连接入口”，借它的 Cloudflare 边缘 IP；
     # SNI/Host 必须保持本机自己的母域名 $BASE_DOMAIN —— 只有它的 CF DNS 记录指向本机源站，
     # CF 才会把流量回源到本机。若把优选域名本身当 SNI/Host（v0.0.40–v0.0.50 的行为），
@@ -5830,6 +5883,7 @@ install_full(){
   prepare_base_domain_for_install
   setup_cloudflare
   configure_node_name
+  configure_node_country
   asn_report
   select_ip_stack_strategy
   select_protocols
@@ -6227,7 +6281,7 @@ subscription_menu(){
     case "$c" in
       1) regenerate_subscriptions_after_change ;;
       2) show_links ;;
-      3) configure_node_name; regenerate_subscriptions_after_change ;;
+      3) configure_node_name; configure_node_country; regenerate_subscriptions_after_change ;;
       4) add_remote_subscription; merge_remote_subscriptions ;;
       5) list_remote_subscriptions ;;
       6) delete_remote_subscription; merge_remote_subscriptions ;;
